@@ -127,7 +127,21 @@ bool Graph::removeNode(int id) {
 }
 
 std::optional<std::string> Graph::connect(PinRef from, PinRef to) {
-    // Accept the pins in either order; links always run output -> input.
+    if (auto error = checkConnection(from, to)) {
+        return error;
+    }
+    // Links always run output -> input.
+    if (from.direction == PinDirection::Input) {
+        std::swap(from, to);
+    }
+    std::erase_if(links_, [&](const Link& l) { return l.toNode == to.node && l.toSlot == to.slot; });
+    links_.push_back(Link{nextLinkId_++, from.node, from.slot, to.node, to.slot});
+    touch();
+    return std::nullopt;
+}
+
+std::optional<std::string> Graph::checkConnection(PinRef from, PinRef to) const {
+    // Accept the pins in either order.
     if (from.direction == PinDirection::Input && to.direction == PinDirection::Output) {
         std::swap(from, to);
     }
@@ -152,10 +166,6 @@ std::optional<std::string> Graph::connect(PinRef from, PinRef to) {
     if (from.node == to.node || reaches(to.node, from.node)) {
         return "This link would create a cycle.";
     }
-
-    std::erase_if(links_, [&](const Link& l) { return l.toNode == to.node && l.toSlot == to.slot; });
-    links_.push_back(Link{nextLinkId_++, from.node, from.slot, to.node, to.slot});
-    touch();
     return std::nullopt;
 }
 

@@ -149,6 +149,8 @@ public:
     // an existing link into `to` is replaced. Returns an error message if the
     // pins are incompatible or the link would create a cycle.
     std::optional<std::string> connect(PinRef from, PinRef to);
+    // The error connect() would report, without changing the graph.
+    std::optional<std::string> checkConnection(PinRef from, PinRef to) const;
     bool removeLink(int id);
 
     Node* findNode(int id);

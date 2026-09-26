@@ -7,13 +7,14 @@
 #include <string>
 #include <vector>
 
+#include <imgui.h>
+#include <imgui_node_editor.h>
+
 #include "studio/graph_compiler.hpp"
 #include "studio/graph_introspection.hpp"
 #include "studio/graph_model.hpp"
 
 struct GLFWwindow;
-struct ImNodesContext;
-struct ImNodesEditorContext;
 
 namespace klartraum {
 class KlartraumEngine;
@@ -52,7 +53,10 @@ public:
 
     // For scripted use (e.g. the snapshot tool).
     void showTab(int tab) { requestedTab_ = tab; }
-    void selectNode(int node) { selectedNode_ = node; }
+    void selectNode(int node) {
+        selectedNode_ = node;
+        pendingSelection_ = node;
+    }
     void setHideBuffers(bool hide) { hideBuffers_ = hide; compiledLayoutDirty_ = true; }
     const Graph& graph() const { return graph_; }
     // Edits made through this reference must call Graph::touch().
@@ -93,6 +97,9 @@ private:
     // (measured from the editor), they are stacked without overlaps.
     void layoutCompiledGraph(bool measured);
     void deleteSelection();
+    void drawEditorToolbar(bool compiled);
+    void drawNodeHeader(ax::NodeEditor::NodeId node, ImVec2 headerMin, ImVec2 headerMax, ImU32 color);
+    void handleFit(int& pendingFrames);
     void setStatus(std::string message, bool error = false);
     void updateWindowTitle();
 
@@ -131,11 +138,17 @@ private:
     double lastProfileTime_ = 0.0;
 
     // Editors
-    ImNodesContext* imnodes_ = nullptr;
-    ImNodesEditorContext* authoringEditor_ = nullptr;
-    ImNodesEditorContext* compiledEditor_ = nullptr;
+    ax::NodeEditor::EditorContext* authoringEditor_ = nullptr;
+    ax::NodeEditor::EditorContext* compiledEditor_ = nullptr;
     std::vector<int> nodesToPlace_;  // authoring nodes whose editor position must be set
-    std::optional<Vec2> addNodeScreenPos_;
+    Vec2 newNodePosition_;           // canvas position for a node added from the menu
+    int contextNode_ = -1;
+    int contextLink_ = -1;
+    int pendingSelection_ = -1;      // node to select in the editor on its next frame
+    bool graphWindowHovered_ = false;
+    bool fitRequested_ = true;
+    int authoringFitFrames_ = 0;
+    int compiledFitFrames_ = 0;
     int selectedNode_ = -1;
     int activeTab_ = 0;              // 0: authoring, 1: compiled
     int requestedTab_ = -1;

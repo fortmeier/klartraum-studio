@@ -23,20 +23,30 @@ set(KLARTRAUM_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(KLARTRAUM_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(klartraum)
 
-# imnodes: node editor extension for Dear ImGui. It builds against the ImGui
-# target that klartraum defines, so both share one ImGui context.
+# imgui-node-editor: node editor extension for Dear ImGui with zoom and
+# panning. It builds against the ImGui target that klartraum defines, so both
+# share one ImGui context. The patch adapts it to ImGui >= 1.92, which defines
+# operator*(float, ImVec2) itself.
 FetchContent_Declare(
-  imnodes
-  GIT_REPOSITORY https://github.com/Nelarius/imnodes.git
-  GIT_TAG eb36902c892548ef94f88f51ad7e7c9c7058a71c
-  # Only fetch the sources; its own CMake project expects a standalone ImGui.
+  imgui_node_editor
+  GIT_REPOSITORY https://github.com/thedmd/imgui-node-editor.git
+  GIT_TAG 021aa0ea4da13fed864bafb2a92d4c5205076866
+  PATCH_COMMAND ${CMAKE_COMMAND} -DPATCH=${PROJECT_SOURCE_DIR}/cmake/patches/imgui-node-editor-imgui192.patch
+                -P ${PROJECT_SOURCE_DIR}/cmake/apply_patch.cmake
+  UPDATE_DISCONNECTED TRUE
+  # Only fetch the sources; the repository has no library CMake project.
   SOURCE_SUBDIR do-not-add
 )
-FetchContent_MakeAvailable(imnodes)
-add_library(imnodes STATIC ${imnodes_SOURCE_DIR}/imnodes.cpp)
-target_include_directories(imnodes PUBLIC ${imnodes_SOURCE_DIR})
-target_link_libraries(imnodes PUBLIC imgui)
-target_compile_features(imnodes PUBLIC cxx_std_17)
+FetchContent_MakeAvailable(imgui_node_editor)
+add_library(imgui_node_editor STATIC
+  ${imgui_node_editor_SOURCE_DIR}/imgui_node_editor.cpp
+  ${imgui_node_editor_SOURCE_DIR}/imgui_node_editor_api.cpp
+  ${imgui_node_editor_SOURCE_DIR}/imgui_canvas.cpp
+  ${imgui_node_editor_SOURCE_DIR}/crude_json.cpp
+)
+target_include_directories(imgui_node_editor PUBLIC ${imgui_node_editor_SOURCE_DIR})
+target_link_libraries(imgui_node_editor PUBLIC imgui)
+target_compile_features(imgui_node_editor PUBLIC cxx_std_17)
 
 FetchContent_Declare(
   nlohmann_json
@@ -60,7 +70,7 @@ target_compile_definitions(klartraum_studio_core PUBLIC
 )
 target_link_libraries(klartraum_studio_core PUBLIC
   klartraum_lib
-  imnodes
+  imgui_node_editor
   nlohmann_json::nlohmann_json
 )
 if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")

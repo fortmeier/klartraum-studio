@@ -5,7 +5,7 @@
 #include <set>
 
 #include <imgui.h>
-#include <imnodes.h>
+#include <imgui_node_editor.h>
 
 #include "klartraum/gaussian_data_standard.hpp"
 #define GLFW_INCLUDE_VULKAN
@@ -19,15 +19,38 @@
 
 namespace kstudio {
 
+namespace ed = ax::NodeEditor;
+
 namespace {
 
 constexpr double kProfileInterval = 0.5;  // seconds between profiling readbacks
 
-// Attribute ids in the compiled-graph editor: per element, input slots count
-// up from the element's base id, the single output uses the last one.
-constexpr int kElementAttrStride = 512;
-int elementInputAttr(int element, int slot) { return element * kElementAttrStride + slot; }
-int elementOutputAttr(int element) { return element * kElementAttrStride + kElementAttrStride - 1; }
+constexpr float kNodeWidth = 170.0f;
+
+// Editor ids must be non-zero. Pins and links get their own ranges so an id
+// never names two kinds of object.
+constexpr uintptr_t kPinIdBase = uintptr_t{1} << 28;
+constexpr uintptr_t kLinkIdBase = uintptr_t{1} << 29;
+
+// Authoring graph: node ids are the graph's (they start at 1).
+ed::NodeId authoringNodeId(int node) { return ed::NodeId(static_cast<uintptr_t>(node)); }
+ed::PinId authoringPinId(const PinRef& pin) { return ed::PinId(kPinIdBase + static_cast<uintptr_t>(pinId(pin))); }
+PinRef pinFromEditor(ed::PinId pin) { return pinFromId(static_cast<int>(pin.Get() - kPinIdBase)); }
+ed::LinkId authoringLinkId(int link) { return ed::LinkId(kLinkIdBase + static_cast<uintptr_t>(link)); }
+int linkFromEditor(ed::LinkId link) { return static_cast<int>(link.Get() - kLinkIdBase); }
+
+// Compiled graph: element ids start at 0; per element, input slots count up
+// from its pin base and the single output uses the last pin.
+constexpr uintptr_t kElementPinStride = 512;
+ed::NodeId compiledNodeId(int element) { return ed::NodeId(static_cast<uintptr_t>(element) + 1); }
+int elementFromEditor(ed::NodeId node) { return static_cast<int>(node.Get()) - 1; }
+ed::PinId compiledInputPinId(int element, int slot) {
+    return ed::PinId(kPinIdBase + static_cast<uintptr_t>(element) * kElementPinStride + static_cast<uintptr_t>(slot));
+}
+ed::PinId compiledOutputPinId(int element) {
+    return ed::PinId(kPinIdBase + static_cast<uintptr_t>(element) * kElementPinStride + kElementPinStride - 1);
+}
+ed::LinkId compiledLinkId(int edge) { return ed::LinkId(kLinkIdBase + static_cast<uintptr_t>(edge) + 1); }
 
 ImU32 rgb(int r, int g, int b, int a = 255) { return IM_COL32(r, g, b, a); }
 
@@ -91,13 +114,52 @@ const char* severityLabel(Severity severity) {
     return "";
 }
 
-ImNodesPinShape pinShape(PinType type) {
+// Draws a pin's icon as an item of `size`: squares for Gaussians, triangles
+// for cameras, circles for images; filled when connected.
+void pinIcon(PinType type, bool connected, float size) {
+    const ImVec2 min = ImGui::GetCursorScreenPos();
+    ImGui::Dummy(ImVec2(size, size));
+    ImDrawList* drawList = ImGui::GetWindowDrawList();
+    const ImVec2 c(min.x + size * 0.5f, min.y + size * 0.5f);
+    const float r = size * 0.3f;
+    const ImU32 color = pinColor(type);
     switch (type) {
-    case PinType::Gaussians: return ImNodesPinShape_QuadFilled;
-    case PinType::Camera: return ImNodesPinShape_TriangleFilled;
-    case PinType::Image: return ImNodesPinShape_CircleFilled;
+    case PinType::Gaussians:
+        if (connected) {
+            drawList->AddRectFilled(ImVec2(c.x - r, c.y - r), ImVec2(c.x + r, c.y + r), color);
+        } else {
+            drawList->AddRect(ImVec2(c.x - r, c.y - r), ImVec2(c.x + r, c.y + r), color, 0.0f, 0, 1.5f);
+        }
+        break;
+    case PinType::Camera: {
+        const ImVec2 a(c.x - r, c.y - r), b(c.x + r, c.y), d(c.x - r, c.y + r);
+        if (connected) {
+            drawList->AddTriangleFilled(a, b, d, color);
+        } else {
+            drawList->AddTriangle(a, b, d, color, 1.5f);
+        }
+        break;
     }
-    return ImNodesPinShape_CircleFilled;
+    case PinType::Image:
+        if (connected) {
+            drawList->AddCircleFilled(c, r, color);
+        } else {
+            drawList->AddCircle(c, r, color, 0, 1.5f);
+        }
+        break;
+    }
+}
+
+void elementPinIcon(bool connected, float size) {
+    const ImVec2 min = ImGui::GetCursorScreenPos();
+    ImGui::Dummy(ImVec2(size, size));
+    const ImVec2 c(min.x + size * 0.5f, min.y + size * 0.5f);
+    const ImU32 color = rgb(170, 170, 190);
+    if (connected) {
+        ImGui::GetWindowDrawList()->AddCircleFilled(c, size * 0.25f, color);
+    } else {
+        ImGui::GetWindowDrawList()->AddCircle(c, size * 0.25f, color, 0, 1.2f);
+    }
 }
 
 bool inputText(const char* label, std::string& value) {
@@ -147,9 +209,12 @@ StudioApp::StudioApp(klartraum::KlartraumEngine& engine, StudioOptions options, 
     : engine_(engine), window_(window), options_(std::move(options)) {
     profiling_ = options_.profiling;
 
-    imnodes_ = ImNodes::CreateContext();
-    authoringEditor_ = ImNodes::EditorContextCreate();
-    compiledEditor_ = ImNodes::EditorContextCreate();
+    // Editor layouts are stored in the graph files, not in NodeEditor.json.
+    ed::Config config;
+    config.SettingsFile = nullptr;
+    config.EnableSmoothZoom = true;
+    authoringEditor_ = ed::CreateEditor(&config);
+    compiledEditor_ = ed::CreateEditor(&config);
     setupStyle();
 
     camera_ = std::make_shared<klartraum::InterfaceCameraOrbit>(klartraum::InterfaceCameraOrbit::UpDirection::Y);
@@ -174,9 +239,8 @@ StudioApp::~StudioApp() {
     vkDeviceWaitIdle(engine_.getVulkanContext().getDevice());
     // The builder refers to this object.
     engine_.setGraphBuilder(nullptr);
-    ImNodes::EditorContextFree(compiledEditor_);
-    ImNodes::EditorContextFree(authoringEditor_);
-    ImNodes::DestroyContext(imnodes_);
+    ed::DestroyEditor(compiledEditor_);
+    ed::DestroyEditor(authoringEditor_);
 }
 
 // ---------------------------------------------------------------------------
@@ -197,10 +261,10 @@ void StudioApp::setGraph(Graph graph, std::filesystem::path file) {
     for (const auto& node : graph_.nodes()) {
         nodesToPlace_.push_back(node.id);
     }
-    ImNodes::EditorContextSet(authoringEditor_);
-    ImNodes::ClearNodeSelection();
-    ImNodes::ClearLinkSelection();
-    ImNodes::EditorContextResetPanning(ImVec2(0.0f, 0.0f));
+    ed::SetCurrentEditor(authoringEditor_);
+    ed::ClearSelection();
+    ed::SetCurrentEditor(nullptr);
+    fitRequested_ = true;
     // A new camera node's view replaces the current one.
     if (appliedPlan_) {
         appliedPlan_->cameraNode = -1;
@@ -468,21 +532,22 @@ void StudioApp::setupStyle() {
     style.WindowBorderSize = 1.0f;
     style.Colors[ImGuiCol_WindowBg].w = 0.92f;
 
-    ImNodes::StyleColorsDark();
-    ImNodesStyle& nodes = ImNodes::GetStyle();
-    nodes.Flags |= ImNodesStyleFlags_GridLines | ImNodesStyleFlags_GridLinesPrimary;
-    nodes.NodeCornerRounding = 5.0f;
-    nodes.LinkThickness = 2.5f;
-    nodes.PinCircleRadius = 5.0f;
-    nodes.Colors[ImNodesCol_GridBackground] = rgb(24, 24, 30, 235);
-    nodes.Colors[ImNodesCol_GridLine] = rgb(50, 50, 60, 200);
-    nodes.Colors[ImNodesCol_GridLinePrimary] = rgb(64, 64, 76, 220);
-    nodes.Colors[ImNodesCol_NodeBackground] = rgb(40, 40, 48, 245);
-    nodes.Colors[ImNodesCol_NodeBackgroundHovered] = rgb(48, 48, 58, 245);
-    nodes.Colors[ImNodesCol_NodeBackgroundSelected] = rgb(54, 54, 66, 245);
-
-    // Ctrl+click on a link end detaches it.
-    ImNodes::GetIO().LinkDetachWithModifierClick.Modifier = &ImGui::GetIO().KeyCtrl;
+    for (auto* editor : {authoringEditor_, compiledEditor_}) {
+        ed::SetCurrentEditor(editor);
+        ed::Style& nodes = ed::GetStyle();
+        nodes.NodePadding = ImVec4(8.0f, 6.0f, 8.0f, 8.0f);
+        nodes.NodeRounding = 6.0f;
+        nodes.NodeBorderWidth = 1.5f;
+        nodes.PinRounding = 0.0f;
+        nodes.LinkStrength = 80.0f;
+        nodes.Colors[ed::StyleColor_Bg] = ImColor(24, 24, 30, 235);
+        nodes.Colors[ed::StyleColor_Grid] = ImColor(90, 90, 110, 50);
+        nodes.Colors[ed::StyleColor_NodeBg] = ImColor(40, 40, 48, 245);
+        nodes.Colors[ed::StyleColor_NodeBorder] = ImColor(90, 90, 104, 255);
+        nodes.Colors[ed::StyleColor_PinRect] = ImColor(120, 170, 255, 60);
+        nodes.Colors[ed::StyleColor_PinRectBorder] = ImColor(120, 170, 255, 110);
+    }
+    ed::SetCurrentEditor(nullptr);
 }
 
 void StudioApp::setStatus(std::string message, bool error) {
@@ -692,9 +757,11 @@ void StudioApp::drawGraphWindow() {
     ImGui::SetNextWindowPos(ImVec2(0.0f, io.DisplaySize.y - height), ImGuiCond_FirstUseEver);
     ImGui::SetNextWindowSize(ImVec2(io.DisplaySize.x - 360.0f, height), ImGuiCond_FirstUseEver);
     if (!ImGui::Begin("Graph", nullptr, ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse)) {
+        graphWindowHovered_ = false;
         ImGui::End();
         return;
     }
+    graphWindowHovered_ = ImGui::IsWindowHovered(ImGuiHoveredFlags_ChildWindows);
     if (ImGui::BeginTabBar("graph_tabs")) {
         const ImGuiTabItemFlags authoringFlags = requestedTab_ == 0 ? ImGuiTabItemFlags_SetSelected : 0;
         const ImGuiTabItemFlags compiledFlags = requestedTab_ == 1 ? ImGuiTabItemFlags_SetSelected : 0;
@@ -715,56 +782,89 @@ void StudioApp::drawGraphWindow() {
     ImGui::End();
 }
 
-void StudioApp::drawAuthoringEditor() {
-    std::set<int> errorNodes;
-    for (const auto& d : plan_.diagnostics) {
-        if (d.severity == Severity::Error && d.node >= 0) {
-            errorNodes.insert(d.node);
+void StudioApp::drawEditorToolbar(bool compiled) {
+    if (ImGui::SmallButton("Fit")) {
+        fitRequested_ = true;
+    }
+    ImGui::SameLine();
+    if (ImGui::SmallButton("Arrange")) {
+        if (compiled) {
+            compiledLayoutDirty_ = true;
+        } else {
+            layoutAuthoringGraph();
+            fitRequested_ = true;
         }
     }
+    if (compiled) {
+        ImGui::SameLine();
+        if (ImGui::Checkbox("Hide buffers", &hideBuffers_)) {
+            compiledLayoutDirty_ = true;
+        }
+    }
+    ImGui::SameLine();
+    if (compiled) {
+        ImGui::TextDisabled("Read-only: the elements klartraum compiled. Scroll: zoom  Right-drag: pan  F: fit");
+    } else {
+        ImGui::TextDisabled("Scroll: zoom  Right-drag: pan  F: fit  Right-click: add node  Drag pins: connect  "
+                            "Del/Backspace: delete");
+    }
+}
+
+void StudioApp::drawAuthoringEditor() {
+    std::set<int> errorNodes;
     std::set<int> unusedNodes;
     for (const auto& d : plan_.diagnostics) {
-        if (d.severity == Severity::Info && d.node >= 0) {
+        if (d.node < 0) {
+            continue;
+        }
+        if (d.severity == Severity::Error) {
+            errorNodes.insert(d.node);
+        } else if (d.severity == Severity::Info) {
             unusedNodes.insert(d.node);
         }
     }
 
-    ImGui::TextDisabled("Right-click: add node   Drag pin to pin: connect   Del: delete   Ctrl+click link end: detach");
-    ImNodes::EditorContextSet(authoringEditor_);
-    ImNodes::BeginNodeEditor();
+    drawEditorToolbar(false);
+    ed::SetCurrentEditor(authoringEditor_);
+    ed::Begin("authoring");
+
+    // Backspace is the delete key on Mac keyboards; the editor only handles Delete.
+    if (graphWindowHovered_ && !ImGui::GetIO().WantTextInput && ImGui::IsKeyPressed(ImGuiKey_Backspace)) {
+        deleteSelection();
+    }
 
     auto& vc = engine_.getVulkanContext();
+    const ImVec4 bodyText(0.75f, 0.75f, 0.8f, 1.0f);
     for (auto& node : graph_.nodes()) {
+        const ed::NodeId nodeId = authoringNodeId(node.id);
         if (auto it = std::find(nodesToPlace_.begin(), nodesToPlace_.end(), node.id); it != nodesToPlace_.end()) {
-            if (addNodeScreenPos_) {
-                ImNodes::SetNodeScreenSpacePos(node.id, ImVec2(addNodeScreenPos_->x, addNodeScreenPos_->y));
-                addNodeScreenPos_.reset();
-            } else {
-                ImNodes::SetNodeGridSpacePos(node.id, ImVec2(node.position.x, node.position.y));
-            }
+            ed::SetNodePosition(nodeId, ImVec2(node.position.x, node.position.y));
             nodesToPlace_.erase(it);
         }
 
-        const ImU32 color = kindColor(node.kind);
-        ImNodes::PushColorStyle(ImNodesCol_TitleBar, color);
-        ImNodes::PushColorStyle(ImNodesCol_TitleBarHovered, brighten(color, 0.08f));
-        ImNodes::PushColorStyle(ImNodesCol_TitleBarSelected, brighten(color, 0.15f));
         const bool hasError = errorNodes.contains(node.id);
-        if (hasError) {
-            ImNodes::PushColorStyle(ImNodesCol_NodeOutline, rgb(240, 90, 80));
-        }
         const bool unused = unusedNodes.contains(node.id);
+        if (hasError) {
+            ed::PushStyleColor(ed::StyleColor_NodeBorder, ImVec4(0.95f, 0.35f, 0.3f, 1.0f));
+        }
         if (unused) {
             ImGui::PushStyleVar(ImGuiStyleVar_Alpha, 0.55f);
         }
 
-        ImNodes::BeginNode(node.id);
-        ImNodes::BeginNodeTitleBar();
+        ed::BeginNode(nodeId);
+        ImGui::PushID(node.id);
+        const float left = ImGui::GetCursorScreenPos().x;
+
+        ImGui::BeginGroup();
         ImGui::TextUnformatted(node.title.c_str());
-        ImNodes::EndNodeTitleBar();
+        ImGui::Dummy(ImVec2(kNodeWidth, 0.0f));
+        ImGui::EndGroup();
+        const ImVec2 headerMin = ImGui::GetItemRectMin();
+        const ImVec2 headerMax = ImGui::GetItemRectMax();
+        ImGui::Dummy(ImVec2(0.0f, 2.0f));
 
         // A short summary; the parameters are edited in the inspector.
-        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.75f, 0.75f, 0.8f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_Text, bodyText);
         switch (node.kind) {
         case NodeKind::Scene: {
             const auto& path = node.as<SceneParams>().path;
@@ -800,65 +900,123 @@ void StudioApp::drawAuthoringEditor() {
             break;
         }
         ImGui::PopStyleColor();
-        ImGui::Dummy(ImVec2(150.0f, 0.0f));
 
+        // Pin rows: inputs on the left, outputs right-aligned.
         const auto& info = kindInfo(node.kind);
-        for (int slot = 0; slot < static_cast<int>(info.inputs.size()); ++slot) {
-            const auto& pin = info.inputs[slot];
-            ImNodes::PushColorStyle(ImNodesCol_Pin, pinColor(pin.type));
-            ImNodes::BeginInputAttribute(pinId({node.id, PinDirection::Input, slot}), pinShape(pin.type));
-            ImGui::TextUnformatted(pin.name.data(), pin.name.data() + pin.name.size());
-            ImNodes::EndInputAttribute();
-            ImNodes::PopColorStyle();
+        const size_t rows = std::max(info.inputs.size(), info.outputs.size());
+        const float iconSize = ImGui::GetTextLineHeight();
+        for (size_t row = 0; row < rows; ++row) {
+            const int slot = static_cast<int>(row);
+            bool sameLine = false;
+            if (row < info.inputs.size()) {
+                const auto& pin = info.inputs[row];
+                const PinRef ref{node.id, PinDirection::Input, slot};
+                ed::BeginPin(authoringPinId(ref), ed::PinKind::Input);
+                ed::PinPivotAlignment(ImVec2(0.0f, 0.5f));
+                ed::PinPivotSize(ImVec2(0.0f, 0.0f));
+                pinIcon(pin.type, graph_.inputLink(node.id, slot) != nullptr, iconSize);
+                ImGui::SameLine();
+                ImGui::TextUnformatted(pin.name.data(), pin.name.data() + pin.name.size());
+                ed::EndPin();
+                sameLine = true;
+            }
+            if (row < info.outputs.size()) {
+                const auto& pin = info.outputs[row];
+                const PinRef ref{node.id, PinDirection::Output, slot};
+                const float width = ImGui::CalcTextSize(pin.name.data(), pin.name.data() + pin.name.size()).x +
+                                    ImGui::GetStyle().ItemSpacing.x + iconSize;
+                if (sameLine) {
+                    ImGui::SameLine();
+                }
+                ImGui::SetCursorScreenPos(ImVec2(left + kNodeWidth - width, ImGui::GetCursorScreenPos().y));
+                ed::BeginPin(authoringPinId(ref), ed::PinKind::Output);
+                ed::PinPivotAlignment(ImVec2(1.0f, 0.5f));
+                ed::PinPivotSize(ImVec2(0.0f, 0.0f));
+                ImGui::TextUnformatted(pin.name.data(), pin.name.data() + pin.name.size());
+                ImGui::SameLine();
+                const bool connected = std::any_of(graph_.links().begin(), graph_.links().end(), [&](const Link& l) {
+                    return l.fromNode == node.id && l.fromSlot == slot;
+                });
+                pinIcon(pin.type, connected, iconSize);
+                ed::EndPin();
+            }
         }
-        for (int slot = 0; slot < static_cast<int>(info.outputs.size()); ++slot) {
-            const auto& pin = info.outputs[slot];
-            ImNodes::PushColorStyle(ImNodesCol_Pin, pinColor(pin.type));
-            ImNodes::BeginOutputAttribute(pinId({node.id, PinDirection::Output, slot}), pinShape(pin.type));
-            const float textWidth = ImGui::CalcTextSize(pin.name.data(), pin.name.data() + pin.name.size()).x;
-            ImGui::SetCursorPosX(ImGui::GetCursorPosX() + 150.0f - textWidth);
-            ImGui::TextUnformatted(pin.name.data(), pin.name.data() + pin.name.size());
-            ImNodes::EndOutputAttribute();
-            ImNodes::PopColorStyle();
-        }
-        ImNodes::EndNode();
+
+        ImGui::PopID();
+        ed::EndNode();
+        drawNodeHeader(nodeId, headerMin, headerMax, kindColor(node.kind));
 
         if (unused) {
             ImGui::PopStyleVar();
         }
         if (hasError) {
-            ImNodes::PopColorStyle();
+            ed::PopStyleColor();
         }
-        ImNodes::PopColorStyle();
-        ImNodes::PopColorStyle();
-        ImNodes::PopColorStyle();
     }
 
     for (const auto& link : graph_.links()) {
         const Node* from = graph_.findNode(link.fromNode);
         const PinType type = kindInfo(from->kind).outputs[link.fromSlot].type;
-        ImNodes::PushColorStyle(ImNodesCol_Link, pinColor(type));
-        ImNodes::PushColorStyle(ImNodesCol_LinkHovered, brighten(pinColor(type), 0.2f));
-        ImNodes::PushColorStyle(ImNodesCol_LinkSelected, brighten(pinColor(type), 0.3f));
-        ImNodes::Link(link.id, pinId({link.fromNode, PinDirection::Output, link.fromSlot}),
-                      pinId({link.toNode, PinDirection::Input, link.toSlot}));
-        ImNodes::PopColorStyle();
-        ImNodes::PopColorStyle();
-        ImNodes::PopColorStyle();
+        ed::Link(authoringLinkId(link.id), authoringPinId({link.fromNode, PinDirection::Output, link.fromSlot}),
+                 authoringPinId({link.toNode, PinDirection::Input, link.toSlot}),
+                 ImGui::ColorConvertU32ToFloat4(pinColor(type)), 2.5f);
     }
 
-    // Right-click context menus: on a node, or on the canvas to add one.
-    int hoveredNode = -1;
-    const bool editorHovered = ImNodes::IsEditorHovered();
-    const bool nodeHovered = ImNodes::IsNodeHovered(&hoveredNode);
-    if (editorHovered && ImGui::IsMouseReleased(ImGuiMouseButton_Right)) {
-        if (nodeHovered) {
-            selectedNode_ = hoveredNode;
-            ImGui::OpenPopup("node_menu");
-        } else {
-            addNodeScreenPos_ = Vec2{ImGui::GetMousePos().x, ImGui::GetMousePos().y};
-            ImGui::OpenPopup("add_node");
+    // Dragging from a pin: accept or reject the link while it is drawn.
+    if (ed::BeginCreate(ImVec4(1.0f, 1.0f, 1.0f, 1.0f), 2.0f)) {
+        ed::PinId start, end;
+        if (ed::QueryNewLink(&start, &end) && start && end) {
+            const PinRef a = pinFromEditor(start);
+            const PinRef b = pinFromEditor(end);
+            if (auto error = graph_.checkConnection(a, b)) {
+                ed::RejectNewItem(ImVec4(1.0f, 0.35f, 0.3f, 1.0f), 2.0f);
+                ed::Suspend();
+                ImGui::SetTooltip("%s", error->c_str());
+                ed::Resume();
+            } else if (ed::AcceptNewItem(ImVec4(0.5f, 1.0f, 0.5f, 1.0f), 3.0f)) {
+                graph_.connect(a, b);
+                modified_ = true;
+            }
         }
+    }
+    ed::EndCreate();
+
+    if (ed::BeginDelete()) {
+        ed::LinkId link;
+        while (ed::QueryDeletedLink(&link)) {
+            if (ed::AcceptDeletedItem()) {
+                graph_.removeLink(linkFromEditor(link));
+                modified_ = true;
+            }
+        }
+        ed::NodeId node;
+        while (ed::QueryDeletedNode(&node)) {
+            if (ed::AcceptDeletedItem()) {
+                graph_.removeNode(static_cast<int>(node.Get()));
+                if (selectedNode_ == static_cast<int>(node.Get())) {
+                    selectedNode_ = -1;
+                }
+                modified_ = true;
+            }
+        }
+    }
+    ed::EndDelete();
+
+    // Context menus. Mouse positions are in canvas space while the editor is
+    // active, so the position for a new node is taken before suspending.
+    const ImVec2 canvasMouse = ImGui::GetMousePos();
+    ed::Suspend();
+    ed::NodeId contextNode;
+    ed::LinkId contextLink;
+    if (ed::ShowNodeContextMenu(&contextNode)) {
+        contextNode_ = static_cast<int>(contextNode.Get());
+        ImGui::OpenPopup("node_menu");
+    } else if (ed::ShowLinkContextMenu(&contextLink)) {
+        contextLink_ = linkFromEditor(contextLink);
+        ImGui::OpenPopup("link_menu");
+    } else if (ed::ShowBackgroundContextMenu()) {
+        newNodePosition_ = Vec2{canvasMouse.x, canvasMouse.y};
+        ImGui::OpenPopup("add_node");
     }
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(8.0f, 8.0f));
     if (ImGui::BeginPopup("add_node")) {
@@ -866,11 +1024,13 @@ void StudioApp::drawAuthoringEditor() {
         ImGui::Separator();
         for (const auto& info : allKinds()) {
             if (ImGui::MenuItem(std::string(info.title).c_str())) {
-                const int id = graph_.addNode(info.kind);
+                const int id = graph_.addNode(info.kind, newNodePosition_);
                 if (info.kind == NodeKind::Scene) {
                     graph_.findNode(id)->as<SceneParams>().path = defaultScenePath();
                 }
                 nodesToPlace_.push_back(id);
+                pendingSelection_ = id;
+                selectedNode_ = id;
                 modified_ = true;
             }
             if (ImGui::IsItemHovered()) {
@@ -878,93 +1038,115 @@ void StudioApp::drawAuthoringEditor() {
             }
         }
         ImGui::EndPopup();
-    } else if (nodesToPlace_.empty()) {
-        addNodeScreenPos_.reset();
     }
     if (ImGui::BeginPopup("node_menu")) {
-        if (Node* node = graph_.findNode(selectedNode_)) {
+        if (Node* node = graph_.findNode(contextNode_)) {
             ImGui::TextDisabled("%s", node->title.c_str());
             ImGui::Separator();
             if (ImGui::MenuItem("Delete")) {
-                graph_.removeNode(node->id);
-                selectedNode_ = -1;
-                modified_ = true;
+                ed::Resume();
+                ed::DeleteNode(authoringNodeId(node->id));
+                ed::Suspend();
             }
         }
         ImGui::EndPopup();
     }
+    if (ImGui::BeginPopup("link_menu")) {
+        if (ImGui::MenuItem("Disconnect")) {
+            ed::Resume();
+            ed::DeleteLink(authoringLinkId(contextLink_));
+            ed::Suspend();
+        }
+        ImGui::EndPopup();
+    }
     ImGui::PopStyleVar();
+    ed::Resume();
 
-    ImNodes::MiniMap(0.15f, ImNodesMiniMapLocation_BottomRight);
-    ImNodes::EndNodeEditor();
-
-    // Editor interactions are only reported after EndNodeEditor.
-    int startAttr = 0, endAttr = 0;
-    if (ImNodes::IsLinkCreated(&startAttr, &endAttr)) {
-        if (auto error = graph_.connect(pinFromId(startAttr), pinFromId(endAttr))) {
-            setStatus(*error, true);
-        } else {
-            modified_ = true;
+    // Requested selections are applied once the editor knows the node,
+    // i.e. after it has been drawn.
+    if (pendingSelection_ >= 0 && std::find(nodesToPlace_.begin(), nodesToPlace_.end(), pendingSelection_) ==
+                                      nodesToPlace_.end()) {
+        ed::ClearSelection();
+        if (graph_.findNode(pendingSelection_)) {
+            ed::SelectNode(authoringNodeId(pendingSelection_));
         }
-    }
-    int destroyedLink = 0;
-    if (ImNodes::IsLinkDestroyed(&destroyedLink)) {
-        graph_.removeLink(destroyedLink);
-        modified_ = true;
+        pendingSelection_ = -1;
     }
 
-    const int selectedCount = ImNodes::NumSelectedNodes();
-    if (selectedCount > 0) {
-        std::vector<int> selected(selectedCount);
-        ImNodes::GetSelectedNodes(selected.data());
-        if (std::find(selected.begin(), selected.end(), selectedNode_) == selected.end()) {
-            selectedNode_ = selected.front();
+    // Selection drives the inspector.
+    std::vector<ed::NodeId> selected(ed::GetSelectedObjectCount());
+    selected.resize(ed::GetSelectedNodes(selected.data(), static_cast<int>(selected.size())));
+    if (!selected.empty()) {
+        const bool keep = std::any_of(selected.begin(), selected.end(), [&](ed::NodeId id) {
+            return static_cast<int>(id.Get()) == selectedNode_;
+        });
+        if (!keep) {
+            selectedNode_ = static_cast<int>(selected.front().Get());
         }
-    } else if (editorHovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left) && !nodeHovered) {
+    } else if (ed::IsBackgroundClicked()) {
         selectedNode_ = -1;
-    }
-
-    if (editorHovered && !ImGui::GetIO().WantTextInput &&
-        (ImGui::IsKeyPressed(ImGuiKey_Delete) || ImGui::IsKeyPressed(ImGuiKey_Backspace))) {
-        deleteSelection();
     }
 
     // Remember where the user put things, for saving.
     for (auto& node : graph_.nodes()) {
-        if (std::find(nodesToPlace_.begin(), nodesToPlace_.end(), node.id) == nodesToPlace_.end()) {
-            const ImVec2 pos = ImNodes::GetNodeGridSpacePos(node.id);
-            const Vec2 position{pos.x, pos.y};
-            if (!(position == node.position)) {
-                node.position = position;
-                modified_ = true;
-            }
+        if (std::find(nodesToPlace_.begin(), nodesToPlace_.end(), node.id) != nodesToPlace_.end()) {
+            continue;
         }
+        const ImVec2 pos = ed::GetNodePosition(authoringNodeId(node.id));
+        if (pos.x == FLT_MAX) {
+            continue;  // not placed yet
+        }
+        const Vec2 position{pos.x, pos.y};
+        if (!(position == node.position)) {
+            node.position = position;
+            modified_ = true;
+        }
+    }
+
+    handleFit(authoringFitFrames_);
+    ed::End();
+    ed::SetCurrentEditor(nullptr);
+}
+
+void StudioApp::handleFit(int& pendingFrames) {
+    // Node sizes are only known once they have been drawn, so fitting waits
+    // a frame after nodes were (re)placed.
+    if (fitRequested_) {
+        pendingFrames = 2;
+        fitRequested_ = false;
+    }
+    if (pendingFrames > 0 && --pendingFrames == 0) {
+        ed::NavigateToContent(0.0f);
     }
 }
 
+void StudioApp::drawNodeHeader(ed::NodeId node, ImVec2 headerMin, ImVec2 headerMax, ImU32 color) {
+    if (!ImGui::IsItemVisible()) {
+        return;
+    }
+    // The header group spans the node's content; widen it to the node's
+    // border using the node padding (left, top, right, bottom).
+    const ed::Style& style = ed::GetStyle();
+    const float border = style.NodeBorderWidth * 0.5f;
+    const ImVec2 min(headerMin.x - style.NodePadding.x + border, headerMin.y - style.NodePadding.y + border);
+    const ImVec2 max(headerMax.x + style.NodePadding.z - border, headerMax.y + 2.0f);
+    ImDrawList* drawList = ed::GetNodeBackgroundDrawList(node);
+    drawList->AddRectFilled(min, max, color, style.NodeRounding, ImDrawFlags_RoundCornersTop);
+    drawList->AddLine(ImVec2(min.x, max.y), ImVec2(max.x, max.y), brighten(color, 0.2f), 1.0f);
+}
+
 void StudioApp::deleteSelection() {
-    ImNodes::EditorContextSet(authoringEditor_);
-    const int linkCount = ImNodes::NumSelectedLinks();
-    if (linkCount > 0) {
-        std::vector<int> links(linkCount);
-        ImNodes::GetSelectedLinks(links.data());
-        for (int id : links) {
-            graph_.removeLink(id);
-        }
+    // Deleting goes through the editor so its BeginDelete handling applies;
+    // call between ed::Begin and ed::End of the authoring editor.
+    std::vector<ed::LinkId> links(ed::GetSelectedObjectCount());
+    links.resize(ed::GetSelectedLinks(links.data(), static_cast<int>(links.size())));
+    for (auto link : links) {
+        ed::DeleteLink(link);
     }
-    const int nodeCount = ImNodes::NumSelectedNodes();
-    if (nodeCount > 0) {
-        std::vector<int> nodes(nodeCount);
-        ImNodes::GetSelectedNodes(nodes.data());
-        for (int id : nodes) {
-            graph_.removeNode(id);
-        }
-    }
-    if (linkCount + nodeCount > 0) {
-        ImNodes::ClearNodeSelection();
-        ImNodes::ClearLinkSelection();
-        selectedNode_ = -1;
-        modified_ = true;
+    std::vector<ed::NodeId> nodes(ed::GetSelectedObjectCount());
+    nodes.resize(ed::GetSelectedNodes(nodes.data(), static_cast<int>(nodes.size())));
+    for (auto node : nodes) {
+        ed::DeleteNode(node);
     }
 }
 
@@ -978,11 +1160,11 @@ void StudioApp::layoutAuthoringGraph() {
         edges.emplace_back(index.at(link.fromNode), index.at(link.toNode));
     }
     LayoutOptions options;
-    options.columnSpacing = 300.0f;
+    options.columnSpacing = kNodeWidth + 140.0f;
     options.rowSpacing = 140.0f;
     const auto positions = layeredLayout(static_cast<int>(graph_.nodes().size()), edges, options);
     for (auto& node : graph_.nodes()) {
-        node.position = {40.0f + positions[index.at(node.id)].x, 20.0f + positions[index.at(node.id)].y};
+        node.position = positions[index.at(node.id)];
         nodesToPlace_.push_back(node.id);
     }
     modified_ = true;
@@ -1005,16 +1187,16 @@ void StudioApp::layoutCompiledGraph(bool measured) {
         }
     }
     LayoutOptions options;
-    options.columnSpacing = 280.0f;
+    options.columnSpacing = kNodeWidth + 120.0f;
     options.rowSpacing = 120.0f;
     if (measured) {
         for (int id : visible) {
-            options.heights.push_back(ImNodes::GetNodeDimensions(id).y);
+            options.heights.push_back(ed::GetNodeSize(compiledNodeId(id)).y);
         }
     }
     const auto positions = layeredLayout(static_cast<int>(visible.size()), edges, options);
     for (size_t i = 0; i < visible.size(); ++i) {
-        ImNodes::SetNodeGridSpacePos(visible[i], ImVec2(20.0f + positions[i].x, 20.0f + positions[i].y));
+        ed::SetNodePosition(compiledNodeId(visible[i]), ImVec2(positions[i].x, positions[i].y));
     }
 }
 
@@ -1023,48 +1205,55 @@ void StudioApp::drawCompiledEditor() {
         ImGui::TextDisabled("Nothing compiled yet.");
         return;
     }
-    if (ImGui::Checkbox("Hide buffers", &hideBuffers_)) {
-        compiledLayoutDirty_ = true;
-    }
-    ImGui::SameLine();
-    if (ImGui::Button("Arrange")) {
-        compiledLayoutDirty_ = true;
-    }
-    ImGui::SameLine();
-    ImGui::TextDisabled("Read-only view of the elements klartraum compiled; select one to inspect it.");
+    drawEditorToolbar(true);
 
-    ImNodes::EditorContextSet(compiledEditor_);
+    ed::SetCurrentEditor(compiledEditor_);
+    ed::Begin("compiled");
     if (compiledLayoutDirty_) {
         layoutCompiledGraph(false);
-        ImNodes::EditorContextResetPanning(ImVec2(0.0f, 0.0f));
         compiledLayoutDirty_ = false;
         compiledLayoutNeedsMeasure_ = true;
     }
 
-    ImNodes::BeginNodeEditor();
     const int highlightOwner = selectedNode_;
     float maxMs = 0.0f;
     for (const auto& [label, ms] : timings_) {
         maxMs = std::max(maxMs, ms);
     }
+    const float iconSize = ImGui::GetTextLineHeight();
 
     for (const auto& node : compiled_.nodes) {
         if (hideBuffers_ && node.category == ElementCategory::Buffer) {
             continue;
         }
-        const ImU32 color = categoryColor(node.category);
-        ImNodes::PushColorStyle(ImNodesCol_TitleBar, color);
-        ImNodes::PushColorStyle(ImNodesCol_TitleBarHovered, brighten(color, 0.08f));
-        ImNodes::PushColorStyle(ImNodesCol_TitleBarSelected, brighten(color, 0.15f));
+        const ed::NodeId nodeId = compiledNodeId(node.id);
         const bool highlighted = highlightOwner >= 0 && node.owner == highlightOwner;
-        ImNodes::PushColorStyle(ImNodesCol_NodeOutline, highlighted ? rgb(255, 214, 90) : rgb(90, 90, 100));
+        if (highlighted) {
+            ed::PushStyleColor(ed::StyleColor_NodeBorder, ImVec4(1.0f, 0.84f, 0.35f, 1.0f));
+        }
 
-        ImNodes::BeginNode(node.id);
-        ImNodes::BeginNodeTitleBar();
+        ed::BeginNode(nodeId);
+        ImGui::PushID(node.id);
+        const float left = ImGui::GetCursorScreenPos().x;
+        ImGui::BeginGroup();
         ImGui::TextUnformatted(node.label().c_str());
-        ImNodes::EndNodeTitleBar();
+        ImGui::Dummy(ImVec2(kNodeWidth, 0.0f));
+        ImGui::EndGroup();
+        const ImVec2 headerMin = ImGui::GetItemRectMin();
+        const ImVec2 headerMax = ImGui::GetItemRectMax();
+        ImGui::Dummy(ImVec2(0.0f, 2.0f));
 
         ImGui::TextDisabled("%s", node.type.c_str());
+        if (!node.outputs.empty()) {
+            // The single output sits at the right of the type row.
+            ImGui::SameLine();
+            ImGui::SetCursorScreenPos(ImVec2(left + kNodeWidth - iconSize, ImGui::GetCursorScreenPos().y));
+            ed::BeginPin(compiledOutputPinId(node.id), ed::PinKind::Output);
+            ed::PinPivotAlignment(ImVec2(1.0f, 0.5f));
+            ed::PinPivotSize(ImVec2(0.0f, 0.0f));
+            elementPinIcon(true, iconSize);
+            ed::EndPin();
+        }
         if (auto it = timings_.find(node.label()); it != timings_.end() && it->second > 0.0f) {
             const float t = maxMs > 0.0f ? it->second / maxMs : 0.0f;
             ImGui::TextColored(ImVec4(0.6f + 0.4f * t, 0.9f - 0.5f * t, 0.5f - 0.3f * t, 1.0f), "%.3f ms", it->second);
@@ -1075,28 +1264,26 @@ void StudioApp::drawCompiledEditor() {
             if (edge.to != node.id) {
                 continue;
             }
-            ImNodes::BeginInputAttribute(elementInputAttr(node.id, edge.slot), ImNodesPinShape_Circle);
             const ElementNode* from = compiled_.find(edge.from);
             const bool hidden = hideBuffers_ && from && from->category == ElementCategory::Buffer;
+            ed::BeginPin(compiledInputPinId(node.id, edge.slot), ed::PinKind::Input);
+            ed::PinPivotAlignment(ImVec2(0.0f, 0.5f));
+            ed::PinPivotSize(ImVec2(0.0f, 0.0f));
+            elementPinIcon(!hidden, iconSize);
+            ImGui::SameLine();
             if (hidden) {
                 ImGui::TextDisabled("%d: %s", edge.slot, from->label().c_str());
             } else {
-                ImGui::Dummy(ImVec2(1.0f, ImGui::GetTextLineHeight()));
+                ImGui::TextDisabled("%d", edge.slot);
             }
-            ImNodes::EndInputAttribute();
+            ed::EndPin();
         }
-        if (!node.outputs.empty()) {
-            ImNodes::BeginOutputAttribute(elementOutputAttr(node.id), ImNodesPinShape_CircleFilled);
-            ImGui::Dummy(ImVec2(150.0f, 1.0f));
-            ImNodes::EndOutputAttribute();
-        } else {
-            ImGui::Dummy(ImVec2(150.0f, 1.0f));
+        ImGui::PopID();
+        ed::EndNode();
+        drawNodeHeader(nodeId, headerMin, headerMax, categoryColor(node.category));
+        if (highlighted) {
+            ed::PopStyleColor();
         }
-        ImNodes::EndNode();
-        ImNodes::PopColorStyle();
-        ImNodes::PopColorStyle();
-        ImNodes::PopColorStyle();
-        ImNodes::PopColorStyle();
     }
 
     for (const auto& edge : compiled_.edges) {
@@ -1109,32 +1296,25 @@ void StudioApp::drawCompiledEditor() {
             continue;
         }
         const bool highlighted = highlightOwner >= 0 && (from->owner == highlightOwner || to->owner == highlightOwner);
-        ImNodes::PushColorStyle(ImNodesCol_Link, highlighted ? rgb(255, 214, 90, 220) : rgb(150, 150, 170, 180));
-        ImNodes::Link(edge.id, elementOutputAttr(edge.from), elementInputAttr(edge.to, edge.slot));
-        ImNodes::PopColorStyle();
+        ed::Link(compiledLinkId(edge.id), compiledOutputPinId(edge.from), compiledInputPinId(edge.to, edge.slot),
+                 highlighted ? ImVec4(1.0f, 0.84f, 0.35f, 0.9f) : ImVec4(0.6f, 0.6f, 0.68f, 0.75f),
+                 highlighted ? 2.5f : 1.5f);
     }
-
-    ImNodes::MiniMap(0.18f, ImNodesMiniMapLocation_BottomRight);
-    ImNodes::EndNodeEditor();
 
     // Node sizes are known once the nodes have been drawn.
-    if (compiledLayoutNeedsMeasure_) {
+    if (compiledLayoutNeedsMeasure_ && !compiledLayoutDirty_) {
         layoutCompiledGraph(true);
         compiledLayoutNeedsMeasure_ = false;
+        fitRequested_ = true;
     }
 
-    // The view is read-only: links dragged here are ignored.
-    int ignoredStart = 0, ignoredEnd = 0;
-    (void)ImNodes::IsLinkCreated(&ignoredStart, &ignoredEnd);
+    std::vector<ed::NodeId> selected(ed::GetSelectedObjectCount());
+    selected.resize(ed::GetSelectedNodes(selected.data(), static_cast<int>(selected.size())));
+    selectedElement_ = selected.empty() ? -1 : elementFromEditor(selected.front());
 
-    const int selectedCount = ImNodes::NumSelectedNodes();
-    if (selectedCount > 0) {
-        std::vector<int> selected(selectedCount);
-        ImNodes::GetSelectedNodes(selected.data());
-        selectedElement_ = selected.front();
-    } else {
-        selectedElement_ = -1;
-    }
+    handleFit(compiledFitFrames_);
+    ed::End();
+    ed::SetCurrentEditor(nullptr);
 }
 
 void StudioApp::drawInspector() {

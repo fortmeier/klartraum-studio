@@ -1,8 +1,8 @@
 # Klartraum Studio
 
-A C++20 Dear ImGui application for building, inspecting and tuning
+An application for building, inspecting and tuning
 [klartraum](https://github.com/fortmeier/klartraum) rendering compute graphs. It
-opens with the Gaussian-splatting graph and renders it live behind the editor.
+opens with the Gaussian-splatting graph and renders it live.
 
 The studio shows the graph at two levels:
 
@@ -23,8 +23,9 @@ The studio shows the graph at two levels:
 
 Graphs can be saved to and loaded from `*.ktgraph.json` files.
 
-Node editing uses [imnodes](https://github.com/Nelarius/imnodes), built
-against the Dear ImGui that klartraum bundles.
+Node editing uses [imgui-node-editor](https://github.com/thedmd/imgui-node-editor)
+(zoomable, pannable canvas), built against the Dear ImGui that klartraum
+bundles. A one-line patch (`cmake/patches/`) adapts it to ImGui ≥ 1.92.
 
 ## Building
 
@@ -74,9 +75,10 @@ klartraum sources, so `3rdparty/spz/samples/racoonfamily.spz` always works.
 | Where | Action |
 |---|---|
 | Scene | left drag orbits, mouse wheel zooms |
-| Authoring graph | right-click the canvas to add a node, right-click a node for its menu |
-| | drag from pin to pin to connect; Ctrl+click a link end to detach it |
-| | Del / Backspace deletes the selection |
+| Graph (both tabs) | scroll / two-finger swipe zooms, right-drag pans, F or *Fit* shows everything |
+| Authoring graph | right-click the canvas to add a node, right-click a node or link for its menu |
+| | drag from pin to pin to connect (invalid links are refused with a reason) |
+| | Del / Backspace deletes the selection, *Arrange* re-lays out the graph |
 | Inspector | edit the selected node's parameters; errors are listed there |
 | Compiled graph | select an element to see its inputs, consumers and timing; *Hide buffers* declutters |
 | Menu | File → New/Open/Save (Ctrl+O, Ctrl+S); Graph → auto-apply, arrange |
@@ -112,7 +114,7 @@ introspected graph contains exactly the elements klartraum compiled.
 | `src/studio/graph_compiler.*` | authoring graph → plan → klartraum elements |
 | `src/studio/graph_introspection.*` | snapshot of a compiled klartraum element DAG |
 | `src/studio/graph_layout.*` | layered DAG layout |
-| `src/studio/studio_app.*` | the ImGui/imnodes user interface |
+| `src/studio/studio_app.*` | the ImGui / imgui-node-editor user interface |
 | `src/main.cpp` | command line and frontend setup |
 | `tools/studio_snapshot.cpp` | headless UI snapshot tool |
 
