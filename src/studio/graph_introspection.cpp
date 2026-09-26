@@ -7,6 +7,10 @@
 
 namespace kstudio {
 
+namespace {
+constexpr int kUnassigned = -2;
+}
+
 ElementCategory categorize(std::string_view type) {
     auto starts = [&](std::string_view prefix) { return type.starts_with(prefix); };
     if (starts("BufferElement") || starts("TensorElement")) {
@@ -85,7 +89,7 @@ ElementGraph introspect(const std::shared_ptr<klartraum::ComputeGraphElement>& r
         if (auto it = owners.find(element.get()); it != owners.end()) {
             node.owner = it->second;
         } else {
-            node.owner = defaultOwner;
+            node.owner = kUnassigned;
         }
         for (const auto& [slot, inputId] : inputs) {
             node.inputs.push_back(inputId);
@@ -101,6 +105,21 @@ ElementGraph introspect(const std::shared_ptr<klartraum::ComputeGraphElement>& r
         auto& outputs = graph.nodes[edge.from].outputs;
         if (std::find(outputs.begin(), outputs.end(), edge.to) == outputs.end()) {
             outputs.push_back(edge.to);
+        }
+    }
+
+    // Unlisted elements (e.g. inside a group) belong to what consumes them.
+    // Consumers come after producers, so walking backwards resolves chains.
+    for (auto it = graph.nodes.rbegin(); it != graph.nodes.rend(); ++it) {
+        if (it->owner != kUnassigned) {
+            continue;
+        }
+        it->owner = defaultOwner;
+        for (int consumer : it->outputs) {
+            if (graph.nodes[consumer].owner != kUnassigned) {
+                it->owner = graph.nodes[consumer].owner;
+                break;
+            }
         }
     }
     return graph;

@@ -13,6 +13,9 @@
 #include "studio/graph_compiler.hpp"
 #include "studio/graph_introspection.hpp"
 #include "studio/graph_model.hpp"
+#include "studio/graph_runner.hpp"
+#include "studio/onnx_info.hpp"
+#include "studio/preview_texture.hpp"
 
 struct GLFWwindow;
 
@@ -24,8 +27,13 @@ class GaussianDataStandard;
 
 namespace kstudio {
 
+// The example graphs offered in File > Examples.
+enum class Example { GaussianSplatting, Autoencoder, SplatAutoencoder };
+std::optional<Example> exampleFromName(std::string_view name);
+
 struct StudioOptions {
-    std::filesystem::path graphFile;  // empty: the default Gaussian-splatting graph
+    std::filesystem::path graphFile;  // empty: the example graph
+    Example example = Example::GaussianSplatting;
     std::string scenePath;            // scene for the default graph
     SplattingBackend backend = SplattingBackend::Raster;
     bool profiling = false;
@@ -61,6 +69,17 @@ public:
     const Graph& graph() const { return graph_; }
     // Edits made through this reference must call Graph::touch().
     Graph& editableGraph() { return graph_; }
+    void loadExample(Example example);
+    // Executes the run part of the graph at the start of the next frame.
+    void requestRun() { runRequested_ = true; }
+    bool lastRunSucceeded() const { return lastRun_.has_value() && runError_.empty(); }
+    const std::string& runError() const { return runError_; }
+    // 0: the live graph, 1: the last run's graph.
+    void showCompiled(int source) {
+        compiledSource_ = source;
+        compiledLayoutDirty_ = true;
+        selectedElement_ = -1;
+    }
 
 private:
     // Graph documents
@@ -68,7 +87,13 @@ private:
     void setGraph(Graph graph, std::filesystem::path file);
     bool openGraph(const std::filesystem::path& path);
     bool saveGraphTo(const std::filesystem::path& path);
-    std::optional<std::filesystem::path> resolveScenePath(const std::string& path) const;
+    // Relative input paths are tried against the working directory, the graph
+    // file's directory and the klartraum sources (for the bundled samples).
+    std::optional<std::filesystem::path> resolveInputPath(const std::string& path) const;
+    // Relative output paths are relative to the graph file, else the working
+    // directory.
+    std::filesystem::path resolveOutputPath(const std::string& path) const;
+    std::shared_ptr<const OnnxModelInfo> onnxInfo(const std::string& path, std::string& error);
 
     // Compilation
     void updatePlan();
@@ -79,6 +104,15 @@ private:
     void syncCamera();
     void pushCameraParams(const CameraParams& params);
     void refreshProfiling();
+    void run();
+    // The graph the compiled view shows: the live graph or the last run's.
+    const ElementGraph& shownCompiled() const {
+        return compiledSource_ == 1 && lastRun_ ? lastRun_->compiled : compiled_;
+    }
+    const std::map<std::string, float>& shownTimings() const {
+        return compiledSource_ == 1 && lastRun_ ? lastRun_->timings : timings_;
+    }
+    bool runIsOutdated() const { return lastRun_ && lastRunRevision_ != graph_.revision(); }
 
     // UI
     void setupStyle();
@@ -91,6 +125,9 @@ private:
     void drawNodeInspector(Node& node);
     void drawElementInspector(const ElementNode& element);
     void drawDiagnostics(int node);
+    void drawRunControls();
+    // Draws a node's run result scaled to `width`; returns false if there is none.
+    bool drawPreview(int node, float width);
     void drawFileDialog();
     void layoutAuthoringGraph();
     // Without heights, nodes are placed on a fixed grid; with heights
@@ -124,8 +161,18 @@ private:
     bool applyRequested_ = false;
     std::map<std::string, std::shared_ptr<klartraum::GaussianDataStandard>> models_;
 
+    // Run
+    OnnxInfoCache onnxInfo_;
+    bool runRequested_ = false;
+    bool autoRun_ = false;
+    std::optional<RunResult> lastRun_;
+    uint64_t lastRunRevision_ = 0;
+    std::string runError_;
+    std::map<int, std::unique_ptr<PreviewTexture>> previews_;
+
     // Compiled graph view
     ElementGraph compiled_;
+    int compiledSource_ = 0;  // 0: live graph, 1: last run
     std::string compiledSignature_;
     bool compiledLayoutDirty_ = true;
     bool compiledLayoutNeedsMeasure_ = false;

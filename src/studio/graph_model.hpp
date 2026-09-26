@@ -11,13 +11,28 @@
 
 namespace kstudio {
 
-// The authoring graph: what the user edits in the node editor. It describes a
-// rendering pipeline at the level of klartraum's public building blocks and is
-// compiled into a klartraum compute graph by GraphCompiler.
+// The authoring graph: what the user edits in the node editor. It describes
+// work at the level of klartraum's public building blocks. Two parts of it
+// are compiled separately (see graph_compiler.hpp):
+//  - the live part, everything feeding Present, renders every frame;
+//  - the run part, everything feeding a sink (Preview, Image File Writer),
+//    is executed once each time the user presses Run.
 
-enum class PinType { Gaussians, Camera, Image };
+enum class PinType { Gaussians, Camera, Image, Tensor };
 
-enum class NodeKind { Scene, Camera, SwapchainTarget, GaussianSplatting, Present };
+enum class NodeKind {
+    Scene,
+    Camera,
+    SwapchainTarget,
+    GaussianSplatting,
+    Present,
+    OffscreenTarget,
+    ImageFile,
+    ImageToTensor,
+    OnnxModel,
+    Preview,
+    ImageFileWriter,
+};
 
 enum class SplattingBackend { Compute, Raster };
 
@@ -25,6 +40,7 @@ enum class UpAxis { Y, Z };
 
 struct SceneParams {
     std::string path;
+    bool operator==(const SceneParams&) const = default;
 };
 
 // Orbit camera. These values are applied live and never require a rebuild.
@@ -65,7 +81,43 @@ struct PresentParams {
     bool operator==(const PresentParams&) const = default;
 };
 
-using NodeParams = std::variant<SceneParams, CameraParams, SwapchainTargetParams, SplattingParams, PresentParams>;
+// An image of fixed size that rendering can target instead of the swapchain.
+struct OffscreenTargetParams {
+    uint32_t width = 128;
+    uint32_t height = 128;
+    bool operator==(const OffscreenTargetParams&) const = default;
+};
+
+// Loads an image file and resizes it to width x height; outputs a
+// 1x3xHxW tensor.
+struct ImageFileParams {
+    std::string path;
+    uint32_t width = 128;
+    uint32_t height = 128;
+    bool operator==(const ImageFileParams&) const = default;
+};
+
+struct ImageToTensorParams {
+    bool operator==(const ImageToTensorParams&) const = default;
+};
+
+struct OnnxModelParams {
+    std::string path;
+    bool operator==(const OnnxModelParams&) const = default;
+};
+
+struct PreviewParams {
+    bool operator==(const PreviewParams&) const = default;
+};
+
+struct ImageFileWriterParams {
+    std::string path = "output.png";
+    bool operator==(const ImageFileWriterParams&) const = default;
+};
+
+using NodeParams = std::variant<SceneParams, CameraParams, SwapchainTargetParams, SplattingParams, PresentParams,
+                                OffscreenTargetParams, ImageFileParams, ImageToTensorParams, OnnxModelParams,
+                                PreviewParams, ImageFileWriterParams>;
 
 struct PinDesc {
     std::string_view name;
@@ -76,6 +128,7 @@ struct NodeKindInfo {
     NodeKind kind;
     std::string_view name;        // stable identifier used in files
     std::string_view title;       // default display title
+    std::string_view group;       // for the add-node menu
     std::string_view description;
     std::span<const PinDesc> inputs;
     std::span<const PinDesc> outputs;
@@ -87,6 +140,8 @@ std::optional<NodeKind> kindFromName(std::string_view name);
 std::string_view pinTypeName(PinType type);
 std::string_view backendName(SplattingBackend backend);
 NodeParams defaultParams(NodeKind kind);
+// Preview and Image File Writer: executed by Run.
+bool isSink(NodeKind kind);
 
 struct Vec2 {
     float x = 0.0f;
@@ -164,9 +219,15 @@ public:
     std::vector<Node>& nodes() { return nodes_; }
     const std::vector<Link>& links() const { return links_; }
 
-    // Checks everything the compiler needs; see GraphCompiler for what the
-    // klartraum backends can express.
+    // Checks the graph's structure; see GraphCompiler for what the klartraum
+    // backends can express. Tensor shapes and files are checked by the
+    // compiler (planGraph).
     std::vector<Diagnostic> validate() const;
+
+    // The nodes `node` depends on, including itself.
+    std::vector<int> upstreamOf(int node) const;
+    // Nodes in dependency order (producers first); ties keep insertion order.
+    std::vector<int> topologicalOrder() const;
     bool hasErrors() const;
 
     // Incremented on every change that may affect the compiled graph.
@@ -188,5 +249,15 @@ private:
 // The Gaussian-splatting pipeline: Scene, Camera and Swapchain Target feed a
 // Gaussian Splatting node, whose image is presented.
 Graph makeGaussianSplattingGraph(const std::string& scenePath, SplattingBackend backend = SplattingBackend::Raster);
+
+// An image file is encoded and decoded by two ONNX models; the result is
+// previewed and written to `outputPath` on Run.
+Graph makeAutoencoderGraph(const std::string& imagePath, const std::string& encoderPath,
+                           const std::string& decoderPath, const std::string& outputPath);
+
+// A Gaussian-splatting rendering into an offscreen image, fed through the
+// encoder and decoder and previewed on Run.
+Graph makeSplatAutoencoderGraph(const std::string& scenePath, const std::string& encoderPath,
+                                const std::string& decoderPath);
 
 } // namespace kstudio

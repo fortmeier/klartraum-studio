@@ -11,24 +11,39 @@ namespace {
 
 constexpr PinDesc kSceneOutputs[] = {{"Gaussians", PinType::Gaussians}};
 constexpr PinDesc kCameraOutputs[] = {{"Camera", PinType::Camera}};
-constexpr PinDesc kTargetOutputs[] = {{"Image", PinType::Image}};
+constexpr PinDesc kImageOutputs[] = {{"Image", PinType::Image}};
 constexpr PinDesc kSplattingInputs[] = {
     {"Gaussians", PinType::Gaussians},
     {"Camera", PinType::Camera},
     {"Target", PinType::Image},
 };
-constexpr PinDesc kSplattingOutputs[] = {{"Image", PinType::Image}};
-constexpr PinDesc kPresentInputs[] = {{"Image", PinType::Image}};
+constexpr PinDesc kImageInputs[] = {{"Image", PinType::Image}};
+constexpr PinDesc kTensorInputs[] = {{"Tensor", PinType::Tensor}};
+constexpr PinDesc kTensorOutputs[] = {{"Tensor", PinType::Tensor}};
 
 const NodeKindInfo kKinds[] = {
-    {NodeKind::Scene, "scene", "Scene", "Loads a 3D Gaussian model from an .spz file.", {}, kSceneOutputs},
-    {NodeKind::Camera, "camera", "Orbit Camera", "Camera uniform buffer driven by an orbit camera.", {}, kCameraOutputs},
-    {NodeKind::SwapchainTarget, "swapchain_target", "Swapchain Target",
-     "The window's swapchain images, rendered into directly.", {}, kTargetOutputs},
-    {NodeKind::GaussianSplatting, "gaussian_splatting", "Gaussian Splatting",
+    {NodeKind::Scene, "scene", "Scene", "Sources", "Loads a 3D Gaussian model from an .spz file.", {}, kSceneOutputs},
+    {NodeKind::ImageFile, "image_file", "Image File", "Sources",
+     "Loads an image file (PNG, JPEG, ...) as a 1x3xHxW tensor with values in [0, 1].", {}, kTensorOutputs},
+    {NodeKind::Camera, "camera", "Orbit Camera", "Rendering", "Camera uniform buffer driven by an orbit camera.", {},
+     kCameraOutputs},
+    {NodeKind::SwapchainTarget, "swapchain_target", "Swapchain Target", "Rendering",
+     "The window's swapchain images, rendered into directly.", {}, kImageOutputs},
+    {NodeKind::OffscreenTarget, "offscreen_target", "Offscreen Target", "Rendering",
+     "An image of fixed size to render into for further processing.", {}, kImageOutputs},
+    {NodeKind::GaussianSplatting, "gaussian_splatting", "Gaussian Splatting", "Rendering",
      "Renders the Gaussians into the target image (klartraum::createGaussianSplatting).", kSplattingInputs,
-     kSplattingOutputs},
-    {NodeKind::Present, "present", "Present", "Presents the image in the window.", kPresentInputs, {}},
+     kImageOutputs},
+    {NodeKind::ImageToTensor, "image_to_tensor", "Image to Tensor", "Compute",
+     "Converts a rendered offscreen image into a 1x3xHxW tensor.", kImageInputs, kTensorOutputs},
+    {NodeKind::OnnxModel, "onnx_model", "ONNX Model", "Compute",
+     "Runs an ONNX network (klartraum::OnnxNetwork) on a tensor.", kTensorInputs, kTensorOutputs},
+    {NodeKind::Present, "present", "Present", "Outputs", "Presents the image in the window every frame.",
+     kImageInputs, {}},
+    {NodeKind::Preview, "preview", "Preview", "Outputs", "Shows a 1- or 3-channel image tensor when the graph is run.",
+     kTensorInputs, {}},
+    {NodeKind::ImageFileWriter, "image_file_writer", "Image File Writer", "Outputs",
+     "Writes a 1- or 3-channel image tensor to a PNG file when the graph is run.", kTensorInputs, {}},
 };
 
 } // namespace
@@ -60,6 +75,7 @@ std::string_view pinTypeName(PinType type) {
     case PinType::Gaussians: return "Gaussians";
     case PinType::Camera: return "Camera";
     case PinType::Image: return "Image";
+    case PinType::Tensor: return "Tensor";
     }
     return "?";
 }
@@ -75,8 +91,18 @@ NodeParams defaultParams(NodeKind kind) {
     case NodeKind::SwapchainTarget: return SwapchainTargetParams{};
     case NodeKind::GaussianSplatting: return SplattingParams{};
     case NodeKind::Present: return PresentParams{};
+    case NodeKind::OffscreenTarget: return OffscreenTargetParams{};
+    case NodeKind::ImageFile: return ImageFileParams{};
+    case NodeKind::ImageToTensor: return ImageToTensorParams{};
+    case NodeKind::OnnxModel: return OnnxModelParams{};
+    case NodeKind::Preview: return PreviewParams{};
+    case NodeKind::ImageFileWriter: return ImageFileWriterParams{};
     }
     throw std::logic_error("unknown node kind");
+}
+
+bool isSink(NodeKind kind) {
+    return kind == NodeKind::Preview || kind == NodeKind::ImageFileWriter;
 }
 
 int pinId(const PinRef& pin) {
@@ -224,6 +250,49 @@ bool Graph::reaches(int fromNode, int toNode) const {
     return false;
 }
 
+std::vector<int> Graph::upstreamOf(int node) const {
+    std::vector<int> result;
+    std::set<int> visited;
+    std::vector<int> stack{node};
+    while (!stack.empty()) {
+        const int current = stack.back();
+        stack.pop_back();
+        if (!visited.insert(current).second) {
+            continue;
+        }
+        result.push_back(current);
+        for (const auto& link : links_) {
+            if (link.toNode == current) {
+                stack.push_back(link.fromNode);
+            }
+        }
+    }
+    return result;
+}
+
+std::vector<int> Graph::topologicalOrder() const {
+    // connect() keeps the graph acyclic, so repeatedly taking the first node
+    // whose producers are all placed terminates.
+    std::vector<int> order;
+    std::set<int> placed;
+    while (order.size() < nodes_.size()) {
+        for (const auto& node : nodes_) {
+            if (placed.contains(node.id)) {
+                continue;
+            }
+            const bool ready = std::all_of(links_.begin(), links_.end(), [&](const Link& l) {
+                return l.toNode != node.id || placed.contains(l.fromNode);
+            });
+            if (ready) {
+                order.push_back(node.id);
+                placed.insert(node.id);
+                break;
+            }
+        }
+    }
+    return order;
+}
+
 std::vector<Diagnostic> Graph::validate() const {
     std::vector<Diagnostic> diagnostics;
     auto report = [&](Severity severity, int node, std::string message) {
@@ -231,18 +300,29 @@ std::vector<Diagnostic> Graph::validate() const {
     };
 
     std::vector<const Node*> presents;
+    std::vector<const Node*> sinks;
     for (const auto& node : nodes_) {
         if (node.kind == NodeKind::Present) {
             presents.push_back(&node);
+        } else if (isSink(node.kind)) {
+            sinks.push_back(&node);
         }
     }
-    if (presents.empty()) {
-        report(Severity::Error, -1, "The graph has no Present node, so nothing is rendered.");
-    } else if (presents.size() > 1) {
+    if (presents.empty() && sinks.empty()) {
+        report(Severity::Error, -1,
+               "Nothing to do: add a Present node to render every frame, or a Preview or Image File Writer to run "
+               "the graph.");
+    }
+    if (presents.size() > 1) {
         for (const Node* present : presents) {
             report(Severity::Error, present->id, "Only one Present node is supported.");
         }
     }
+
+    // The target a Gaussian Splatting node renders into, if connected.
+    auto splattingTarget = [&](const Node* splatting) -> const Node* {
+        return splatting && splatting->kind == NodeKind::GaussianSplatting ? inputNode(splatting->id, 2) : nullptr;
+    };
 
     for (const auto& node : nodes_) {
         const auto& inputs = kindInfo(node.kind).inputs;
@@ -260,10 +340,10 @@ std::vector<Diagnostic> Graph::validate() const {
             break;
         case NodeKind::GaussianSplatting: {
             const Node* target = inputNode(node.id, 2);
-            if (target && target->kind != NodeKind::SwapchainTarget) {
+            if (target && target->kind != NodeKind::SwapchainTarget && target->kind != NodeKind::OffscreenTarget) {
                 report(Severity::Error, node.id,
-                       "The target must be a Swapchain Target: klartraum's splatting backends render into "
-                       "swapchain images and do not composite onto another node's output.");
+                       "The target must be a Swapchain Target or an Offscreen Target: klartraum's splatting "
+                       "backends render into an image and do not composite onto another node's output.");
             }
             const auto& params = node.as<SplattingParams>();
             if (params.backend == SplattingBackend::Compute && (params.splatTileX == 0 || params.splatTileY == 0)) {
@@ -275,19 +355,72 @@ std::vector<Diagnostic> Graph::validate() const {
             const Node* source = inputNode(node.id, 0);
             if (source && source->kind != NodeKind::GaussianSplatting) {
                 report(Severity::Error, node.id, "Present needs a rendered image, e.g. from Gaussian Splatting.");
+            } else if (const Node* target = splattingTarget(source);
+                       target && target->kind != NodeKind::SwapchainTarget) {
+                report(Severity::Error, node.id,
+                       "Present shows swapchain images; render into a Swapchain Target to present.");
             }
             break;
         }
+        case NodeKind::ImageToTensor: {
+            const Node* source = inputNode(node.id, 0);
+            if (source && source->kind != NodeKind::GaussianSplatting) {
+                report(Severity::Error, node.id, "Image to Tensor needs a rendered image, e.g. from Gaussian Splatting.");
+            } else if (const Node* target = splattingTarget(source);
+                       target && target->kind != NodeKind::OffscreenTarget) {
+                report(Severity::Error, node.id,
+                       "Only offscreen images can be processed; render into an Offscreen Target.");
+            }
+            break;
+        }
+        case NodeKind::OffscreenTarget: {
+            const auto& p = node.as<OffscreenTargetParams>();
+            if (p.width == 0 || p.height == 0) {
+                report(Severity::Error, node.id, "Width and height must not be zero.");
+            }
+            break;
+        }
+        case NodeKind::ImageFile: {
+            const auto& p = node.as<ImageFileParams>();
+            if (p.path.empty()) {
+                report(Severity::Error, node.id, "No image file is set.");
+            }
+            if (p.width == 0 || p.height == 0) {
+                report(Severity::Error, node.id, "Width and height must not be zero.");
+            }
+            break;
+        }
+        case NodeKind::OnnxModel:
+            if (node.as<OnnxModelParams>().path.empty()) {
+                report(Severity::Error, node.id, "No ONNX model file is set.");
+            }
+            break;
+        case NodeKind::ImageFileWriter:
+            if (node.as<ImageFileWriterParams>().path.empty()) {
+                report(Severity::Error, node.id, "No output file is set.");
+            }
+            break;
         default:
             break;
         }
     }
 
-    // Nodes that do not feed the presented image are not compiled.
-    if (presents.size() == 1) {
+    // Nodes that feed neither Present nor a sink are not compiled.
+    std::set<int> used;
+    for (const Node* output : presents) {
+        for (int id : upstreamOf(output->id)) {
+            used.insert(id);
+        }
+    }
+    for (const Node* sink : sinks) {
+        for (int id : upstreamOf(sink->id)) {
+            used.insert(id);
+        }
+    }
+    if (!presents.empty() || !sinks.empty()) {
         for (const auto& node : nodes_) {
-            if (node.id != presents.front()->id && !reaches(node.id, presents.front()->id)) {
-                report(Severity::Info, node.id, "Not connected to Present; it is not compiled.");
+            if (!used.contains(node.id)) {
+                report(Severity::Info, node.id, "Not connected to Present or a sink; it is not compiled.");
             }
         }
     }
@@ -325,6 +458,64 @@ Graph makeGaussianSplattingGraph(const std::string& scenePath, SplattingBackend 
     graph.connect(out(camera), in(splatting, 1));
     graph.connect(out(target), in(splatting, 2));
     graph.connect(out(splatting), in(present, 0));
+    return graph;
+}
+
+namespace {
+
+PinRef out(int node, int slot = 0) { return {node, PinDirection::Output, slot}; }
+PinRef in(int node, int slot = 0) { return {node, PinDirection::Input, slot}; }
+
+} // namespace
+
+Graph makeAutoencoderGraph(const std::string& imagePath, const std::string& encoderPath,
+                           const std::string& decoderPath, const std::string& outputPath) {
+    Graph graph;
+    const int image = graph.addNode(NodeKind::ImageFile, {0.0f, 60.0f});
+    const int encoder = graph.addNode(NodeKind::OnnxModel, {310.0f, 60.0f});
+    const int decoder = graph.addNode(NodeKind::OnnxModel, {620.0f, 60.0f});
+    const int preview = graph.addNode(NodeKind::Preview, {930.0f, 0.0f});
+    const int writer = graph.addNode(NodeKind::ImageFileWriter, {930.0f, 260.0f});
+
+    graph.findNode(image)->as<ImageFileParams>().path = imagePath;
+    graph.findNode(encoder)->as<OnnxModelParams>().path = encoderPath;
+    graph.findNode(encoder)->title = "Encoder";
+    graph.findNode(decoder)->as<OnnxModelParams>().path = decoderPath;
+    graph.findNode(decoder)->title = "Decoder";
+    graph.findNode(writer)->as<ImageFileWriterParams>().path = outputPath;
+
+    graph.connect(out(image), in(encoder));
+    graph.connect(out(encoder), in(decoder));
+    graph.connect(out(decoder), in(preview));
+    graph.connect(out(decoder), in(writer));
+    return graph;
+}
+
+Graph makeSplatAutoencoderGraph(const std::string& scenePath, const std::string& encoderPath,
+                                const std::string& decoderPath) {
+    Graph graph;
+    const int scene = graph.addNode(NodeKind::Scene, {0.0f, 0.0f});
+    const int camera = graph.addNode(NodeKind::Camera, {0.0f, 150.0f});
+    const int target = graph.addNode(NodeKind::OffscreenTarget, {0.0f, 300.0f});
+    const int splatting = graph.addNode(NodeKind::GaussianSplatting, {310.0f, 120.0f});
+    const int toTensor = graph.addNode(NodeKind::ImageToTensor, {620.0f, 150.0f});
+    const int encoder = graph.addNode(NodeKind::OnnxModel, {930.0f, 150.0f});
+    const int decoder = graph.addNode(NodeKind::OnnxModel, {1240.0f, 150.0f});
+    const int preview = graph.addNode(NodeKind::Preview, {1550.0f, 100.0f});
+
+    graph.findNode(scene)->as<SceneParams>().path = scenePath;
+    graph.findNode(encoder)->as<OnnxModelParams>().path = encoderPath;
+    graph.findNode(encoder)->title = "Encoder";
+    graph.findNode(decoder)->as<OnnxModelParams>().path = decoderPath;
+    graph.findNode(decoder)->title = "Decoder";
+
+    graph.connect(out(scene), in(splatting, 0));
+    graph.connect(out(camera), in(splatting, 1));
+    graph.connect(out(target), in(splatting, 2));
+    graph.connect(out(splatting), in(toTensor));
+    graph.connect(out(toTensor), in(encoder));
+    graph.connect(out(encoder), in(decoder));
+    graph.connect(out(decoder), in(preview));
     return graph;
 }
 

@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <cstdlib>
 #include <exception>
 #include <filesystem>
@@ -18,7 +19,9 @@ constexpr int kWindowHeight = 960;
 
 void printUsage(const char* program) {
     std::cout << "Usage: " << program << " [options] [graph.ktgraph.json]\n"
-              << "  --spz PATH                 scene for the default Gaussian-splatting graph\n"
+              << "  --example NAME             start with an example: gaussian-splatting (default),\n"
+              << "                             autoencoder or splat-autoencoder\n"
+              << "  --spz PATH                 scene for the Gaussian-splatting examples\n"
               << "  --backend compute|raster   backend of the default graph (default: raster)\n"
               << "  --profile                  start with per-element GPU timings enabled\n"
               << "  --frames N                 exit after N frames (smoke testing)\n"
@@ -36,6 +39,13 @@ int main(int argc, char** argv) {
         if (arg == "--help" || arg == "-h") {
             printUsage(argv[0]);
             return 0;
+        } else if (arg == "--example" && i + 1 < argc) {
+            const auto example = kstudio::exampleFromName(argv[++i]);
+            if (!example) {
+                std::cerr << "Unknown --example '" << argv[i] << "'\n";
+                return EXIT_FAILURE;
+            }
+            options.example = *example;
         } else if (arg == "--spz" && i + 1 < argc) {
             options.scenePath = argv[++i];
         } else if (arg == "--backend" && i + 1 < argc) {
@@ -78,7 +88,10 @@ int main(int argc, char** argv) {
             frontend.loop(maxFrames);
 
             frontend.setGui(nullptr);
-            if (maxFrames > 0 && !app.hasAppliedGraph()) {
+            const bool hasPresent =
+                std::any_of(app.graph().nodes().begin(), app.graph().nodes().end(),
+                            [](const kstudio::Node& n) { return n.kind == kstudio::NodeKind::Present; });
+            if (maxFrames > 0 && hasPresent && !app.hasAppliedGraph()) {
                 std::cerr << "No graph was compiled: " << app.lastError() << "\n";
                 return EXIT_FAILURE;
             }

@@ -1,6 +1,7 @@
 #include "studio/graph_compiler.hpp"
 
 #include <algorithm>
+#include <set>
 
 #include "klartraum/computegraph/imageviewsrc.hpp"
 #include "klartraum/gaussian_data_standard.hpp"
@@ -9,19 +10,71 @@
 
 namespace kstudio {
 
-CompilePlan planGraph(const Graph& graph) {
+CompilePlan planGraph(const Graph& graph, const OnnxInfoProvider& onnxInfo, const InputExists& inputExists) {
     CompilePlan plan;
     plan.diagnostics = graph.validate();
-    const bool hasErrors = std::any_of(plan.diagnostics.begin(), plan.diagnostics.end(),
-                                       [](const Diagnostic& d) { return d.severity == Severity::Error; });
-    if (hasErrors) {
-        return plan;
+    ShapeInference shapes = inferTensorShapes(graph, onnxInfo);
+    plan.diagnostics.insert(plan.diagnostics.end(), shapes.diagnostics.begin(), shapes.diagnostics.end());
+    if (inputExists) {
+        for (const auto& node : graph.nodes()) {
+            const std::string* path = nullptr;
+            if (node.kind == NodeKind::Scene) {
+                path = &node.as<SceneParams>().path;
+            } else if (node.kind == NodeKind::ImageFile) {
+                path = &node.as<ImageFileParams>().path;
+            }
+            if (path && !path->empty() && !inputExists(*path)) {
+                plan.diagnostics.push_back(Diagnostic{Severity::Error, node.id, "File not found: " + *path});
+            }
+        }
     }
 
-    // validate() guarantees a single Present fed by a fully connected
-    // Gaussian Splatting node whose target is a Swapchain Target.
+    std::set<int> errorNodes;
+    bool graphError = false;
+    for (const auto& d : plan.diagnostics) {
+        if (d.severity != Severity::Error) {
+            continue;
+        }
+        if (d.node < 0) {
+            graphError = true;
+        } else {
+            errorNodes.insert(d.node);
+        }
+    }
+    auto clean = [&](const std::vector<int>& nodes) {
+        return !graphError && std::none_of(nodes.begin(), nodes.end(), [&](int id) { return errorNodes.contains(id); });
+    };
+
+    // Run part: everything upstream of the sinks.
+    std::vector<int> sinks;
+    std::set<int> runNodes;
+    for (const auto& node : graph.nodes()) {
+        if (isSink(node.kind)) {
+            sinks.push_back(node.id);
+            for (int id : graph.upstreamOf(node.id)) {
+                runNodes.insert(id);
+            }
+        }
+    }
+    if (!sinks.empty() && clean(std::vector<int>(runNodes.begin(), runNodes.end()))) {
+        RunPlan run;
+        for (int id : graph.topologicalOrder()) {
+            if (runNodes.contains(id)) {
+                run.nodes.push_back(id);
+            }
+        }
+        run.sinks = sinks;
+        run.shapes = std::move(shapes.shapes);
+        plan.run = std::move(run);
+    }
+
+    // Live part: validate() guarantees at most one Present, fed by a Gaussian
+    // Splatting node that renders into a Swapchain Target.
     const auto present = std::find_if(graph.nodes().begin(), graph.nodes().end(),
                                       [](const Node& n) { return n.kind == NodeKind::Present; });
+    if (present == graph.nodes().end() || !clean(graph.upstreamOf(present->id))) {
+        return plan;
+    }
     const Node* splatting = graph.inputNode(present->id, 0);
     const Node* scene = graph.inputNode(splatting->id, 0);
     const Node* camera = graph.inputNode(splatting->id, 1);

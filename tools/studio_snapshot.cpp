@@ -7,12 +7,15 @@
 //                             [graph.ktgraph.json]
 //
 // --then-backend switches the Gaussian Splatting node's backend halfway, which
-// exercises recompiling while a graph is running.
+// exercises recompiling while a graph is running. --example picks the start
+// graph (see klartraum_studio --help); --run presses Run after the first
+// frame and fails if the run fails.
 //
 // KIND is a node kind name such as gaussian_splatting or scene. The headless
 // swapchain is 512x512 pixels; the UI is laid out at kLogicalSize and scaled
 // down to fit.
 
+#include <algorithm>
 #include <cstdlib>
 #include <fstream>
 #include <iostream>
@@ -116,6 +119,7 @@ int main(int argc, char** argv) {
     bool hideBuffers = false;
     int frames = 12;
     std::string thenBackend;
+    bool run = false;
 
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
@@ -134,6 +138,15 @@ int main(int argc, char** argv) {
             frames = std::stoi(argv[++i]);
         } else if (arg == "--then-backend" && i + 1 < argc) {
             thenBackend = argv[++i];
+        } else if (arg == "--example" && i + 1 < argc) {
+            const auto example = kstudio::exampleFromName(argv[++i]);
+            if (!example) {
+                std::cerr << "Unknown --example '" << argv[i] << "'\n";
+                return EXIT_FAILURE;
+            }
+            options.example = *example;
+        } else if (arg == "--run") {
+            run = true;
         } else if (arg == "--profile") {
             options.profiling = true;
         } else if (!arg.empty() && arg[0] != '-') {
@@ -179,6 +192,9 @@ int main(int argc, char** argv) {
         // settled UI; image 0 is then read back.
         const int total = frames + static_cast<int>(vc.getNumberOfSwapChainImages());
         for (int f = 0; f < total; ++f) {
+            if (run && f == 1) {
+                app.requestRun();
+            }
             if (!thenBackend.empty() && f == frames / 2) {
                 for (auto& node : app.editableGraph().nodes()) {
                     if (node.kind == kstudio::NodeKind::GaussianSplatting) {
@@ -196,8 +212,14 @@ int main(int argc, char** argv) {
             vkQueueWaitIdle(vc.getGraphicsQueue());
         }
 
-        if (!app.hasAppliedGraph()) {
+        const bool hasPresent = std::any_of(app.graph().nodes().begin(), app.graph().nodes().end(),
+                                            [](const kstudio::Node& n) { return n.kind == kstudio::NodeKind::Present; });
+        if (hasPresent && !app.hasAppliedGraph()) {
             std::cerr << "No graph was compiled: " << app.lastError() << "\n";
+            ok = false;
+        }
+        if (run && !app.lastRunSucceeded()) {
+            std::cerr << "The run failed: " << app.runError() << "\n";
             ok = false;
         }
         std::cout << "compiled elements: " << app.compiledGraph().nodes.size() << "\n";

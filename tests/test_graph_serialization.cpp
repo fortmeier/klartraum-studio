@@ -5,6 +5,7 @@
  * - missingFieldsKeepDefaults: parameters absent from a file keep their defaults
  * - rejectsMalformedFiles: wrong format tags, unknown kinds, bad links and invalid JSON throw
  * - saveAndLoadFile: saveGraph/loadGraph write and read a file on disk
+ * - roundTripComputeNodes: image file, offscreen, ONNX and writer parameters are saved and restored
  **/
 
 #include <gtest/gtest.h>
@@ -126,4 +127,30 @@ TEST(GraphSerialization, saveAndLoadFile) {
 
     std::filesystem::remove_all(dir);
     EXPECT_THROW(loadGraph(path), std::runtime_error);
+}
+
+TEST(GraphSerialization, roundTripComputeNodes) {
+    Graph graph = makeSplatAutoencoderGraph("scene.spz", "enc.onnx", "dec.onnx");
+    const Graph autoencoder = makeAutoencoderGraph("photo.jpg", "enc.onnx", "dec.onnx", "result.png");
+    for (const auto& node : autoencoder.nodes()) {
+        Node copy = node;
+        copy.id += 100;
+        graph.addNodeWithId(copy);
+    }
+    for (auto& node : graph.nodes()) {
+        if (node.kind == NodeKind::OffscreenTarget) {
+            node.as<OffscreenTargetParams>() = {64, 48};
+        } else if (node.kind == NodeKind::ImageFile) {
+            node.as<ImageFileParams>().width = 32;
+            node.as<ImageFileParams>().height = 16;
+        }
+    }
+    const Graph loaded = fromJson(toJson(graph));
+    ASSERT_EQ(loaded.nodes().size(), graph.nodes().size());
+    for (const auto& node : graph.nodes()) {
+        const Node* other = loaded.findNode(node.id);
+        ASSERT_NE(other, nullptr);
+        EXPECT_TRUE(other->params == node.params) << node.title;
+    }
+    EXPECT_EQ(toJson(loaded), toJson(graph));
 }

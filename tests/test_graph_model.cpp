@@ -13,6 +13,11 @@
  * - validateUnconnectedInput: a missing input link is reported on its node
  * - validateTargetMustBeSwapchain: splatting into another node's image is an error
  * - validateReportsUnusedNodes: nodes not feeding Present are reported as info
+ * - runOnlyGraphIsValid: a graph with sinks but no Present validates without errors
+ * - validateNothingToDo: a graph without Present and sinks is an error
+ * - validateOffscreenRules: Present needs a swapchain rendering, Image to Tensor an offscreen one
+ * - validateMissingPaths: image, model and output files must be set
+ * - upstreamAndOrder: upstreamOf collects dependencies; topologicalOrder places producers first
  **/
 
 #include <gtest/gtest.h>
@@ -171,6 +176,67 @@ TEST(GraphModel, validateTargetMustBeSwapchain) {
     ASSERT_FALSE(graph.connect(out(first), in(second, 2)).has_value());
     ASSERT_FALSE(graph.connect(out(second), in(findKind(graph, NodeKind::Present))).has_value());
     EXPECT_TRUE(hasDiagnostic(graph.validate(), Severity::Error, second));
+}
+
+TEST(GraphModel, runOnlyGraphIsValid) {
+    const Graph graph = makeAutoencoderGraph("in.png", "enc.onnx", "dec.onnx", "out.png");
+    for (const auto& d : graph.validate()) {
+        EXPECT_EQ(d.severity, Severity::Info) << d.message;
+    }
+    const Graph splat = makeSplatAutoencoderGraph("scene.spz", "enc.onnx", "dec.onnx");
+    EXPECT_FALSE(splat.hasErrors());
+}
+
+TEST(GraphModel, validateNothingToDo) {
+    Graph graph;
+    graph.addNode(NodeKind::Scene);
+    EXPECT_TRUE(hasDiagnostic(graph.validate(), Severity::Error, -1));
+}
+
+TEST(GraphModel, validateOffscreenRules) {
+    // Present fed by a splatting that renders offscreen.
+    Graph graph = makeGaussianSplattingGraph("scene.spz");
+    const int offscreen = graph.addNode(NodeKind::OffscreenTarget);
+    const int splatting = findKind(graph, NodeKind::GaussianSplatting);
+    ASSERT_FALSE(graph.connect(out(offscreen), in(splatting, 2)).has_value());
+    EXPECT_TRUE(hasDiagnostic(graph.validate(), Severity::Error, findKind(graph, NodeKind::Present)));
+
+    // Image to Tensor fed by a splatting that renders into the swapchain.
+    Graph other = makeGaussianSplattingGraph("scene.spz");
+    const int toTensor = other.addNode(NodeKind::ImageToTensor);
+    const int preview = other.addNode(NodeKind::Preview);
+    ASSERT_FALSE(other.connect(out(findKind(other, NodeKind::GaussianSplatting)), in(toTensor)).has_value());
+    ASSERT_FALSE(other.connect(out(toTensor), in(preview)).has_value());
+    EXPECT_TRUE(hasDiagnostic(other.validate(), Severity::Error, toTensor));
+    EXPECT_FALSE(hasDiagnostic(other.validate(), Severity::Error, findKind(other, NodeKind::Present)));
+}
+
+TEST(GraphModel, validateMissingPaths) {
+    Graph graph = makeAutoencoderGraph("", "", "dec.onnx", "");
+    const auto diagnostics = graph.validate();
+    EXPECT_TRUE(hasDiagnostic(diagnostics, Severity::Error, findKind(graph, NodeKind::ImageFile)));
+    EXPECT_TRUE(hasDiagnostic(diagnostics, Severity::Error, findKind(graph, NodeKind::OnnxModel)));
+    EXPECT_TRUE(hasDiagnostic(diagnostics, Severity::Error, findKind(graph, NodeKind::ImageFileWriter)));
+}
+
+TEST(GraphModel, upstreamAndOrder) {
+    const Graph graph = makeAutoencoderGraph("in.png", "enc.onnx", "dec.onnx", "out.png");
+    const int image = findKind(graph, NodeKind::ImageFile);
+    const int preview = findKind(graph, NodeKind::Preview);
+    const int writer = findKind(graph, NodeKind::ImageFileWriter);
+
+    auto upstream = graph.upstreamOf(preview);
+    std::sort(upstream.begin(), upstream.end());
+    EXPECT_EQ(upstream.size(), 4u);
+    EXPECT_FALSE(std::binary_search(upstream.begin(), upstream.end(), writer));
+
+    const auto order = graph.topologicalOrder();
+    ASSERT_EQ(order.size(), graph.nodes().size());
+    auto position = [&](int id) { return std::find(order.begin(), order.end(), id) - order.begin(); };
+    for (const auto& link : graph.links()) {
+        EXPECT_LT(position(link.fromNode), position(link.toNode));
+    }
+    EXPECT_EQ(order.front(), image);
 }
 
 TEST(GraphModel, validateReportsUnusedNodes) {

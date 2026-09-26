@@ -5,7 +5,8 @@
  * - introspectChain: a linear chain yields producers before consumers with slot-indexed edges
  * - introspectSharedInputs: an element used by several consumers appears once with all its consumers
  * - introspectGroupOutputs: a group is traversed through the output elements it reports as inputs
- * - introspectOwners: listed elements get their owner, all others the default owner
+ * - introspectOwners: listed elements get their owner, unconsumed unlisted ones the default owner
+ * - introspectOwnersPropagate: unlisted elements inherit the owner of their consumer
  * - builtGraphMatchesCompiledElements: for both Gaussian-splatting backends, the introspected
  *   graph holds exactly the elements klartraum compiles and renders (GPU)
  **/
@@ -141,6 +142,21 @@ TEST(GraphIntrospection, introspectOwners) {
     const ElementGraph graph = introspect(op, {{buffer.get(), 7}}, 3);
     EXPECT_EQ(graph.find(idOf(graph, "Buf"))->owner, 7);
     EXPECT_EQ(graph.find(idOf(graph, "Op"))->owner, 3);
+}
+
+TEST(GraphIntrospection, introspectOwnersPropagate) {
+    auto buffer = element("Buf", "BufferElement");
+    auto inner = element("Inner");
+    inner->setInput(buffer, 0);
+    auto group = std::make_shared<FakeGroup>(inner);
+    auto consumer = element("Consumer");
+    consumer->setInput(group, 0);
+
+    const ElementGraph graph = introspect(consumer, {{group.get(), 5}, {consumer.get(), 9}});
+    EXPECT_EQ(graph.find(idOf(graph, "Group"))->owner, 5);
+    EXPECT_EQ(graph.find(idOf(graph, "Inner"))->owner, 5);
+    EXPECT_EQ(graph.find(idOf(graph, "Buf"))->owner, 5);
+    EXPECT_EQ(graph.find(idOf(graph, "Consumer"))->owner, 9);
 }
 
 TEST(GraphIntrospection, builtGraphMatchesCompiledElements) {

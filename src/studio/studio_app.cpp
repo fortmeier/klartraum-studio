@@ -59,6 +59,7 @@ ImU32 pinColor(PinType type) {
     case PinType::Gaussians: return rgb(236, 178, 72);
     case PinType::Camera: return rgb(110, 196, 140);
     case PinType::Image: return rgb(96, 160, 240);
+    case PinType::Tensor: return rgb(206, 120, 226);
     }
     return rgb(200, 200, 200);
 }
@@ -70,6 +71,12 @@ ImU32 kindColor(NodeKind kind) {
     case NodeKind::SwapchainTarget: return rgb(44, 88, 150);
     case NodeKind::GaussianSplatting: return rgb(122, 60, 150);
     case NodeKind::Present: return rgb(70, 70, 82);
+    case NodeKind::OffscreenTarget: return rgb(44, 110, 140);
+    case NodeKind::ImageFile: return rgb(150, 84, 50);
+    case NodeKind::ImageToTensor: return rgb(110, 70, 140);
+    case NodeKind::OnnxModel: return rgb(150, 60, 110);
+    case NodeKind::Preview: return rgb(60, 110, 100);
+    case NodeKind::ImageFileWriter: return rgb(60, 100, 70);
     }
     return rgb(80, 80, 80);
 }
@@ -115,7 +122,8 @@ const char* severityLabel(Severity severity) {
 }
 
 // Draws a pin's icon as an item of `size`: squares for Gaussians, triangles
-// for cameras, circles for images; filled when connected.
+// for cameras, circles for images, diamonds for tensors; filled when
+// connected.
 void pinIcon(PinType type, bool connected, float size) {
     const ImVec2 min = ImGui::GetCursorScreenPos();
     ImGui::Dummy(ImVec2(size, size));
@@ -147,6 +155,16 @@ void pinIcon(PinType type, bool connected, float size) {
             drawList->AddCircle(c, r, color, 0, 1.5f);
         }
         break;
+    case PinType::Tensor: {
+        const float d = r * 1.25f;
+        const ImVec2 top(c.x, c.y - d), right(c.x + d, c.y), bottom(c.x, c.y + d), left(c.x - d, c.y);
+        if (connected) {
+            drawList->AddQuadFilled(top, right, bottom, left, color);
+        } else {
+            drawList->AddQuad(top, right, bottom, left, color, 1.5f);
+        }
+        break;
+    }
     }
 }
 
@@ -199,11 +217,41 @@ bool comboUint(const char* label, uint32_t& value, std::initializer_list<uint32_
     return changed;
 }
 
+// Sample files, relative to the klartraum sources (see resolveInputPath).
+constexpr const char* kSampleScene = "3rdparty/spz/samples/racoonfamily.spz";
+constexpr const char* kSampleImage = "data/lantern.jpg";
+constexpr const char* kSampleEncoder = "data/onnx/simple_encoder.onnx";
+constexpr const char* kSampleDecoder = "data/onnx/simple_decoder.onnx";
+
 std::string defaultScenePath() {
-    return "3rdparty/spz/samples/racoonfamily.spz";
+    return kSampleScene;
+}
+
+std::string fileName(const std::string& path) {
+    return path.empty() ? std::string("(no file)") : std::filesystem::path(path).filename().string();
+}
+
+// Text field for a uint32 parameter; values below `min` are raised to it.
+bool inputUint(const char* label, uint32_t& value, uint32_t min = 1) {
+    int v = static_cast<int>(value);
+    if (ImGui::InputInt(label, &v, 1, 16) || ImGui::IsItemDeactivatedAfterEdit()) {
+        const uint32_t clamped = static_cast<uint32_t>(std::max(v, static_cast<int>(min)));
+        if (clamped != value) {
+            value = clamped;
+            return true;
+        }
+    }
+    return false;
 }
 
 } // namespace
+
+std::optional<Example> exampleFromName(std::string_view name) {
+    if (name == "gaussian-splatting") return Example::GaussianSplatting;
+    if (name == "autoencoder") return Example::Autoencoder;
+    if (name == "splat-autoencoder") return Example::SplatAutoencoder;
+    return std::nullopt;
+}
 
 StudioApp::StudioApp(klartraum::KlartraumEngine& engine, StudioOptions options, GLFWwindow* window)
     : engine_(engine), window_(window), options_(std::move(options)) {
@@ -223,10 +271,10 @@ StudioApp::StudioApp(klartraum::KlartraumEngine& engine, StudioOptions options, 
 
     if (!options_.graphFile.empty()) {
         if (!openGraph(options_.graphFile)) {
-            newDefaultGraph();
+            loadExample(options_.example);
         }
     } else {
-        newDefaultGraph();
+        loadExample(options_.example);
     }
     // Compile right away so the first frame shows the scene.
     updatePlan();
@@ -251,6 +299,24 @@ void StudioApp::newDefaultGraph() {
     setGraph(makeGaussianSplattingGraph(scene, options_.backend), {});
 }
 
+void StudioApp::loadExample(Example example) {
+    switch (example) {
+    case Example::GaussianSplatting:
+        newDefaultGraph();
+        break;
+    case Example::Autoencoder:
+        setGraph(makeAutoencoderGraph(kSampleImage, kSampleEncoder, kSampleDecoder, "autoencoded.png"), {});
+        break;
+    case Example::SplatAutoencoder: {
+        const std::string scene = options_.scenePath.empty() ? defaultScenePath() : options_.scenePath;
+        setGraph(makeSplatAutoencoderGraph(scene, kSampleEncoder, kSampleDecoder), {});
+        break;
+    }
+    }
+    // The examples come with a layout of their own; start the view on it.
+    fitRequested_ = true;
+}
+
 void StudioApp::setGraph(Graph graph, std::filesystem::path file) {
     graph_ = std::move(graph);
     graph_.touch();
@@ -268,6 +334,13 @@ void StudioApp::setGraph(Graph graph, std::filesystem::path file) {
     // A new camera node's view replaces the current one.
     if (appliedPlan_) {
         appliedPlan_->cameraNode = -1;
+    }
+    // Run results belong to the previous graph.
+    lastRun_.reset();
+    runError_.clear();
+    previews_.clear();
+    if (compiledSource_ == 1) {
+        compiledLayoutDirty_ = true;
     }
     updateWindowTitle();
 }
@@ -297,13 +370,11 @@ bool StudioApp::saveGraphTo(const std::filesystem::path& path) {
     }
 }
 
-std::optional<std::filesystem::path> StudioApp::resolveScenePath(const std::string& path) const {
+std::optional<std::filesystem::path> StudioApp::resolveInputPath(const std::string& path) const {
     namespace fs = std::filesystem;
     if (path.empty()) {
         return std::nullopt;
     }
-    // Relative paths are tried against the working directory, the graph
-    // file's directory and the klartraum sources (for the bundled samples).
     std::vector<fs::path> candidates{fs::path(path)};
     if (fs::path(path).is_relative()) {
         if (!file_.empty()) {
@@ -320,20 +391,50 @@ std::optional<std::filesystem::path> StudioApp::resolveScenePath(const std::stri
     return std::nullopt;
 }
 
+std::filesystem::path StudioApp::resolveOutputPath(const std::string& path) const {
+    const std::filesystem::path p(path);
+    if (p.is_absolute() || file_.empty()) {
+        return std::filesystem::absolute(p);
+    }
+    return file_.parent_path() / p;
+}
+
+std::shared_ptr<const OnnxModelInfo> StudioApp::onnxInfo(const std::string& path, std::string& error) {
+    const auto resolved = resolveInputPath(path);
+    if (!resolved) {
+        error = "File not found: " + path;
+        return nullptr;
+    }
+    return onnxInfo_.get(*resolved, &error);
+}
+
 // ---------------------------------------------------------------------------
 // Compilation
 
 void StudioApp::updatePlan() {
     if (graph_.revision() != plannedRevision_) {
-        plan_ = planGraph(graph_);
+        plan_ = planGraph(
+            graph_, [this](const std::string& path, std::string& error) { return onnxInfo(path, error); },
+            [this](const std::string& path) { return resolveInputPath(path).has_value(); });
         plannedRevision_ = graph_.revision();
-        if (plan_.ok() && !resolveScenePath(plan_.splatting->scenePath)) {
-            plan_.diagnostics.push_back(Diagnostic{Severity::Error, plan_.splatting->sceneNode,
-                                                   "Scene file not found: " + plan_.splatting->scenePath});
-            plan_.splatting.reset();
-        }
     }
+
+    const bool userIsEditing = ImGui::GetCurrentContext() && ImGui::IsAnyItemActive();
+    if (plan_.run && autoRun_ && !userIsEditing && lastRunRevision_ != graph_.revision()) {
+        runRequested_ = true;
+    }
+
     if (!plan_.ok()) {
+        // Without a Present node nothing should render live; with a broken
+        // one, the last graph that compiled keeps running.
+        const bool hasPresent = std::any_of(graph_.nodes().begin(), graph_.nodes().end(),
+                                            [](const Node& n) { return n.kind == NodeKind::Present; });
+        if (!hasPresent && appliedPlan_) {
+            vkDeviceWaitIdle(engine_.getVulkanContext().getDevice());
+            appliedPlan_.reset();
+            failedPlan_.reset();
+            installBuilder(std::nullopt, nullptr);
+        }
         return;
     }
     const SplattingPlan& pending = *plan_.splatting;
@@ -341,7 +442,6 @@ void StudioApp::updatePlan() {
     const bool rebuild = !appliedPlan_ || pending.needsRebuildFrom(*appliedPlan_);
     if (rebuild) {
         const bool alreadyFailed = failedPlan_ && !pending.needsRebuildFrom(*failedPlan_);
-        const bool userIsEditing = ImGui::GetCurrentContext() && ImGui::IsAnyItemActive();
         if (applyRequested_ || (autoApply_ && !alreadyFailed && !userIsEditing)) {
             applyRequested_ = false;
             apply(pending);
@@ -371,7 +471,7 @@ void StudioApp::updatePlan() {
 }
 
 std::shared_ptr<klartraum::GaussianDataStandard> StudioApp::loadModel(const std::string& path) {
-    const auto resolved = resolveScenePath(path);
+    const auto resolved = resolveInputPath(path);
     if (!resolved) {
         throw std::runtime_error("scene file not found: " + path);
     }
@@ -392,8 +492,10 @@ void StudioApp::installBuilder(const std::optional<SplattingPlan>& plan,
                                const std::shared_ptr<klartraum::GaussianDataStandard>& model) {
     if (!plan) {
         compiled_ = {};
-        // A builder that adds nothing keeps the window resizable.
-        engine_.setGraphBuilder([](klartraum::KlartraumEngine&) {});
+        compiledSignature_.clear();
+        // Without a live graph the window is only cleared; the builder keeps
+        // it resizable.
+        engine_.setGraphBuilder([](klartraum::KlartraumEngine& e) { e.add(e.createRenderPass()); });
         return;
     }
     // The engine runs the builder now and again after every swapchain
@@ -470,7 +572,7 @@ bool StudioApp::apply(const SplattingPlan& plan) {
         }
     }
     // Drop models that the running graph no longer uses.
-    const auto keep = resolveScenePath(plan.scenePath);
+    const auto keep = resolveInputPath(plan.scenePath);
     std::erase_if(models_, [&](const auto& entry) { return !keep || entry.first != keep->string(); });
 
     setStatus(std::format("Compiled {} elements ({} backend)", compiled_.nodes.size(),
@@ -569,8 +671,57 @@ void StudioApp::updateWindowTitle() {
     }
 }
 
+void StudioApp::run() {
+    runRequested_ = false;
+    lastRunRevision_ = graph_.revision();
+    if (!plan_.run) {
+        runError_ = "Nothing to run: add a Preview or Image File Writer, and fix the errors of the nodes feeding it.";
+        setStatus(runError_, true);
+        return;
+    }
+
+    RunContext context;
+    context.resolveInput = [this](const std::string& path) {
+        const auto resolved = resolveInputPath(path);
+        if (!resolved) {
+            throw std::runtime_error("file not found: " + path);
+        }
+        return *resolved;
+    };
+    context.resolveOutput = [this](const std::string& path) { return resolveOutputPath(path); };
+    context.loadScene = [this](const std::string& path) { return loadModel(path); };
+    context.onnxInfo = [this](const std::string& path, std::string& error) { return onnxInfo(path, error); };
+
+    try {
+        RunResult result = runGraph(engine_.getVulkanContext(), graph_, *plan_.run, context);
+        previews_.clear();
+        for (const auto& [node, image] : result.images) {
+            previews_[node] = std::make_unique<PreviewTexture>(engine_.getVulkanContext(), image);
+        }
+        std::string message = std::format("Run finished in {:.0f} ms", result.milliseconds);
+        for (const auto& file : result.written) {
+            message += ", wrote " + file.filename().string();
+        }
+        lastRun_ = std::move(result);
+        runError_.clear();
+        setStatus(message);
+        if (compiledSource_ == 1) {
+            compiledLayoutDirty_ = true;
+        }
+    } catch (const std::exception& e) {
+        runError_ = e.what();
+        setStatus("Run failed: " + runError_, true);
+    }
+}
+
 void StudioApp::drawGui() {
     syncCamera();
+    if (runRequested_) {
+        run();
+    }
+    if (ImGui::Shortcut(ImGuiKey_F5, ImGuiInputFlags_RouteGlobal)) {
+        requestRun();
+    }
 
     if (ImGui::Shortcut(ImGuiMod_Ctrl | ImGuiKey_S, ImGuiInputFlags_RouteGlobal)) {
         if (file_.empty()) {
@@ -599,8 +750,17 @@ void StudioApp::drawMenuBar() {
         return;
     }
     if (ImGui::BeginMenu("File")) {
-        if (ImGui::MenuItem("New Gaussian Splatting Graph")) {
-            newDefaultGraph();
+        if (ImGui::BeginMenu("New from Example")) {
+            if (ImGui::MenuItem("Gaussian splatting (live)")) {
+                loadExample(Example::GaussianSplatting);
+            }
+            if (ImGui::MenuItem("Image autoencoder (run)")) {
+                loadExample(Example::Autoencoder);
+            }
+            if (ImGui::MenuItem("Splatting autoencoder (offscreen, run)")) {
+                loadExample(Example::SplatAutoencoder);
+            }
+            ImGui::EndMenu();
         }
         if (ImGui::MenuItem("New Empty Graph")) {
             setGraph(Graph{}, {});
@@ -626,6 +786,11 @@ void StudioApp::drawMenuBar() {
         ImGui::EndMenu();
     }
     if (ImGui::BeginMenu("Graph")) {
+        if (ImGui::MenuItem("Run", "F5", false, plan_.run.has_value())) {
+            requestRun();
+        }
+        ImGui::MenuItem("Run on every change", nullptr, &autoRun_);
+        ImGui::Separator();
         ImGui::MenuItem("Auto-apply changes", nullptr, &autoApply_);
         if (ImGui::MenuItem("Apply now", nullptr, false, plan_.ok())) {
             applyRequested_ = true;
@@ -675,7 +840,7 @@ void StudioApp::drawOverview() {
     ImGui::Text("Resolution: %u x %u", extent.width, extent.height);
     if (appliedPlan_) {
         ImGui::Text("Backend: %s", std::string(backendName(appliedPlan_->params.backend)).c_str());
-        if (auto resolved = resolveScenePath(appliedPlan_->scenePath)) {
+        if (auto resolved = resolveInputPath(appliedPlan_->scenePath)) {
             if (auto it = models_.find(resolved->string()); it != models_.end()) {
                 ImGui::Text("Gaussians: %u", it->second->count());
             }
@@ -685,9 +850,13 @@ void StudioApp::drawOverview() {
         ImGui::TextDisabled("No graph compiled");
     }
 
-    ImGui::SeparatorText("Compile");
+    ImGui::SeparatorText("Live");
     const bool pending = plan_.ok() && (!appliedPlan_ || plan_.splatting->needsRebuildFrom(*appliedPlan_));
-    if (!plan_.ok()) {
+    const bool hasPresent = std::any_of(graph_.nodes().begin(), graph_.nodes().end(),
+                                        [](const Node& n) { return n.kind == NodeKind::Present; });
+    if (!hasPresent) {
+        ImGui::TextDisabled("No Present node: nothing renders live.");
+    } else if (!plan_.ok()) {
         ImGui::TextColored(severityColor(Severity::Error), "Graph has errors");
         if (appliedPlan_) {
             ImGui::TextDisabled("Showing the last graph that compiled.");
@@ -700,14 +869,18 @@ void StudioApp::drawOverview() {
     } else {
         ImGui::TextColored(ImVec4(0.55f, 0.85f, 0.55f, 1.0f), "Up to date");
     }
-    ImGui::Checkbox("Auto-apply", &autoApply_);
-    ImGui::SameLine();
-    ImGui::BeginDisabled(!plan_.ok());
-    if (ImGui::Button("Apply")) {
-        applyRequested_ = true;
-        failedPlan_.reset();
+    if (hasPresent) {
+        ImGui::Checkbox("Auto-apply", &autoApply_);
+        ImGui::SameLine();
+        ImGui::BeginDisabled(!plan_.ok());
+        if (ImGui::Button("Apply")) {
+            applyRequested_ = true;
+            failedPlan_.reset();
+        }
+        ImGui::EndDisabled();
     }
-    ImGui::EndDisabled();
+
+    drawRunControls();
 
     ImGui::SeparatorText("GPU profiling");
     if (ImGui::Checkbox("Per-element timings", &profiling_)) {
@@ -751,6 +924,51 @@ void StudioApp::drawOverview() {
     ImGui::End();
 }
 
+void StudioApp::drawRunControls() {
+    ImGui::SeparatorText("Run");
+    const bool hasSinks =
+        std::any_of(graph_.nodes().begin(), graph_.nodes().end(), [](const Node& n) { return isSink(n.kind); });
+    if (!hasSinks) {
+        ImGui::TextDisabled("Add a Preview or Image File Writer to run the graph.");
+        return;
+    }
+    ImGui::BeginDisabled(!plan_.run.has_value());
+    if (ImGui::Button("Run (F5)")) {
+        requestRun();
+    }
+    ImGui::EndDisabled();
+    ImGui::SameLine();
+    ImGui::Checkbox("On every change", &autoRun_);
+    if (!plan_.run) {
+        ImGui::TextColored(severityColor(Severity::Error), "The nodes feeding the outputs have errors.");
+    }
+    if (!runError_.empty()) {
+        ImGui::PushStyleColor(ImGuiCol_Text, severityColor(Severity::Error));
+        ImGui::TextWrapped("Last run failed: %s", runError_.c_str());
+        ImGui::PopStyleColor();
+    } else if (lastRun_) {
+        ImGui::Text("Last run: %.0f ms, %zu elements", lastRun_->milliseconds, lastRun_->compiled.nodes.size());
+        if (runIsOutdated()) {
+            ImGui::SameLine();
+            ImGui::TextColored(severityColor(Severity::Warning), "(outdated)");
+        }
+        for (const auto& file : lastRun_->written) {
+            ImGui::TextDisabled("wrote %s", file.string().c_str());
+        }
+    }
+}
+
+bool StudioApp::drawPreview(int node, float width) {
+    auto it = previews_.find(node);
+    if (it == previews_.end()) {
+        return false;
+    }
+    const PreviewTexture& texture = *it->second;
+    const float height = width * static_cast<float>(texture.height()) / static_cast<float>(texture.width());
+    ImGui::Image(ImTextureRef(texture.id()), ImVec2(width, height));
+    return true;
+}
+
 void StudioApp::drawGraphWindow() {
     const ImGuiIO& io = ImGui::GetIO();
     const float height = std::max(260.0f, io.DisplaySize.y * 0.44f);
@@ -771,7 +989,8 @@ void StudioApp::drawGraphWindow() {
             drawAuthoringEditor();
             ImGui::EndTabItem();
         }
-        const std::string compiledLabel = std::format("Compiled graph ({})###compiled", compiled_.nodes.size());
+        const std::string compiledLabel =
+            std::format("Compiled graph ({})###compiled", shownCompiled().nodes.size());
         if (ImGui::BeginTabItem(compiledLabel.c_str(), nullptr, compiledFlags)) {
             activeTab_ = 1;
             drawCompiledEditor();
@@ -783,6 +1002,12 @@ void StudioApp::drawGraphWindow() {
 }
 
 void StudioApp::drawEditorToolbar(bool compiled) {
+    ImGui::BeginDisabled(!plan_.run.has_value());
+    if (ImGui::SmallButton("Run")) {
+        requestRun();
+    }
+    ImGui::EndDisabled();
+    ImGui::SameLine();
     if (ImGui::SmallButton("Fit")) {
         fitRequested_ = true;
     }
@@ -800,6 +1025,16 @@ void StudioApp::drawEditorToolbar(bool compiled) {
         if (ImGui::Checkbox("Hide buffers", &hideBuffers_)) {
             compiledLayoutDirty_ = true;
         }
+        ImGui::SameLine();
+        if (ImGui::RadioButton("Live", compiledSource_ == 0)) {
+            showCompiled(0);
+        }
+        ImGui::SameLine();
+        ImGui::BeginDisabled(!lastRun_);
+        if (ImGui::RadioButton("Last run", compiledSource_ == 1)) {
+            showCompiled(1);
+        }
+        ImGui::EndDisabled();
     }
     ImGui::SameLine();
     if (compiled) {
@@ -869,7 +1104,7 @@ void StudioApp::drawAuthoringEditor() {
         case NodeKind::Scene: {
             const auto& path = node.as<SceneParams>().path;
             ImGui::TextUnformatted(path.empty() ? "(no file)" : std::filesystem::path(path).filename().string().c_str());
-            if (auto resolved = resolveScenePath(path)) {
+            if (auto resolved = resolveInputPath(path)) {
                 if (auto it = models_.find(resolved->string()); it != models_.end()) {
                     ImGui::Text("%u Gaussians", it->second->count());
                 }
@@ -898,6 +1133,42 @@ void StudioApp::drawAuthoringEditor() {
         case NodeKind::Present:
             ImGui::Text("%.0f FPS", ImGui::GetIO().Framerate);
             break;
+        case NodeKind::OffscreenTarget: {
+            const auto& p = node.as<OffscreenTargetParams>();
+            ImGui::Text("%u x %u", p.width, p.height);
+            break;
+        }
+        case NodeKind::ImageFile: {
+            const auto& p = node.as<ImageFileParams>();
+            ImGui::TextUnformatted(fileName(p.path).c_str());
+            ImGui::Text("resized to %u x %u", p.width, p.height);
+            break;
+        }
+        case NodeKind::OnnxModel:
+            ImGui::TextUnformatted(fileName(node.as<OnnxModelParams>().path).c_str());
+            break;
+        case NodeKind::ImageToTensor:
+            break;
+        case NodeKind::Preview:
+            if (!drawPreview(node.id, kNodeWidth)) {
+                ImGui::TextDisabled(plan_.run ? "Press Run (F5)" : "No result");
+            } else if (runIsOutdated()) {
+                ImGui::TextColored(severityColor(Severity::Warning), "outdated");
+            }
+            break;
+        case NodeKind::ImageFileWriter: {
+            ImGui::TextUnformatted(fileName(node.as<ImageFileWriterParams>().path).c_str());
+            if (lastRun_ && lastRun_->images.contains(node.id)) {
+                ImGui::TextDisabled("written by the last run");
+            }
+            break;
+        }
+        }
+        // Tensor outputs show their shape.
+        if (plan_.run) {
+            if (auto it = plan_.run->shapes.find(node.id); it != plan_.run->shapes.end()) {
+                ImGui::Text("-> %s", shapeToString(it->second).c_str());
+            }
         }
         ImGui::PopStyleColor();
 
@@ -1021,12 +1292,18 @@ void StudioApp::drawAuthoringEditor() {
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(8.0f, 8.0f));
     if (ImGui::BeginPopup("add_node")) {
         ImGui::TextDisabled("Add node");
-        ImGui::Separator();
+        std::string_view group;
         for (const auto& info : allKinds()) {
+            if (info.group != group) {
+                group = info.group;
+                ImGui::SeparatorText(std::string(group).c_str());
+            }
             if (ImGui::MenuItem(std::string(info.title).c_str())) {
                 const int id = graph_.addNode(info.kind, newNodePosition_);
                 if (info.kind == NodeKind::Scene) {
                     graph_.findNode(id)->as<SceneParams>().path = defaultScenePath();
+                } else if (info.kind == NodeKind::ImageFile) {
+                    graph_.findNode(id)->as<ImageFileParams>().path = kSampleImage;
                 }
                 nodesToPlace_.push_back(id);
                 pendingSelection_ = id;
@@ -1173,7 +1450,7 @@ void StudioApp::layoutAuthoringGraph() {
 void StudioApp::layoutCompiledGraph(bool measured) {
     std::vector<int> visible;
     std::map<int, int> index;
-    for (const auto& node : compiled_.nodes) {
+    for (const auto& node : shownCompiled().nodes) {
         if (hideBuffers_ && node.category == ElementCategory::Buffer) {
             continue;
         }
@@ -1181,7 +1458,7 @@ void StudioApp::layoutCompiledGraph(bool measured) {
         visible.push_back(node.id);
     }
     std::vector<std::pair<int, int>> edges;
-    for (const auto& edge : compiled_.edges) {
+    for (const auto& edge : shownCompiled().edges) {
         if (index.contains(edge.from) && index.contains(edge.to)) {
             edges.emplace_back(index.at(edge.from), index.at(edge.to));
         }
@@ -1201,11 +1478,15 @@ void StudioApp::layoutCompiledGraph(bool measured) {
 }
 
 void StudioApp::drawCompiledEditor() {
-    if (compiled_.empty()) {
-        ImGui::TextDisabled("Nothing compiled yet.");
-        return;
+    // Without a live graph, show the last run's.
+    if (compiledSource_ == 0 && compiled_.empty() && lastRun_) {
+        showCompiled(1);
     }
     drawEditorToolbar(true);
+    if (shownCompiled().empty()) {
+        ImGui::TextDisabled(compiledSource_ == 0 ? "No live graph is compiled." : "Nothing has been run yet.");
+        return;
+    }
 
     ed::SetCurrentEditor(compiledEditor_);
     ed::Begin("compiled");
@@ -1217,12 +1498,12 @@ void StudioApp::drawCompiledEditor() {
 
     const int highlightOwner = selectedNode_;
     float maxMs = 0.0f;
-    for (const auto& [label, ms] : timings_) {
+    for (const auto& [label, ms] : shownTimings()) {
         maxMs = std::max(maxMs, ms);
     }
     const float iconSize = ImGui::GetTextLineHeight();
 
-    for (const auto& node : compiled_.nodes) {
+    for (const auto& node : shownCompiled().nodes) {
         if (hideBuffers_ && node.category == ElementCategory::Buffer) {
             continue;
         }
@@ -1254,17 +1535,17 @@ void StudioApp::drawCompiledEditor() {
             elementPinIcon(true, iconSize);
             ed::EndPin();
         }
-        if (auto it = timings_.find(node.label()); it != timings_.end() && it->second > 0.0f) {
+        if (auto it = shownTimings().find(node.label()); it != shownTimings().end() && it->second > 0.0f) {
             const float t = maxMs > 0.0f ? it->second / maxMs : 0.0f;
             ImGui::TextColored(ImVec4(0.6f + 0.4f * t, 0.9f - 0.5f * t, 0.5f - 0.3f * t, 1.0f), "%.3f ms", it->second);
         }
 
         // One pin per input slot; hidden producers are listed by name.
-        for (const auto& edge : compiled_.edges) {
+        for (const auto& edge : shownCompiled().edges) {
             if (edge.to != node.id) {
                 continue;
             }
-            const ElementNode* from = compiled_.find(edge.from);
+            const ElementNode* from = shownCompiled().find(edge.from);
             const bool hidden = hideBuffers_ && from && from->category == ElementCategory::Buffer;
             ed::BeginPin(compiledInputPinId(node.id, edge.slot), ed::PinKind::Input);
             ed::PinPivotAlignment(ImVec2(0.0f, 0.5f));
@@ -1286,9 +1567,9 @@ void StudioApp::drawCompiledEditor() {
         }
     }
 
-    for (const auto& edge : compiled_.edges) {
-        const ElementNode* from = compiled_.find(edge.from);
-        const ElementNode* to = compiled_.find(edge.to);
+    for (const auto& edge : shownCompiled().edges) {
+        const ElementNode* from = shownCompiled().find(edge.from);
+        const ElementNode* to = shownCompiled().find(edge.to);
         if (!from || !to) {
             continue;
         }
@@ -1328,7 +1609,7 @@ void StudioApp::drawInspector() {
     }
 
     if (activeTab_ == 1 && selectedElement_ >= 0) {
-        if (const ElementNode* element = compiled_.find(selectedElement_)) {
+        if (const ElementNode* element = shownCompiled().find(selectedElement_)) {
             drawElementInspector(*element);
             ImGui::End();
             return;
@@ -1377,7 +1658,7 @@ void StudioApp::drawNodeInspector(Node& node) {
             }
             ImGui::EndCombo();
         }
-        if (auto resolved = resolveScenePath(p.path)) {
+        if (auto resolved = resolveInputPath(p.path)) {
             ImGui::TextDisabled("%s", resolved->string().c_str());
             if (auto it = models_.find(resolved->string()); it != models_.end()) {
                 ImGui::Text("%u Gaussians loaded", it->second->count());
@@ -1489,6 +1770,94 @@ void StudioApp::drawNodeInspector(Node& node) {
         ImGui::SeparatorText("Present");
         ImGui::Text("%.1f FPS", ImGui::GetIO().Framerate);
         break;
+    case NodeKind::OffscreenTarget: {
+        auto& p = node.as<OffscreenTargetParams>();
+        ImGui::SeparatorText("Image size");
+        changed |= inputUint("Width", p.width);
+        changed |= inputUint("Height", p.height);
+        break;
+    }
+    case NodeKind::ImageFile: {
+        auto& p = node.as<ImageFileParams>();
+        ImGui::SeparatorText("Image file");
+        changed |= inputText("File", p.path);
+        if (ImGui::BeginCombo("Samples", "choose...")) {
+            if (ImGui::Selectable(fileName(kSampleImage).c_str())) {
+                p.path = kSampleImage;
+                changed = true;
+            }
+            ImGui::EndCombo();
+        }
+        if (auto resolved = resolveInputPath(p.path)) {
+            ImGui::TextDisabled("%s", resolved->string().c_str());
+        } else if (!p.path.empty()) {
+            ImGui::TextColored(severityColor(Severity::Error), "File not found");
+        }
+        ImGui::SeparatorText("Resize to");
+        changed |= inputUint("Width", p.width);
+        changed |= inputUint("Height", p.height);
+        ImGui::TextDisabled("Output: 1x3x%ux%u tensor, values in [0, 1]", p.height, p.width);
+        break;
+    }
+    case NodeKind::ImageToTensor:
+        ImGui::SeparatorText("Conversion");
+        ImGui::TextWrapped("Converts the rendered offscreen image into a 1x3xHxW tensor (values in [0, 1]) with "
+                           "klartraum's image_to_tensor shader.");
+        break;
+    case NodeKind::OnnxModel: {
+        auto& p = node.as<OnnxModelParams>();
+        ImGui::SeparatorText("Model");
+        changed |= inputText("File", p.path);
+        if (ImGui::BeginCombo("Samples", "choose...")) {
+            for (const char* sample : {kSampleEncoder, kSampleDecoder}) {
+                if (ImGui::Selectable(fileName(sample).c_str())) {
+                    p.path = sample;
+                    changed = true;
+                }
+            }
+            ImGui::EndCombo();
+        }
+        std::string error;
+        if (const auto info = p.path.empty() ? nullptr : onnxInfo(p.path, error)) {
+            for (const auto& input : info->inputs) {
+                ImGui::BulletText("in  %s: %s", input.name.c_str(), shapeToString(input.shape).c_str());
+            }
+            for (const auto& output : info->outputs) {
+                ImGui::BulletText("out %s: %s", output.name.c_str(), shapeToString(output.shape).c_str());
+            }
+            std::string ops;
+            for (const auto& op : info->opTypes) {
+                ops += (ops.empty() ? "" : ", ") + op;
+            }
+            ImGui::TextWrapped("Operators: %s", ops.c_str());
+        } else if (!p.path.empty()) {
+            ImGui::TextColored(severityColor(Severity::Error), "%s", error.c_str());
+        }
+        break;
+    }
+    case NodeKind::Preview:
+        ImGui::SeparatorText("Result");
+        if (drawPreview(node.id, ImGui::GetContentRegionAvail().x)) {
+            const auto& image = lastRun_->images.at(node.id);
+            ImGui::Text("%u x %u", image.width, image.height);
+            if (runIsOutdated()) {
+                ImGui::SameLine();
+                ImGui::TextColored(severityColor(Severity::Warning), "(outdated, press Run)");
+            }
+        } else {
+            ImGui::TextDisabled("Press Run (F5) to compute it.");
+        }
+        break;
+    case NodeKind::ImageFileWriter: {
+        auto& p = node.as<ImageFileWriterParams>();
+        ImGui::SeparatorText("Output file");
+        changed |= inputText("File", p.path);
+        if (!p.path.empty()) {
+            ImGui::TextDisabled("%s", resolveOutputPath(p.path).string().c_str());
+        }
+        ImGui::TextDisabled("Written as PNG on every run.");
+        break;
+    }
     }
 
     if (changed) {
@@ -1527,20 +1896,20 @@ void StudioApp::drawElementInspector(const ElementNode& element) {
     if (const Node* owner = graph_.findNode(element.owner)) {
         ImGui::Text("Built for: %s", owner->title.c_str());
     }
-    if (auto it = timings_.find(element.label()); it != timings_.end()) {
+    if (auto it = shownTimings().find(element.label()); it != shownTimings().end()) {
         ImGui::Text("GPU time: %.3f ms", it->second);
     }
 
     ImGui::SeparatorText("Inputs");
-    for (const auto& edge : compiled_.edges) {
+    for (const auto& edge : shownCompiled().edges) {
         if (edge.to == element.id) {
-            const ElementNode* from = compiled_.find(edge.from);
+            const ElementNode* from = shownCompiled().find(edge.from);
             ImGui::BulletText("%d: %s (%s)", edge.slot, from->label().c_str(), from->type.c_str());
         }
     }
     ImGui::SeparatorText("Consumers");
     for (int id : element.outputs) {
-        const ElementNode* to = compiled_.find(id);
+        const ElementNode* to = shownCompiled().find(id);
         ImGui::BulletText("%s (%s)", to->label().c_str(), to->type.c_str());
     }
     if (element.outputs.empty()) {

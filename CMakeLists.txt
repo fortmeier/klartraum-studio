@@ -9,9 +9,10 @@ include(FetchContent)
 # klartraum (Vulkan compute-graph framework). Point FETCHCONTENT_SOURCE_DIR_KLARTRAUM
 # at a local checkout to build against it instead of the pinned upstream branch.
 set(KLARTRAUM_GIT_REPOSITORY "https://github.com/fortmeier/klartraum.git" CACHE STRING "klartraum repository")
-# The studio needs https://github.com/fortmeier/klartraum/pull/22 (exported
-# include dirs, asset root, profiling toggle); switch to develop once merged.
-set(KLARTRAUM_GIT_TAG "feature/consumable-library" CACHE STRING "klartraum branch, tag or commit")
+# Run-once graphs need https://github.com/fortmeier/klartraum/pull/23 (offscreen
+# rendering in single-path graphs) and #24 (ONNX convolutions); the branch
+# contains both. Switch back to develop once they are merged.
+set(KLARTRAUM_GIT_TAG "fix/onnx-conv-dispatch" CACHE STRING "klartraum branch, tag or commit")
 FetchContent_Declare(
   klartraum
   GIT_REPOSITORY ${KLARTRAUM_GIT_REPOSITORY}
@@ -48,6 +49,15 @@ target_include_directories(imgui_node_editor PUBLIC ${imgui_node_editor_SOURCE_D
 target_link_libraries(imgui_node_editor PUBLIC imgui)
 target_compile_features(imgui_node_editor PUBLIC cxx_std_17)
 
+# stb: image file loading, resizing and PNG writing (header-only).
+FetchContent_Declare(
+  stb
+  GIT_REPOSITORY https://github.com/nothings/stb.git
+  GIT_TAG 2c980bb59875b0d32144a71867fbdebb2f77cd20
+  SOURCE_SUBDIR do-not-add
+)
+FetchContent_MakeAvailable(stb)
+
 FetchContent_Declare(
   nlohmann_json
   URL https://github.com/nlohmann/json/releases/download/v3.11.3/json.tar.xz
@@ -61,9 +71,15 @@ add_library(klartraum_studio_core STATIC
   src/studio/graph_compiler.cpp
   src/studio/graph_introspection.cpp
   src/studio/graph_layout.cpp
+  src/studio/image_io.cpp
+  src/studio/onnx_info.cpp
+  src/studio/tensor_shapes.cpp
+  src/studio/graph_runner.cpp
+  src/studio/preview_texture.cpp
   src/studio/studio_app.cpp
 )
 target_include_directories(klartraum_studio_core PUBLIC ${PROJECT_SOURCE_DIR}/src)
+target_include_directories(klartraum_studio_core SYSTEM PRIVATE ${stb_SOURCE_DIR})
 target_compile_features(klartraum_studio_core PUBLIC cxx_std_20)
 target_compile_definitions(klartraum_studio_core PUBLIC
   KLARTRAUM_SOURCE_DIR="${klartraum_SOURCE_DIR}"
@@ -99,6 +115,10 @@ if(KLARTRAUM_STUDIO_BUILD_TESTS)
     tests/test_graph_compiler.cpp
     tests/test_graph_introspection.cpp
     tests/test_graph_layout.cpp
+    tests/test_image_io.cpp
+    tests/test_onnx_info.cpp
+    tests/test_tensor_shapes.cpp
+    tests/test_graph_runner.cpp
   )
   target_link_libraries(klartraum_studio_tests PRIVATE klartraum_studio_core GTest::gtest_main)
   include(GoogleTest)

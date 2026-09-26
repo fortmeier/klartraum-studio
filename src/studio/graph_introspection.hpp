@@ -52,8 +52,10 @@ struct ElementGraph {
     bool empty() const { return nodes.empty(); }
 };
 
-// `owners` maps elements to the authoring node they were built for; elements
-// not listed get `defaultOwner`.
+// `owners` maps elements to the authoring node they were built for. An
+// element not listed belongs to the owner of its first consumer, e.g. the
+// stages inside a Gaussian-splatting or ONNX group belong to the group's node;
+// elements with no owned consumer get `defaultOwner`.
 ElementGraph introspect(const std::shared_ptr<klartraum::ComputeGraphElement>& root,
                         const std::map<const klartraum::ComputeGraphElement*, int>& owners = {},
                         int defaultOwner = -1);

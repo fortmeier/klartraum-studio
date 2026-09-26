@@ -1,25 +1,42 @@
 # Klartraum Studio
 
 An application for building, inspecting and tuning
-[klartraum](https://github.com/fortmeier/klartraum) rendering compute graphs. It
-opens with the Gaussian-splatting graph and renders it live.
+[klartraum](https://github.com/fortmeier/klartraum) compute graphs. It opens
+with the Gaussian-splatting graph and renders it live.
 
-The studio shows the graph at two levels:
+A graph has two kinds of output, and one graph can use both:
 
-- **Authoring graph** (editable). Nodes stand for klartraum's public building
-  blocks: *Scene* (an `.spz` model), *Orbit Camera*, *Swapchain Target*,
-  *Gaussian Splatting* (compute or raster backend, all `GsplatConfig` knobs) and
-  *Present*. Pins are typed (Gaussians, Camera, Image), and the graph is
-  validated as you edit it. Valid changes are compiled into a klartraum compute
-  graph and swapped in without restarting. Camera parameters apply live;
-  backend, scene and splatting parameters rebuild the pipelines.
-- **Compiled graph** (read-only). This is the element DAG klartraum actually
-  compiled, found by walking `ComputeGraphElement::getInputs()` from the
-  backend's root element. That is the same traversal
-  `ComputeGraph::compileFrom()` uses, so every buffer, compute pass, barrier
-  and render pass inside the backend is shown. Elements are laid out in
-  layers, coloured by category and linked back to the authoring node they were
-  built for. With *GPU profiling* on, each element shows its mean GPU time.
+- **Live:** everything feeding the *Present* node renders into the window
+  every frame. Valid edits are compiled and swapped in without restarting.
+  Camera parameters apply immediately; backend, scene and splatting parameters
+  rebuild the pipelines.
+- **Run:** everything feeding a *Preview* or *Image File Writer* is compiled
+  into its own klartraum compute graph and executed once each time you press
+  **Run** (F5), or on every change with *Run on every change*. Previews show
+  the result inside the node and in the Inspector; writers save it as a PNG.
+
+Nodes stand for klartraum's public building blocks:
+
+| Group | Nodes |
+|---|---|
+| Sources | *Scene* (`.spz` Gaussians), *Image File* (PNG, JPEG, … resized to W×H, as a 1×3×H×W tensor) |
+| Rendering | *Orbit Camera*, *Swapchain Target*, *Offscreen Target* (W×H), *Gaussian Splatting* (compute or raster backend, all `GsplatConfig` settings) |
+| Compute | *Image to Tensor* (offscreen image → 1×3×H×W tensor), *ONNX Model* (`klartraum::OnnxNetwork`; Conv, ConvTranspose, Relu, Reshape, Transpose) |
+| Outputs | *Present* (live), *Preview* and *Image File Writer* (run) |
+
+Pins are typed (Gaussians, Camera, Image, Tensor), and the graph is validated
+as you edit it. The checks cover missing inputs and files, a swapchain image
+where an offscreen one is needed, tensor shapes propagated through ONNX models
+(the model's declared input vs. what it gets), unsupported ONNX operators, and
+tensors that are not images feeding a Preview.
+
+The **compiled graph** view is read-only. It shows the element DAG klartraum
+actually compiled, for the live graph or the last run, found by walking
+`ComputeGraphElement::getInputs()`. That is the same traversal
+`ComputeGraph::compileFrom()` uses, so every buffer, compute pass, barrier,
+render pass and ONNX layer is shown. Elements are laid out in layers, coloured
+by category and linked back to the node they were built for. With *GPU
+profiling* on, each element shows its mean GPU time.
 
 Graphs can be saved to and loaded from `*.ktgraph.json` files.
 
@@ -40,11 +57,12 @@ cmake --build build -j
 
 By default klartraum is fetched from GitHub, including its submodules.
 `KLARTRAUM_GIT_TAG` picks the branch or commit. It defaults to
-`feature/consumable-library` because the studio needs
-[klartraum#22](https://github.com/fortmeier/klartraum/pull/22) (exported include
-directories, shader asset root, profiling toggle). Switch it to `develop` once
-that PR is merged. To build against a local
-checkout instead:
+`fix/onnx-conv-dispatch`, which contains two fixes the run graphs need:
+[klartraum#23](https://github.com/fortmeier/klartraum/pull/23) (the raster
+backend crashed in single-path offscreen graphs) and
+[klartraum#24](https://github.com/fortmeier/klartraum/pull/24) (ONNX
+convolutions computed only a few output channels). Switch it back to `develop`
+once both are merged. To build against a local checkout instead:
 
 ```bash
 cmake -S . -B build -DFETCHCONTENT_SOURCE_DIR_KLARTRAUM=/path/to/klartraum
@@ -56,10 +74,19 @@ support.
 ## Running
 
 ```bash
-./build/klartraum_studio                       # default Gaussian-splatting graph
-./build/klartraum_studio my.ktgraph.json       # open a saved graph
+./build/klartraum_studio                                # live Gaussian-splatting graph
+./build/klartraum_studio --example autoencoder          # image file -> encoder -> decoder -> preview + PNG
+./build/klartraum_studio --example splat-autoencoder    # offscreen splatting -> encoder -> decoder -> preview
+./build/klartraum_studio my.ktgraph.json                # open a saved graph
 ./build/klartraum_studio --backend compute --spz path/to/scene.spz --profile
 ```
+
+The same examples are in *File → New from Example*. The autoencoder uses
+klartraum's sample models (`data/onnx/simple_encoder.onnx`,
+`simple_decoder.onnx`, 1×3×128×128 → 1×128×16×16 → 1×3×128×128) and
+`data/lantern.jpg`. Press **Run** (F5) to compute it. The preview shows the
+reconstructed image, and `autoencoded.png` is written next to the graph file
+(or into the working directory for an unsaved graph).
 
 The default graph uses the raster backend. The compute (tile-binned) backend
 shows the classic projection → binning → sort → gather → bounds → splat
@@ -68,9 +95,11 @@ one frame per second at window resolution, and the UI is only as responsive as
 the frame rate.
 
 You can run it from any directory: klartraum's shaders load from its source
-directory, found through `klartraum::setAssetRoot()`. Relative scene paths are
-tried against the working directory, then the graph file's directory, then the
-klartraum sources, so `3rdparty/spz/samples/racoonfamily.spz` always works.
+directory, found through `klartraum::setAssetRoot()`. Relative input paths
+(scenes, images, models) are tried against the working directory, then the
+graph file's directory, then the klartraum sources, so the bundled samples
+always resolve. Relative output paths are relative to the graph file, or to
+the working directory for an unsaved graph.
 
 | Where | Action |
 |---|---|
@@ -81,7 +110,8 @@ klartraum sources, so `3rdparty/spz/samples/racoonfamily.spz` always works.
 | | Del / Backspace deletes the selection, *Arrange* re-lays out the graph |
 | Inspector | edit the selected node's parameters; errors are listed there |
 | Compiled graph | select an element to see its inputs, consumers and timing; *Hide buffers* declutters |
-| Menu | File → New/Open/Save (Ctrl+O, Ctrl+S); Graph → auto-apply, arrange |
+| Run | F5, the *Run* buttons, or *Graph → Run on every change* |
+| Menu | File → New from Example / Open / Save (Ctrl+O, Ctrl+S); Graph → run, auto-apply, arrange |
 
 ## Headless snapshots
 
@@ -92,7 +122,10 @@ inspector) headlessly into a 512×384 BMP, with no display needed:
 ./build/klartraum_studio_snapshot --out authoring.bmp --select gaussian_splatting
 ./build/klartraum_studio_snapshot --out compiled.bmp --tab compiled --hide-buffers
 ./build/klartraum_studio_snapshot --out swap.bmp --then-backend compute   # recompiles mid-run
+./build/klartraum_studio_snapshot --out run.bmp --example autoencoder --run --select preview
 ```
+
+With `--run` the tool presses Run and fails if the run fails.
 
 ## Tests
 
@@ -101,9 +134,14 @@ ctest --test-dir build --output-on-failure
 ```
 
 Most tests need no GPU: graph model and validation, serialization, planning,
-layout and introspection. `GraphIntrospection.builtGraphMatchesCompiledElements`
-builds both Gaussian-splatting backends headlessly. It then checks that the
-introspected graph contains exactly the elements klartraum compiled.
+tensor shapes, ONNX model info, image I/O, layout and introspection. The GPU
+tests run headlessly:
+- `GraphIntrospection.builtGraphMatchesCompiledElements` checks that the
+  introspected graph contains exactly the elements klartraum compiled, for both
+  splatting backends.
+- `GraphRunnerTest` executes the example run graphs. The image autoencoder's
+  output has to resemble its input, and the offscreen splatting chain has to
+  produce a non-black reconstruction.
 
 ## Layout
 
@@ -111,7 +149,12 @@ introspected graph contains exactly the elements klartraum compiled.
 |---|---|
 | `src/studio/graph_model.*` | authoring graph: node kinds, typed pins, links, validation |
 | `src/studio/graph_serialization.*` | JSON load/save |
-| `src/studio/graph_compiler.*` | authoring graph → plan → klartraum elements |
+| `src/studio/graph_compiler.*` | authoring graph → live and run plans; the live klartraum graph |
+| `src/studio/tensor_shapes.*` | tensor shape propagation and checks |
+| `src/studio/onnx_info.*` | reads ONNX model inputs, outputs and operators |
+| `src/studio/graph_runner.*` | builds and executes the run part once, reads back the sinks |
+| `src/studio/image_io.*` | image files (stb) and image ↔ tensor conversion |
+| `src/studio/preview_texture.*` | uploads run results as ImGui textures |
 | `src/studio/graph_introspection.*` | snapshot of a compiled klartraum element DAG |
 | `src/studio/graph_layout.*` | layered DAG layout |
 | `src/studio/studio_app.*` | the ImGui / imgui-node-editor user interface |
@@ -120,7 +163,10 @@ introspected graph contains exactly the elements klartraum compiled.
 
 ## Limitations
 
-The authoring node set covers what klartraum's public Gaussian-splatting API
-can express. A splatting backend renders straight into swapchain images, so
-chaining two splatting passes, or compositing one onto another's output, is
-reported as a validation error rather than compiled.
+- A splatting backend renders straight into a target image. Chaining two
+  splatting passes, or compositing one onto another's output, is reported as a
+  validation error rather than compiled.
+- *Present* shows swapchain renderings only. Run results are shown by
+  *Preview* nodes, not in the window's background.
+- ONNX models need a single input. Only the operators klartraum implements are
+  supported, and the editor lists any others.

@@ -36,6 +36,12 @@ json paramsToJson(const NodeParams& params) {
                         {"shDegree", p.shDegree},
                         {"alphaCullThreshold", p.alphaCullThreshold},
                         {"useMeshShader", p.useMeshShader}};
+            } else if constexpr (std::is_same_v<T, OffscreenTargetParams>) {
+                return {{"width", p.width}, {"height", p.height}};
+            } else if constexpr (std::is_same_v<T, ImageFileParams>) {
+                return {{"path", p.path}, {"width", p.width}, {"height", p.height}};
+            } else if constexpr (std::is_same_v<T, OnnxModelParams> || std::is_same_v<T, ImageFileWriterParams>) {
+                return {{"path", p.path}};
             } else {
                 return json::object();
             }
@@ -85,6 +91,15 @@ NodeParams paramsFromJson(NodeKind kind, const json& j) {
                 read(j, "shDegree", p.shDegree);
                 read(j, "alphaCullThreshold", p.alphaCullThreshold);
                 read(j, "useMeshShader", p.useMeshShader);
+            } else if constexpr (std::is_same_v<T, OffscreenTargetParams>) {
+                read(j, "width", p.width);
+                read(j, "height", p.height);
+            } else if constexpr (std::is_same_v<T, ImageFileParams>) {
+                read(j, "path", p.path);
+                read(j, "width", p.width);
+                read(j, "height", p.height);
+            } else if constexpr (std::is_same_v<T, OnnxModelParams> || std::is_same_v<T, ImageFileWriterParams>) {
+                read(j, "path", p.path);
             }
         },
         params);
