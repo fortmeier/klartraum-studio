@@ -56,13 +56,7 @@ cmake --build build -j
 ```
 
 By default klartraum is fetched from GitHub, including its submodules.
-`KLARTRAUM_GIT_TAG` picks the branch or commit. It defaults to
-`fix/onnx-conv-dispatch`, which contains two fixes the run graphs need:
-[klartraum#23](https://github.com/fortmeier/klartraum/pull/23) (the raster
-backend crashed in single-path offscreen graphs) and
-[klartraum#24](https://github.com/fortmeier/klartraum/pull/24) (ONNX
-convolutions computed only a few output channels). Switch it back to `develop`
-once both are merged. To build against a local checkout instead:
+`KLARTRAUM_GIT_TAG` picks the branch or commit (default: `develop`). To build against a local checkout instead:
 
 ```bash
 cmake -S . -B build -DFETCHCONTENT_SOURCE_DIR_KLARTRAUM=/path/to/klartraum

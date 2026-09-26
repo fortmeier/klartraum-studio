@@ -9,10 +9,7 @@ include(FetchContent)
 # klartraum (Vulkan compute-graph framework). Point FETCHCONTENT_SOURCE_DIR_KLARTRAUM
 # at a local checkout to build against it instead of the pinned upstream branch.
 set(KLARTRAUM_GIT_REPOSITORY "https://github.com/fortmeier/klartraum.git" CACHE STRING "klartraum repository")
-# Run-once graphs need https://github.com/fortmeier/klartraum/pull/23 (offscreen
-# rendering in single-path graphs) and #24 (ONNX convolutions); the branch
-# contains both. Switch back to develop once they are merged.
-set(KLARTRAUM_GIT_TAG "fix/onnx-conv-dispatch" CACHE STRING "klartraum branch, tag or commit")
+set(KLARTRAUM_GIT_TAG "develop" CACHE STRING "klartraum branch, tag or commit")
 FetchContent_Declare(
   klartraum
   GIT_REPOSITORY ${KLARTRAUM_GIT_REPOSITORY}
