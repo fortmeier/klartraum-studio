@@ -25,9 +25,10 @@ struct ShapeInference {
 };
 
 // Propagates tensor shapes through the graph: Image File and Image to Tensor
-// produce 1x3xHxW, ONNX models map their declared input shape to their output
-// shape. Reports mismatched shapes, unreadable or unsupported models, and
-// sinks fed with tensors that are not images. Nodes with unconnected inputs
+// produce 1x3xHxW (unknown for swapchain renderings), ONNX models map their declared input shape to their output
+// shape. Reports mismatched shapes, unreadable or unsupported models, sinks
+// fed with tensors that are not images, and Tensor to Image nodes fed with
+// tensors that are not 1x3xHxW. Nodes with unconnected inputs
 // are skipped; Graph::validate reports those.
 ShapeInference inferTensorShapes(const Graph& graph, const OnnxInfoProvider& onnxInfo);
 

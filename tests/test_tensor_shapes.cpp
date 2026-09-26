@@ -3,6 +3,8 @@
  * - imageShapes: 1x1xHxW and 1x3xHxW are images, other shapes are not
  * - autoencoderShapes: shapes flow from the image file through encoder and decoder
  * - offscreenShapes: Image to Tensor takes its size from the Offscreen Target
+ * - tensorToImageShapes: Image to Tensor after Tensor to Image has the original tensor's shape
+ * - tensorToImageNeedsRgb: a tensor that is not 1x3xHxW into Tensor to Image is reported on it
  * - mismatchedModelInput: a tensor of the wrong shape into a model is reported on the model
  * - sinkNeedsImage: a Preview fed with a non-image tensor is reported on the Preview
  * - unreadableModel: a model the provider cannot read is reported with the provider's error
@@ -87,6 +89,31 @@ TEST(TensorShapes, offscreenShapes) {
     EXPECT_EQ(result.shapes.at(findKind(graph, NodeKind::ImageToTensor)), (TensorShape{1, 3, 32, 64}));
     // 64x32 does not fit the 128x128 encoder.
     EXPECT_TRUE(hasErrorOn(result, findKind(graph, NodeKind::OnnxModel, 0)));
+}
+
+TEST(TensorShapes, tensorToImageShapes) {
+    Graph graph = makeAutoencoderGraph("in.png", "enc", "dec", "out.png");
+    const int toImage = graph.addNode(NodeKind::TensorToImage);
+    const int toTensor = graph.addNode(NodeKind::ImageToTensor);
+    graph.connect({findKind(graph, NodeKind::OnnxModel, 1), PinDirection::Output, 0}, {toImage, PinDirection::Input, 0});
+    graph.connect({toImage, PinDirection::Output, 0}, {toTensor, PinDirection::Input, 0});
+    graph.connect({toTensor, PinDirection::Output, 0}, {findKind(graph, NodeKind::Preview), PinDirection::Input, 0});
+    const ShapeInference result = inferTensorShapes(graph, sampleModels());
+    EXPECT_TRUE(result.diagnostics.empty());
+    EXPECT_EQ(result.shapes.at(toTensor), (TensorShape{1, 3, 128, 128}));
+    EXPECT_FALSE(result.shapes.contains(toImage));
+}
+
+TEST(TensorShapes, tensorToImageNeedsRgb) {
+    Graph graph = makeAutoencoderGraph("in.png", "enc", "grey", "out.png");
+    const int toImage = graph.addNode(NodeKind::TensorToImage);
+    graph.connect({findKind(graph, NodeKind::OnnxModel, 1), PinDirection::Output, 0}, {toImage, PinDirection::Input, 0});
+    const ShapeInference result = inferTensorShapes(
+        graph, provider({{"enc", model({1, 3, 128, 128}, {1, 128, 16, 16})},
+                         {"grey", model({1, 128, 16, 16}, {1, 1, 128, 128})}}));
+    EXPECT_TRUE(hasErrorOn(result, toImage));
+    // A grey image is fine for the sinks.
+    EXPECT_FALSE(hasErrorOn(result, findKind(graph, NodeKind::Preview)));
 }
 
 TEST(TensorShapes, mismatchedModelInput) {

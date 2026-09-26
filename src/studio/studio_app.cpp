@@ -74,6 +74,8 @@ ImU32 kindColor(NodeKind kind) {
     case NodeKind::OffscreenTarget: return rgb(44, 110, 140);
     case NodeKind::ImageFile: return rgb(150, 84, 50);
     case NodeKind::ImageToTensor: return rgb(110, 70, 140);
+    case NodeKind::TensorToImage: return rgb(70, 90, 150);
+    case NodeKind::Resample: return rgb(50, 110, 130);
     case NodeKind::OnnxModel: return rgb(150, 60, 110);
     case NodeKind::Preview: return rgb(60, 110, 100);
     case NodeKind::ImageFileWriter: return rgb(60, 100, 70);
@@ -279,7 +281,7 @@ StudioApp::StudioApp(klartraum::KlartraumEngine& engine, StudioOptions options, 
     // Compile right away so the first frame shows the scene.
     updatePlan();
     if (!appliedPlan_) {
-        installBuilder(std::nullopt, nullptr);
+        installBuilder(std::nullopt, {});
     }
 }
 
@@ -433,38 +435,38 @@ void StudioApp::updatePlan() {
             vkDeviceWaitIdle(engine_.getVulkanContext().getDevice());
             appliedPlan_.reset();
             failedPlan_.reset();
-            installBuilder(std::nullopt, nullptr);
+            installBuilder(std::nullopt, {});
         }
         return;
     }
-    const SplattingPlan& pending = *plan_.splatting;
+    const LivePlan& pending = *plan_.live;
 
     const bool rebuild = !appliedPlan_ || pending.needsRebuildFrom(*appliedPlan_);
     if (rebuild) {
         const bool alreadyFailed = failedPlan_ && !pending.needsRebuildFrom(*failedPlan_);
         if (applyRequested_ || (autoApply_ && !alreadyFailed && !userIsEditing)) {
             applyRequested_ = false;
-            apply(pending);
+            apply(pending, graph_);
         }
         return;
     }
 
     // Same pipelines; only which authoring nodes they stand for may differ.
+    // Equal signatures list corresponding nodes at the same positions.
     if (appliedPlan_->cameraNode != pending.cameraNode) {
         if (const Node* camera = graph_.findNode(pending.cameraNode)) {
             pushCameraParams(camera->as<CameraParams>());
         }
     }
-    const bool ownersChanged = appliedPlan_->sceneNode != pending.sceneNode ||
-                               appliedPlan_->cameraNode != pending.cameraNode ||
-                               appliedPlan_->targetNode != pending.targetNode ||
-                               appliedPlan_->splattingNode != pending.splattingNode;
-    if (ownersChanged) {
+    if (appliedPlan_->nodes != pending.nodes) {
+        std::map<int, int> renamed;
+        for (size_t i = 0; i < pending.nodes.size(); ++i) {
+            renamed[appliedPlan_->nodes[i]] = pending.nodes[i];
+        }
         for (auto& element : compiled_.nodes) {
-            if (element.owner == appliedPlan_->sceneNode) element.owner = pending.sceneNode;
-            else if (element.owner == appliedPlan_->cameraNode) element.owner = pending.cameraNode;
-            else if (element.owner == appliedPlan_->targetNode) element.owner = pending.targetNode;
-            else if (element.owner == appliedPlan_->splattingNode) element.owner = pending.splattingNode;
+            if (auto it = renamed.find(element.owner); it != renamed.end()) {
+                element.owner = it->second;
+            }
         }
     }
     appliedPlan_ = pending;
@@ -488,8 +490,22 @@ std::shared_ptr<klartraum::GaussianDataStandard> StudioApp::loadModel(const std:
     return model;
 }
 
-void StudioApp::installBuilder(const std::optional<SplattingPlan>& plan,
-                               const std::shared_ptr<klartraum::GaussianDataStandard>& model) {
+RunContext StudioApp::runContext() {
+    RunContext context;
+    context.resolveInput = [this](const std::string& path) {
+        const auto resolved = resolveInputPath(path);
+        if (!resolved) {
+            throw std::runtime_error("file not found: " + path);
+        }
+        return *resolved;
+    };
+    context.resolveOutput = [this](const std::string& path) { return resolveOutputPath(path); };
+    context.loadScene = [this](const std::string& path) { return loadModel(path); };
+    context.onnxInfo = [this](const std::string& path, std::string& error) { return onnxInfo(path, error); };
+    return context;
+}
+
+void StudioApp::installBuilder(const std::optional<LivePlan>& plan, const Graph& graph) {
     if (!plan) {
         compiled_ = {};
         compiledSignature_.clear();
@@ -500,13 +516,15 @@ void StudioApp::installBuilder(const std::optional<SplattingPlan>& plan,
     }
     // The engine runs the builder now and again after every swapchain
     // recreation, so it must not throw: errors are reported via builderError_.
-    engine_.setGraphBuilder([this, plan = *plan, model](klartraum::KlartraumEngine& e) {
+    // It keeps a copy of the graph, which the user goes on editing.
+    engine_.setGraphBuilder([this, plan = *plan, graph](klartraum::KlartraumEngine& e) {
         try {
-            BuiltGraph built = buildGraph(e, plan, model);
-            compiled_ = introspect(built.root, built.owners, plan.splattingNode);
+            BuiltGraph built = buildLiveGraph(e, graph, plan, runContext());
+            compiled_ = introspect(built.root, built.owners, plan.presentNode);
             builderError_.clear();
         } catch (const std::exception& ex) {
             e.clearComputeGraphs();
+            e.setCameraUBO(nullptr);
             compiled_ = {};
             builderError_ = ex.what();
         }
@@ -525,18 +543,7 @@ void StudioApp::installBuilder(const std::optional<SplattingPlan>& plan,
     });
 }
 
-bool StudioApp::apply(const SplattingPlan& plan) {
-
-    std::shared_ptr<klartraum::GaussianDataStandard> model;
-    try {
-        model = loadModel(plan.scenePath);
-    } catch (const std::exception& e) {
-        applyError_ = e.what();
-        failedPlan_ = plan;
-        setStatus("Compile failed: " + applyError_, true);
-        return false;
-    }
-
+bool StudioApp::apply(const LivePlan& plan, const Graph& graph) {
     // The GUI runs between frames; once the GPU is idle the running graphs
     // can be released.
     vkDeviceWaitIdle(engine_.getVulkanContext().getDevice());
@@ -548,7 +555,7 @@ bool StudioApp::apply(const SplattingPlan& plan) {
     timings_.clear();
 
     const bool newCamera = !appliedPlan_ || appliedPlan_->cameraNode != plan.cameraNode;
-    installBuilder(plan, model);
+    installBuilder(plan, graph);
 
     if (!builderError_.empty()) {
         applyError_ = builderError_;
@@ -556,27 +563,35 @@ bool StudioApp::apply(const SplattingPlan& plan) {
         setStatus("Compile failed: " + applyError_, true);
         // Fall back to the last graph that compiled.
         if (appliedPlan_) {
-            installBuilder(appliedPlan_, loadModel(appliedPlan_->scenePath));
+            installBuilder(appliedPlan_, appliedGraph_);
         } else {
-            installBuilder(std::nullopt, nullptr);
+            installBuilder(std::nullopt, {});
         }
         return false;
     }
 
     appliedPlan_ = plan;
+    appliedGraph_ = graph;
     failedPlan_.reset();
     applyError_.clear();
     if (newCamera) {
-        if (const Node* camera = graph_.findNode(plan.cameraNode)) {
+        if (const Node* camera = graph.findNode(plan.cameraNode)) {
             pushCameraParams(camera->as<CameraParams>());
         }
     }
     // Drop models that the running graph no longer uses.
-    const auto keep = resolveInputPath(plan.scenePath);
-    std::erase_if(models_, [&](const auto& entry) { return !keep || entry.first != keep->string(); });
+    std::set<std::string> keep;
+    for (int id : plan.nodes) {
+        const Node* node = graph.findNode(id);
+        if (node->kind == NodeKind::Scene) {
+            if (auto resolved = resolveInputPath(node->as<SceneParams>().path)) {
+                keep.insert(resolved->string());
+            }
+        }
+    }
+    std::erase_if(models_, [&](const auto& entry) { return !keep.contains(entry.first); });
 
-    setStatus(std::format("Compiled {} elements ({} backend)", compiled_.nodes.size(),
-                          backendName(plan.params.backend)));
+    setStatus(std::format("Compiled {} elements", compiled_.nodes.size()));
     return true;
 }
 
@@ -680,20 +695,8 @@ void StudioApp::run() {
         return;
     }
 
-    RunContext context;
-    context.resolveInput = [this](const std::string& path) {
-        const auto resolved = resolveInputPath(path);
-        if (!resolved) {
-            throw std::runtime_error("file not found: " + path);
-        }
-        return *resolved;
-    };
-    context.resolveOutput = [this](const std::string& path) { return resolveOutputPath(path); };
-    context.loadScene = [this](const std::string& path) { return loadModel(path); };
-    context.onnxInfo = [this](const std::string& path, std::string& error) { return onnxInfo(path, error); };
-
     try {
-        RunResult result = runGraph(engine_.getVulkanContext(), graph_, *plan_.run, context);
+        RunResult result = runGraph(engine_.getVulkanContext(), graph_, *plan_.run, runContext());
         previews_.clear();
         for (const auto& [node, image] : result.images) {
             previews_[node] = std::make_unique<PreviewTexture>(engine_.getVulkanContext(), image);
@@ -839,10 +842,16 @@ void StudioApp::drawOverview() {
     ImGui::Text("%.1f FPS (%.2f ms)", io.Framerate, 1000.0f / std::max(io.Framerate, 0.001f));
     ImGui::Text("Resolution: %u x %u", extent.width, extent.height);
     if (appliedPlan_) {
-        ImGui::Text("Backend: %s", std::string(backendName(appliedPlan_->params.backend)).c_str());
-        if (auto resolved = resolveInputPath(appliedPlan_->scenePath)) {
-            if (auto it = models_.find(resolved->string()); it != models_.end()) {
-                ImGui::Text("Gaussians: %u", it->second->count());
+        for (int id : appliedPlan_->nodes) {
+            const Node& node = *appliedGraph_.findNode(id);
+            if (node.kind == NodeKind::GaussianSplatting) {
+                ImGui::Text("Backend: %s", std::string(backendName(node.as<SplattingParams>().backend)).c_str());
+            } else if (node.kind == NodeKind::Scene) {
+                if (auto resolved = resolveInputPath(node.as<SceneParams>().path)) {
+                    if (auto it = models_.find(resolved->string()); it != models_.end()) {
+                        ImGui::Text("Gaussians: %u", it->second->count());
+                    }
+                }
             }
         }
         ImGui::Text("Compiled elements: %zu", compiled_.nodes.size());
@@ -851,7 +860,7 @@ void StudioApp::drawOverview() {
     }
 
     ImGui::SeparatorText("Live");
-    const bool pending = plan_.ok() && (!appliedPlan_ || plan_.splatting->needsRebuildFrom(*appliedPlan_));
+    const bool pending = plan_.ok() && (!appliedPlan_ || plan_.live->needsRebuildFrom(*appliedPlan_));
     const bool hasPresent = std::any_of(graph_.nodes().begin(), graph_.nodes().end(),
                                         [](const Node& n) { return n.kind == NodeKind::Present; });
     if (!hasPresent) {
@@ -861,7 +870,7 @@ void StudioApp::drawOverview() {
         if (appliedPlan_) {
             ImGui::TextDisabled("Showing the last graph that compiled.");
         }
-    } else if (!applyError_.empty() && failedPlan_ && !plan_.splatting->needsRebuildFrom(*failedPlan_)) {
+    } else if (!applyError_.empty() && failedPlan_ && !plan_.live->needsRebuildFrom(*failedPlan_)) {
         ImGui::TextColored(severityColor(Severity::Error), "Compile failed");
         ImGui::TextWrapped("%s", applyError_.c_str());
     } else if (pending) {
@@ -886,9 +895,9 @@ void StudioApp::drawOverview() {
     if (ImGui::Checkbox("Per-element timings", &profiling_)) {
         // Takes effect with freshly compiled graphs.
         if (appliedPlan_) {
-            SplattingPlan plan = *appliedPlan_;
+            const LivePlan plan = *appliedPlan_;
             appliedPlan_.reset();
-            apply(plan);
+            apply(plan, appliedGraph_);
         }
     }
     if (profiling_) {
@@ -1125,7 +1134,7 @@ void StudioApp::drawAuthoringEditor() {
         case NodeKind::GaussianSplatting: {
             const auto& p = node.as<SplattingParams>();
             ImGui::Text("backend: %s", std::string(backendName(p.backend)).c_str());
-            if (appliedPlan_ && appliedPlan_->splattingNode == node.id) {
+            if (appliedPlan_ && appliedPlan_->contains(node.id)) {
                 ImGui::Text("%zu elements", compiled_.nodes.size());
             }
             break;
@@ -1148,7 +1157,13 @@ void StudioApp::drawAuthoringEditor() {
             ImGui::TextUnformatted(fileName(node.as<OnnxModelParams>().path).c_str());
             break;
         case NodeKind::ImageToTensor:
+        case NodeKind::TensorToImage:
             break;
+        case NodeKind::Resample: {
+            const auto& p = node.as<ResampleParams>();
+            ImGui::Text("%u x %u, %s", p.width, p.height, std::string(filterName(p.filter)).c_str());
+            break;
+        }
         case NodeKind::Preview:
             if (!drawPreview(node.id, kNodeWidth)) {
                 ImGui::TextDisabled(plan_.run ? "Press Run (F5)" : "No result");
@@ -1749,7 +1764,7 @@ void StudioApp::drawNodeInspector(Node& node) {
         }
         ImGui::TextDisabled("Changes rebuild the pipelines.");
 
-        if (appliedPlan_ && appliedPlan_->splattingNode == node.id && !compiled_.empty()) {
+        if (appliedPlan_ && appliedPlan_->contains(node.id) && !compiled_.empty()) {
             ImGui::SeparatorText("Compiled");
             std::map<ElementCategory, int> counts;
             for (const auto& element : compiled_.nodes) {
@@ -1801,9 +1816,29 @@ void StudioApp::drawNodeInspector(Node& node) {
     }
     case NodeKind::ImageToTensor:
         ImGui::SeparatorText("Conversion");
-        ImGui::TextWrapped("Converts the rendered offscreen image into a 1x3xHxW tensor (values in [0, 1]) with "
-                           "klartraum's image_to_tensor shader.");
+        ImGui::TextWrapped("Converts the rendered image into a 1x3xHxW tensor (values in [0, 1]) of the image's "
+                           "size with klartraum's image_to_tensor shader. Put a Resample in front to get a fixed "
+                           "size from the window's swapchain.");
         break;
+    case NodeKind::TensorToImage:
+        ImGui::SeparatorText("Conversion");
+        ImGui::TextWrapped("Converts a 1x3xHxW tensor into an HxW offscreen image with klartraum's tensor_to_image "
+                           "shader; values are clamped to [0, 1]. Feed it to Present, a Preview, an Image File "
+                           "Writer, a Resample or an Image to Tensor node.");
+        break;
+    case NodeKind::Resample: {
+        auto& p = node.as<ResampleParams>();
+        ImGui::SeparatorText("Output size");
+        changed |= inputUint("Width", p.width);
+        changed |= inputUint("Height", p.height);
+        int filter = p.filter == ResampleFilter::Nearest ? 0 : 1;
+        if (ImGui::Combo("Filter", &filter, "nearest\0bilinear\0")) {
+            p.filter = filter == 0 ? ResampleFilter::Nearest : ResampleFilter::Bilinear;
+            changed = true;
+        }
+        ImGui::TextDisabled("Stretches the image to %u x %u (klartraum::ImageResample).", p.width, p.height);
+        break;
+    }
     case NodeKind::OnnxModel: {
         auto& p = node.as<OnnxModelParams>();
         ImGui::SeparatorText("Model");

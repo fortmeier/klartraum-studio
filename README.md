@@ -6,10 +6,11 @@ with the Gaussian-splatting graph and renders it live.
 
 A graph has two kinds of output, and one graph can use both:
 
-- **Live:** everything feeding the *Present* node renders into the window
-  every frame. Valid edits are compiled and swapped in without restarting.
-  Camera parameters apply immediately; backend, scene and splatting parameters
-  rebuild the pipelines.
+- **Live:** everything feeding the *Present* node runs every frame and shows
+  in the window: a Gaussian splatting as it is, or processed further, for
+  example resampled, run through ONNX models and turned back into an image.
+  Valid edits are compiled and swapped in without restarting. Camera
+  parameters apply immediately; any other change rebuilds the pipelines.
 - **Run:** everything feeding a *Preview* or *Image File Writer* is compiled
   into its own klartraum compute graph and executed once each time you press
   **Run** (F5), or on every change with *Run on every change*. Previews show
@@ -21,12 +22,13 @@ Nodes stand for klartraum's public building blocks:
 |---|---|
 | Sources | *Scene* (`.spz` Gaussians), *Image File* (PNG, JPEG, … resized to W×H, as a 1×3×H×W tensor) |
 | Rendering | *Orbit Camera*, *Swapchain Target*, *Offscreen Target* (W×H), *Gaussian Splatting* (compute or raster backend, all `GsplatConfig` settings) |
-| Compute | *Image to Tensor* (offscreen image → 1×3×H×W tensor), *ONNX Model* (`klartraum::OnnxNetwork`; Conv, ConvTranspose, Relu, Reshape, Transpose) |
-| Outputs | *Present* (live), *Preview* and *Image File Writer* (run) |
+| Compute | *Image to Tensor* (image → 1×3×H×W tensor), *Tensor to Image* (1×3×H×W tensor → H×W image), *Resample* (image → W×H image, nearest or bilinear; `klartraum::ImageResample`), *ONNX Model* (`klartraum::OnnxNetwork`; Conv, ConvTranspose, Relu, Reshape, Transpose) |
+| Outputs | *Present* (live; images other than a swapchain rendering are stretched to the window), *Preview* and *Image File Writer* (run; they take an image tensor or an image) |
 
 Pins are typed (Gaussians, Camera, Image, Tensor), and the graph is validated
-as you edit it. The checks cover missing inputs and files, a swapchain image
-where an offscreen one is needed, tensor shapes propagated through ONNX models
+as you edit it. The checks cover missing inputs and files, Run reading the
+window's swapchain images (render into an *Offscreen Target* for it), tensor
+shapes propagated through ONNX models
 (the model's declared input vs. what it gets), unsupported ONNX operators, and
 tensors that are not images feeding a Preview.
 
@@ -160,7 +162,9 @@ tests run headlessly:
 - A splatting backend renders straight into a target image. Chaining two
   splatting passes, or compositing one onto another's output, is reported as a
   validation error rather than compiled.
-- *Present* shows swapchain renderings only. Run results are shown by
-  *Preview* nodes, not in the window's background.
+- Run results are shown by *Preview* nodes, not in the window's background.
+- A swapchain rendering has the window's size, which changes with it. A tensor
+  made from it only fits a model with fixed input dimensions after a
+  *Resample*; a mismatch is reported when the live graph is built.
 - ONNX models need a single input. Only the operators klartraum implements are
   supported, and the editor lists any others.

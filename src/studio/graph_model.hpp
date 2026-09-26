@@ -14,7 +14,7 @@ namespace kstudio {
 // The authoring graph: what the user edits in the node editor. It describes
 // work at the level of klartraum's public building blocks. Two parts of it
 // are compiled separately (see graph_compiler.hpp):
-//  - the live part, everything feeding Present, renders every frame;
+//  - the live part, everything feeding Present, runs every frame;
 //  - the run part, everything feeding a sink (Preview, Image File Writer),
 //    is executed once each time the user presses Run.
 
@@ -29,6 +29,8 @@ enum class NodeKind {
     OffscreenTarget,
     ImageFile,
     ImageToTensor,
+    TensorToImage,
+    Resample,
     OnnxModel,
     Preview,
     ImageFileWriter,
@@ -37,6 +39,8 @@ enum class NodeKind {
 enum class SplattingBackend { Compute, Raster };
 
 enum class UpAxis { Y, Z };
+
+enum class ResampleFilter { Nearest, Bilinear };
 
 struct SceneParams {
     std::string path;
@@ -101,6 +105,18 @@ struct ImageToTensorParams {
     bool operator==(const ImageToTensorParams&) const = default;
 };
 
+struct TensorToImageParams {
+    bool operator==(const TensorToImageParams&) const = default;
+};
+
+// Resamples an image to width x height (klartraum::ImageResample).
+struct ResampleParams {
+    uint32_t width = 128;
+    uint32_t height = 128;
+    ResampleFilter filter = ResampleFilter::Bilinear;
+    bool operator==(const ResampleParams&) const = default;
+};
+
 struct OnnxModelParams {
     std::string path;
     bool operator==(const OnnxModelParams&) const = default;
@@ -116,12 +132,16 @@ struct ImageFileWriterParams {
 };
 
 using NodeParams = std::variant<SceneParams, CameraParams, SwapchainTargetParams, SplattingParams, PresentParams,
-                                OffscreenTargetParams, ImageFileParams, ImageToTensorParams, OnnxModelParams,
-                                PreviewParams, ImageFileWriterParams>;
+                                OffscreenTargetParams, ImageFileParams, ImageToTensorParams, TensorToImageParams,
+                                ResampleParams, OnnxModelParams, PreviewParams, ImageFileWriterParams>;
 
 struct PinDesc {
     std::string_view name;
     PinType type;
+    // An input may accept a second type (sinks take tensors and images).
+    std::optional<PinType> alsoAccepts = std::nullopt;
+
+    bool accepts(PinType other) const { return other == type || other == alsoAccepts; }
 };
 
 struct NodeKindInfo {
@@ -139,9 +159,13 @@ std::span<const NodeKindInfo> allKinds();
 std::optional<NodeKind> kindFromName(std::string_view name);
 std::string_view pinTypeName(PinType type);
 std::string_view backendName(SplattingBackend backend);
+std::string_view filterName(ResampleFilter filter);
 NodeParams defaultParams(NodeKind kind);
 // Preview and Image File Writer: executed by Run.
 bool isSink(NodeKind kind);
+// Nodes whose Image output holds a result (Gaussian Splatting, Tensor to
+// Image, Resample), as opposed to an empty target.
+bool producesImage(NodeKind kind);
 
 struct Vec2 {
     float x = 0.0f;
@@ -214,6 +238,8 @@ public:
     // The link feeding an input pin, if any.
     const Link* inputLink(int node, int slot) const;
     const Node* inputNode(int node, int slot) const;
+    // The type of the output feeding an input pin, if connected.
+    std::optional<PinType> inputType(int node, int slot) const;
 
     const std::vector<Node>& nodes() const { return nodes_; }
     std::vector<Node>& nodes() { return nodes_; }

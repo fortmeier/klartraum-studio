@@ -6,6 +6,16 @@
  * - runSplatAutoencoderGraph: a Gaussian splatting rendered offscreen runs through image
  *   to tensor, encoder and decoder; the preview is a non-black 128x128 image and the
  *   compiled graph attributes the ONNX layers to their model nodes (GPU)
+ * - runTensorToImage: an image file through Tensor to Image into a writer, and back through
+ *   Image to Tensor into a preview, reproduces the resized input (GPU)
+ * - runWritesOffscreenRendering: a writer fed directly with an offscreen splatting writes a
+ *   non-black image of the target's size (GPU)
+ * - runResample: an image resampled to twice its size with nearest filtering repeats every
+ *   pixel (GPU)
+ * - liveProcessedGraph: the Gaussian splatting rendered into the swapchain, resampled, encoded,
+ *   decoded and presented builds as the live graph and renders frames (GPU)
+ * - liveReportsShapeMismatch: a model fed with the window-sized rendering fails the live build
+ *   with the model's title (GPU)
  * - runReportsFailingNode: a missing input file fails the run with the node's title (GPU)
  **/
 
@@ -19,6 +29,7 @@
 
 #include "klartraum/gaussian_data_standard.hpp"
 #include "klartraum/headless_frontend.hpp"
+#include "klartraum/klartraum_core.hpp"
 #include "klartraum/vulkan_helpers.hpp"
 
 #include "studio/graph_runner.hpp"
@@ -168,6 +179,182 @@ TEST_F(GraphRunnerTest, runSplatAutoencoderGraph) {
     EXPECT_TRUE(std::any_of(result.compiled.nodes.begin(), result.compiled.nodes.end(), [&](const ElementNode& n) {
         return n.owner == findKind(graph, NodeKind::GaussianSplatting) && n.category == ElementCategory::Group;
     }));
+}
+
+TEST_F(GraphRunnerTest, runTensorToImage) {
+    Graph graph;
+    const int file = graph.addNode(NodeKind::ImageFile);
+    const int toImage = graph.addNode(NodeKind::TensorToImage);
+    const int toTensor = graph.addNode(NodeKind::ImageToTensor);
+    const int writer = graph.addNode(NodeKind::ImageFileWriter);
+    const int preview = graph.addNode(NodeKind::Preview);
+    auto& p = graph.findNode(file)->as<ImageFileParams>();
+    p.path = kImage;
+    p.width = 96;
+    p.height = 64;
+    graph.findNode(writer)->as<ImageFileWriterParams>().path = "roundtrip.png";
+    auto out = [](int node) { return PinRef{node, PinDirection::Output, 0}; };
+    auto in = [](int node) { return PinRef{node, PinDirection::Input, 0}; };
+    ASSERT_FALSE(graph.connect(out(file), in(toImage)).has_value());
+    ASSERT_FALSE(graph.connect(out(toImage), in(writer)).has_value());
+    ASSERT_FALSE(graph.connect(out(toImage), in(toTensor)).has_value());
+    ASSERT_FALSE(graph.connect(out(toTensor), in(preview)).has_value());
+
+    const RunResult result = runGraph(vc(), graph, plan(graph), context);
+
+    const ImageRGBA8 input = resizeImage(loadImage(kImage), 96, 64);
+    for (int sink : {writer, preview}) {
+        const ImageRGBA8& image = result.images.at(sink);
+        ASSERT_EQ(image.width, 96u);
+        ASSERT_EQ(image.height, 64u);
+        int maxError = 0;
+        for (size_t i = 0; i < input.pixels.size(); ++i) {
+            if (i % 4 != 3) {
+                maxError = std::max(maxError, std::abs(int(image.pixels[i]) - int(input.pixels[i])));
+            }
+        }
+        EXPECT_LE(maxError, 1) << "sink " << sink;
+    }
+    ASSERT_EQ(result.written.size(), 1u);
+    EXPECT_EQ(loadImage(result.written[0]).pixels, result.images.at(writer).pixels);
+}
+
+TEST_F(GraphRunnerTest, runWritesOffscreenRendering) {
+    Graph graph = makeSplatAutoencoderGraph(kScene, kEncoder, kDecoder);
+    auto& target = graph.findNode(findKind(graph, NodeKind::OffscreenTarget))->as<OffscreenTargetParams>();
+    target.width = 80;
+    target.height = 48;
+    // Only the rendering is written; the autoencoder is left out.
+    for (NodeKind kind : {NodeKind::Preview, NodeKind::OnnxModel, NodeKind::OnnxModel, NodeKind::ImageToTensor}) {
+        graph.removeNode(findKind(graph, kind));
+    }
+    const int writer = graph.addNode(NodeKind::ImageFileWriter);
+    graph.findNode(writer)->as<ImageFileWriterParams>().path = "splats.png";
+    ASSERT_FALSE(graph.connect({findKind(graph, NodeKind::GaussianSplatting), PinDirection::Output, 0},
+                               {writer, PinDirection::Input, 0})
+                     .has_value());
+
+    const RunResult result = runGraph(vc(), graph, plan(graph), context);
+
+    const ImageRGBA8& image = result.images.at(writer);
+    EXPECT_EQ(image.width, 80u);
+    EXPECT_EQ(image.height, 48u);
+    EXPECT_FALSE(isConstant(image));
+    EXPECT_GT(meanValue(image), 5.0) << "the splatting is black";
+    ASSERT_EQ(result.written.size(), 1u);
+    EXPECT_EQ(result.written[0], outputDir / "splats.png");
+}
+
+TEST_F(GraphRunnerTest, runResample) {
+    Graph graph;
+    const int file = graph.addNode(NodeKind::ImageFile);
+    const int toImage = graph.addNode(NodeKind::TensorToImage);
+    const int resample = graph.addNode(NodeKind::Resample);
+    const int preview = graph.addNode(NodeKind::Preview);
+    auto& p = graph.findNode(file)->as<ImageFileParams>();
+    p.path = kImage;
+    p.width = 24;
+    p.height = 16;
+    auto& r = graph.findNode(resample)->as<ResampleParams>();
+    r.width = 48;
+    r.height = 32;
+    r.filter = ResampleFilter::Nearest;
+    auto out = [](int node) { return PinRef{node, PinDirection::Output, 0}; };
+    auto in = [](int node) { return PinRef{node, PinDirection::Input, 0}; };
+    ASSERT_FALSE(graph.connect(out(file), in(toImage)).has_value());
+    ASSERT_FALSE(graph.connect(out(toImage), in(resample)).has_value());
+    ASSERT_FALSE(graph.connect(out(resample), in(preview)).has_value());
+
+    const RunResult result = runGraph(vc(), graph, plan(graph), context);
+
+    const ImageRGBA8 input = resizeImage(loadImage(kImage), 24, 16);
+    const ImageRGBA8& image = result.images.at(preview);
+    ASSERT_EQ(image.width, 48u);
+    ASSERT_EQ(image.height, 32u);
+    int maxError = 0;
+    for (uint32_t y = 0; y < 32; ++y) {
+        for (uint32_t x = 0; x < 48; ++x) {
+            for (uint32_t c = 0; c < 3; ++c) {
+                const int actual = image.pixels[(y * 48 + x) * 4 + c];
+                const int expected = input.pixels[((y / 2) * 24 + x / 2) * 4 + c];
+                maxError = std::max(maxError, std::abs(actual - expected));
+            }
+        }
+    }
+    EXPECT_LE(maxError, 1);
+}
+
+namespace {
+
+// The Gaussian splatting graph with the rendering resampled to the
+// encoder's size, encoded, decoded and presented; without `resample`, the
+// window-sized rendering goes to the encoder directly.
+Graph processedLiveGraph(bool resample) {
+    Graph graph = makeGaussianSplattingGraph(kScene);
+    const int splatting = findKind(graph, NodeKind::GaussianSplatting);
+    const int toTensor = graph.addNode(NodeKind::ImageToTensor);
+    const int encoder = graph.addNode(NodeKind::OnnxModel);
+    const int decoder = graph.addNode(NodeKind::OnnxModel);
+    const int toImage = graph.addNode(NodeKind::TensorToImage);
+    graph.findNode(encoder)->as<OnnxModelParams>().path = kEncoder;
+    graph.findNode(encoder)->title = "Encoder";
+    graph.findNode(decoder)->as<OnnxModelParams>().path = kDecoder;
+    auto out = [](int node) { return PinRef{node, PinDirection::Output, 0}; };
+    auto in = [](int node) { return PinRef{node, PinDirection::Input, 0}; };
+    if (resample) {
+        const int node = graph.addNode(NodeKind::Resample);
+        graph.connect(out(splatting), in(node));
+        graph.connect(out(node), in(toTensor));
+    } else {
+        graph.connect(out(splatting), in(toTensor));
+    }
+    graph.connect(out(toTensor), in(encoder));
+    graph.connect(out(encoder), in(decoder));
+    graph.connect(out(decoder), in(toImage));
+    graph.connect(out(toImage), in(findKind(graph, NodeKind::Present)));
+    return graph;
+}
+
+} // namespace
+
+TEST_F(GraphRunnerTest, liveProcessedGraph) {
+    const Graph graph = processedLiveGraph(true);
+    const CompilePlan compiled = planGraph(graph, context.onnxInfo);
+    for (const auto& d : compiled.diagnostics) {
+        EXPECT_NE(d.severity, Severity::Error) << d.message;
+    }
+    ASSERT_TRUE(compiled.live.has_value());
+
+    auto& engine = frontend->getKlartraumEngine();
+    const BuiltGraph built = buildLiveGraph(engine, graph, *compiled.live, context);
+    const ElementGraph elements = introspect(built.root, built.owners, compiled.live->presentNode);
+    for (int i = 0; i < 3; ++i) {
+        engine.step();
+    }
+    vkDeviceWaitIdle(vc().getDevice());
+
+    auto owns = [&](NodeKind kind, std::string_view type) {
+        return std::any_of(elements.nodes.begin(), elements.nodes.end(), [&](const ElementNode& n) {
+            return n.owner == findKind(graph, kind) && n.type == type;
+        });
+    };
+    EXPECT_TRUE(owns(NodeKind::Resample, "ImageResample"));
+    EXPECT_TRUE(owns(NodeKind::Present, "ImageResample"));
+    EXPECT_TRUE(owns(NodeKind::OnnxModel, "OnnxNetwork"));
+    EXPECT_TRUE(owns(NodeKind::SwapchainTarget, "ImageViewSrc"));
+    engine.clearComputeGraphs();
+}
+
+TEST_F(GraphRunnerTest, liveReportsShapeMismatch) {
+    const Graph graph = processedLiveGraph(false);
+    const CompilePlan compiled = planGraph(graph, context.onnxInfo);
+    ASSERT_TRUE(compiled.live.has_value());
+    try {
+        buildLiveGraph(frontend->getKlartraumEngine(), graph, *compiled.live, context);
+        FAIL() << "expected the build to fail";
+    } catch (const std::runtime_error& e) {
+        EXPECT_TRUE(std::string(e.what()).starts_with("Encoder: the model expects a")) << e.what();
+    }
 }
 
 TEST_F(GraphRunnerTest, runReportsFailingNode) {

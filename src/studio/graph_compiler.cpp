@@ -1,12 +1,13 @@
 #include "studio/graph_compiler.hpp"
 
 #include <algorithm>
+#include <format>
+#include <functional>
 #include <set>
 
-#include "klartraum/computegraph/imageviewsrc.hpp"
-#include "klartraum/gaussian_data_standard.hpp"
 #include "klartraum/gaussian_splatting_factory.hpp"
-#include "klartraum/klartraum_core.hpp"
+
+#include "studio/graph_serialization.hpp"
 
 namespace kstudio {
 
@@ -68,27 +69,40 @@ CompilePlan planGraph(const Graph& graph, const OnnxInfoProvider& onnxInfo, cons
         plan.run = std::move(run);
     }
 
-    // Live part: validate() guarantees at most one Present, fed by a Gaussian
-    // Splatting node that renders into a Swapchain Target.
+    // Live part: validate() allows at most one Present.
     const auto present = std::find_if(graph.nodes().begin(), graph.nodes().end(),
                                       [](const Node& n) { return n.kind == NodeKind::Present; });
     if (present == graph.nodes().end() || !clean(graph.upstreamOf(present->id))) {
         return plan;
     }
-    const Node* splatting = graph.inputNode(present->id, 0);
-    const Node* scene = graph.inputNode(splatting->id, 0);
-    const Node* camera = graph.inputNode(splatting->id, 1);
-    const Node* target = graph.inputNode(splatting->id, 2);
-
-    SplattingPlan splattingPlan;
-    splattingPlan.presentNode = present->id;
-    splattingPlan.splattingNode = splatting->id;
-    splattingPlan.sceneNode = scene->id;
-    splattingPlan.cameraNode = camera->id;
-    splattingPlan.targetNode = target->id;
-    splattingPlan.scenePath = scene->as<SceneParams>().path;
-    splattingPlan.params = splatting->as<SplattingParams>();
-    plan.splatting = splattingPlan;
+    LivePlan live;
+    live.presentNode = present->id;
+    std::map<int, size_t> visited;
+    std::function<void(int)> visit = [&](int id) {
+        if (auto it = visited.find(id); it != visited.end()) {
+            live.signature += std::format("#{}", it->second);
+            return;
+        }
+        visited[id] = live.nodes.size();
+        live.nodes.push_back(id);
+        const Node& node = *graph.findNode(id);
+        live.signature += kindInfo(node.kind).name;
+        if (node.kind == NodeKind::Camera) {
+            live.cameraNode = id;
+        } else {
+            live.signature += paramsToString(node.params);
+        }
+        live.signature += "(";
+        const auto& inputs = kindInfo(node.kind).inputs;
+        for (int slot = 0; slot < static_cast<int>(inputs.size()); ++slot) {
+            const Link* link = graph.inputLink(id, slot);
+            live.signature += std::format("{}{}:", slot == 0 ? "" : ",", link->fromSlot);
+            visit(link->fromNode);
+        }
+        live.signature += ")";
+    };
+    visit(present->id);
+    plan.live = std::move(live);
     return plan;
 }
 
@@ -107,54 +121,6 @@ klartraum::GsplatConfig toGsplatConfig(const SplattingParams& params) {
 
 klartraum::GsplatBackend toGsplatBackend(SplattingBackend backend) {
     return backend == SplattingBackend::Raster ? klartraum::GsplatBackend::Raster : klartraum::GsplatBackend::Compute;
-}
-
-BuiltGraph buildGraph(klartraum::KlartraumEngine& engine, const SplattingPlan& plan,
-                      const std::shared_ptr<klartraum::GaussianDataStandard>& model) {
-    auto& vc = engine.getVulkanContext();
-
-    // Swapchain Target: one image per swapchain image, each waiting for its
-    // acquire semaphore.
-    const uint32_t numImages = vc.getNumberOfSwapChainImages();
-    std::vector<VkImageView> imageViews(numImages);
-    std::vector<VkImage> images(numImages);
-    std::vector<VkExtent2D> extents(numImages, vc.getSwapChainExtent());
-    for (uint32_t i = 0; i < numImages; ++i) {
-        imageViews[i] = vc.getImageView(i);
-        images[i] = vc.getSwapChainImage(i);
-    }
-    auto imageViewSrc = std::make_shared<klartraum::ImageViewSrc>(imageViews, images, extents);
-    imageViewSrc->setName("Swapchain");
-    for (uint32_t i = 0; i < numImages; ++i) {
-        imageViewSrc->setWaitFor(i, vc.imageAvailableSemaphoresPerImage[i]);
-    }
-
-    auto cameraUBO = std::make_shared<klartraum::CameraUboType>();
-    cameraUBO->setName("CameraUBO");
-
-    BuiltGraph built;
-    built.root = klartraum::createGaussianSplatting(vc, toGsplatBackend(plan.params.backend), imageViewSrc, cameraUBO,
-                                                    model, toGsplatConfig(plan.params));
-
-    built.owners[imageViewSrc.get()] = plan.targetNode;
-    built.owners[cameraUBO.get()] = plan.cameraNode;
-    const auto& buffers = model->buffers();
-    for (const klartraum::ComputeGraphElement* element :
-         {static_cast<klartraum::ComputeGraphElement*>(buffers.pos.get()),
-          static_cast<klartraum::ComputeGraphElement*>(buffers.rot.get()),
-          static_cast<klartraum::ComputeGraphElement*>(buffers.scale.get()),
-          static_cast<klartraum::ComputeGraphElement*>(buffers.colAlpha.get()),
-          static_cast<klartraum::ComputeGraphElement*>(buffers.shR.get()),
-          static_cast<klartraum::ComputeGraphElement*>(buffers.shG.get()),
-          static_cast<klartraum::ComputeGraphElement*>(buffers.shB.get())}) {
-        if (element) {
-            built.owners[element] = plan.sceneNode;
-        }
-    }
-
-    engine.add(built.root);
-    engine.setCameraUBO(cameraUBO);
-    return built;
 }
 
 } // namespace kstudio

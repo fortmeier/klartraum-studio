@@ -97,9 +97,10 @@ private:
 
     // Compilation
     void updatePlan();
-    bool apply(const SplattingPlan& plan);
-    void installBuilder(const std::optional<SplattingPlan>& plan,
-                        const std::shared_ptr<klartraum::GaussianDataStandard>& model);
+    bool apply(const LivePlan& plan, const Graph& graph);
+    void installBuilder(const std::optional<LivePlan>& plan, const Graph& graph);
+    // How the live graph and Run find their inputs.
+    RunContext runContext();
     std::shared_ptr<klartraum::GaussianDataStandard> loadModel(const std::string& path);
     void syncCamera();
     void pushCameraParams(const CameraParams& params);
@@ -153,8 +154,9 @@ private:
     // Compilation state
     uint64_t plannedRevision_ = ~uint64_t{0};
     CompilePlan plan_;
-    std::optional<SplattingPlan> appliedPlan_;
-    std::optional<SplattingPlan> failedPlan_;
+    std::optional<LivePlan> appliedPlan_;
+    Graph appliedGraph_;  // the graph appliedPlan_ was built from
+    std::optional<LivePlan> failedPlan_;
     std::string applyError_;
     std::string builderError_;
     bool autoApply_ = true;

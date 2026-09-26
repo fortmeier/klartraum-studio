@@ -19,11 +19,14 @@ ElementCategory categorize(std::string_view type) {
     if (starts("UniformBufferObject")) {
         return ElementCategory::Uniform;
     }
+    if (starts("ImageViewSrcTransition")) {
+        return ElementCategory::Sync;
+    }
     if (starts("ImageViewSrc") || starts("ImageSrc") || starts("OffscreenTarget")) {
         return ElementCategory::Image;
     }
     if (starts("GeneralComputation") || starts("BufferTransformation") || starts("CopyBuffer") ||
-        starts("OnnxNetwork")) {
+        starts("OnnxNetwork") || starts("ImageResample")) {
         return ElementCategory::Compute;
     }
     if (starts("RenderPass")) {

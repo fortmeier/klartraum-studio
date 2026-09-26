@@ -1,6 +1,7 @@
 #include "studio/tensor_shapes.hpp"
 
 #include <format>
+#include <optional>
 
 namespace kstudio {
 
@@ -21,6 +22,27 @@ ShapeInference inferTensorShapes(const Graph& graph, const OnnxInfoProvider& onn
         auto it = result.shapes.find(link->fromNode);
         return it == result.shapes.end() ? nullptr : &it->second;
     };
+    // The 1x3xHxW tensor an image converts to, if its size is known: a
+    // Gaussian Splatting node renders at its Offscreen Target's size (the
+    // swapchain's is only known when the graph is built), a Tensor to Image
+    // node at its input tensor's, a Resample node at its own.
+    auto imageShape = [&](const Node* source) -> std::optional<TensorShape> {
+        if (source && source->kind == NodeKind::GaussianSplatting) {
+            const Node* target = graph.inputNode(source->id, 2);
+            if (target && target->kind == NodeKind::OffscreenTarget) {
+                const auto& p = target->as<OffscreenTargetParams>();
+                return TensorShape{1, 3, p.height, p.width};
+            }
+        } else if (source && source->kind == NodeKind::Resample) {
+            const auto& p = source->as<ResampleParams>();
+            return TensorShape{1, 3, p.height, p.width};
+        } else if (source && source->kind == NodeKind::TensorToImage) {
+            if (const TensorShape* in = inputShape(source->id); in && isImageShape(*in) && (*in)[1] == 3) {
+                return *in;
+            }
+        }
+        return std::nullopt;
+    };
 
     for (int id : graph.topologicalOrder()) {
         const Node& node = *graph.findNode(id);
@@ -30,16 +52,17 @@ ShapeInference inferTensorShapes(const Graph& graph, const OnnxInfoProvider& onn
             result.shapes[id] = {1, 3, p.height, p.width};
             break;
         }
-        case NodeKind::ImageToTensor: {
-            // Image to Tensor <- Gaussian Splatting <- Offscreen Target
-            const Node* splatting = graph.inputNode(id, 0);
-            const Node* target = splatting ? graph.inputNode(splatting->id, 2) : nullptr;
-            if (target && target->kind == NodeKind::OffscreenTarget) {
-                const auto& p = target->as<OffscreenTargetParams>();
-                result.shapes[id] = {1, 3, p.height, p.width};
+        case NodeKind::ImageToTensor:
+            if (auto shape = imageShape(graph.inputNode(id, 0))) {
+                result.shapes[id] = *shape;
             }
             break;
-        }
+        case NodeKind::TensorToImage:
+            // klartraum's tensor_to_image shader reads three planes.
+            if (const TensorShape* in = inputShape(id); in && !(isImageShape(*in) && (*in)[1] == 3)) {
+                report(id, std::format("A {} tensor cannot be converted; expected 1x3xHxW.", shapeToString(*in)));
+            }
+            break;
         case NodeKind::OnnxModel: {
             const auto& path = node.as<OnnxModelParams>().path;
             if (path.empty() || !onnxInfo) {

@@ -23,10 +23,20 @@
 
 #include "studio/graph_compiler.hpp"
 #include "studio/graph_introspection.hpp"
+#include "studio/graph_runner.hpp"
 
 using namespace kstudio;
 
 namespace {
+
+int findKind(const Graph& graph, NodeKind kind) {
+    for (const auto& node : graph.nodes()) {
+        if (node.kind == kind) {
+            return node.id;
+        }
+    }
+    return -1;
+}
 
 class FakeElement : public klartraum::ComputeGraphElement {
 public:
@@ -170,15 +180,17 @@ TEST(GraphIntrospection, builtGraphMatchesCompiledElements) {
     for (SplattingBackend backend : {SplattingBackend::Compute, SplattingBackend::Raster}) {
         SCOPED_TRACE(std::string(backendName(backend)));
         const Graph graph = makeGaussianSplattingGraph(scene, backend);
-        const SplattingPlan plan = *planGraph(graph).splatting;
+        const LivePlan plan = *planGraph(graph).live;
 
         klartraum::HeadlessFrontend frontend;
         auto& engine = frontend.getKlartraumEngine();
         engine.enableProfiling();
         auto model = std::make_shared<klartraum::GaussianDataStandard>(engine.getVulkanContext(), scene);
+        RunContext context;
+        context.loadScene = [&](const std::string&) { return model; };
 
-        const BuiltGraph built = buildGraph(engine, plan, model);
-        const ElementGraph introspected = introspect(built.root, built.owners, plan.splattingNode);
+        const BuiltGraph built = buildLiveGraph(engine, graph, plan, context);
+        const ElementGraph introspected = introspect(built.root, built.owners, plan.presentNode);
         engine.step();
 
         // Profiling reports one entry per element klartraum compiled, in
@@ -200,10 +212,11 @@ TEST(GraphIntrospection, builtGraphMatchesCompiledElements) {
             return std::count_if(introspected.nodes.begin(), introspected.nodes.end(),
                                  [&](const ElementNode& n) { return n.owner == owner; });
         };
-        EXPECT_EQ(countOwned(plan.sceneNode), 7);
+        EXPECT_EQ(countOwned(findKind(graph, NodeKind::Scene)), 7);
         EXPECT_EQ(countOwned(plan.cameraNode), 1);
-        EXPECT_EQ(countOwned(plan.targetNode), 1);
-        EXPECT_EQ(introspected.nodes[introspected.root].owner, plan.splattingNode);
+        EXPECT_EQ(countOwned(findKind(graph, NodeKind::SwapchainTarget)), 1);
+        // A rendering into the swapchain is presented as it is.
+        EXPECT_EQ(introspected.nodes[introspected.root].owner, findKind(graph, NodeKind::GaussianSplatting));
 
         vkDeviceWaitIdle(engine.getVulkanContext().getDevice());
         engine.clearComputeGraphs();

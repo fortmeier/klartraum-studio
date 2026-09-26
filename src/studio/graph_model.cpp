@@ -20,6 +20,7 @@ constexpr PinDesc kSplattingInputs[] = {
 constexpr PinDesc kImageInputs[] = {{"Image", PinType::Image}};
 constexpr PinDesc kTensorInputs[] = {{"Tensor", PinType::Tensor}};
 constexpr PinDesc kTensorOutputs[] = {{"Tensor", PinType::Tensor}};
+constexpr PinDesc kSinkInputs[] = {{"Tensor", PinType::Tensor, PinType::Image}};
 
 const NodeKindInfo kKinds[] = {
     {NodeKind::Scene, "scene", "Scene", "Sources", "Loads a 3D Gaussian model from an .spz file.", {}, kSceneOutputs},
@@ -36,14 +37,19 @@ const NodeKindInfo kKinds[] = {
      kImageOutputs},
     {NodeKind::ImageToTensor, "image_to_tensor", "Image to Tensor", "Compute",
      "Converts a rendered offscreen image into a 1x3xHxW tensor.", kImageInputs, kTensorOutputs},
+    {NodeKind::TensorToImage, "tensor_to_image", "Tensor to Image", "Compute",
+     "Converts a 1x3xHxW tensor (values in [0, 1]) into an HxW image.", kTensorInputs, kImageOutputs},
+    {NodeKind::Resample, "resample", "Resample", "Compute",
+     "Resamples an image to a fixed size (klartraum::ImageResample).", kImageInputs, kImageOutputs},
     {NodeKind::OnnxModel, "onnx_model", "ONNX Model", "Compute",
      "Runs an ONNX network (klartraum::OnnxNetwork) on a tensor.", kTensorInputs, kTensorOutputs},
-    {NodeKind::Present, "present", "Present", "Outputs", "Presents the image in the window every frame.",
-     kImageInputs, {}},
-    {NodeKind::Preview, "preview", "Preview", "Outputs", "Shows a 1- or 3-channel image tensor when the graph is run.",
-     kTensorInputs, {}},
+    {NodeKind::Present, "present", "Present", "Outputs",
+     "Shows the image in the window every frame, stretched to the window's size.", kImageInputs, {}},
+    {NodeKind::Preview, "preview", "Preview", "Outputs",
+     "Shows a 1- or 3-channel image tensor, or an offscreen image, when the graph is run.", kSinkInputs, {}},
     {NodeKind::ImageFileWriter, "image_file_writer", "Image File Writer", "Outputs",
-     "Writes a 1- or 3-channel image tensor to a PNG file when the graph is run.", kTensorInputs, {}},
+     "Writes a 1- or 3-channel image tensor, or an offscreen image, to a PNG file when the graph is run.",
+     kSinkInputs, {}},
 };
 
 } // namespace
@@ -84,6 +90,10 @@ std::string_view backendName(SplattingBackend backend) {
     return backend == SplattingBackend::Raster ? "raster" : "compute";
 }
 
+std::string_view filterName(ResampleFilter filter) {
+    return filter == ResampleFilter::Nearest ? "nearest" : "bilinear";
+}
+
 NodeParams defaultParams(NodeKind kind) {
     switch (kind) {
     case NodeKind::Scene: return SceneParams{};
@@ -94,6 +104,8 @@ NodeParams defaultParams(NodeKind kind) {
     case NodeKind::OffscreenTarget: return OffscreenTargetParams{};
     case NodeKind::ImageFile: return ImageFileParams{};
     case NodeKind::ImageToTensor: return ImageToTensorParams{};
+    case NodeKind::TensorToImage: return TensorToImageParams{};
+    case NodeKind::Resample: return ResampleParams{};
     case NodeKind::OnnxModel: return OnnxModelParams{};
     case NodeKind::Preview: return PreviewParams{};
     case NodeKind::ImageFileWriter: return ImageFileWriterParams{};
@@ -103,6 +115,10 @@ NodeParams defaultParams(NodeKind kind) {
 
 bool isSink(NodeKind kind) {
     return kind == NodeKind::Preview || kind == NodeKind::ImageFileWriter;
+}
+
+bool producesImage(NodeKind kind) {
+    return kind == NodeKind::GaussianSplatting || kind == NodeKind::TensorToImage || kind == NodeKind::Resample;
 }
 
 int pinId(const PinRef& pin) {
@@ -185,7 +201,7 @@ std::optional<std::string> Graph::checkConnection(PinRef from, PinRef to) const 
         to.slot >= static_cast<int>(inputs.size())) {
         return "Unknown pin.";
     }
-    if (outputs[from.slot].type != inputs[to.slot].type) {
+    if (!inputs[to.slot].accepts(outputs[from.slot].type)) {
         return std::format("Cannot connect {} to {}.", pinTypeName(outputs[from.slot].type),
                            pinTypeName(inputs[to.slot].type));
     }
@@ -226,6 +242,15 @@ const Link* Graph::inputLink(int node, int slot) const {
 const Node* Graph::inputNode(int node, int slot) const {
     const Link* link = inputLink(node, slot);
     return link ? findNode(link->fromNode) : nullptr;
+}
+
+std::optional<PinType> Graph::inputType(int node, int slot) const {
+    const Link* link = inputLink(node, slot);
+    const Node* source = link ? findNode(link->fromNode) : nullptr;
+    if (!source) {
+        return std::nullopt;
+    }
+    return kindInfo(source->kind).outputs[link->fromSlot].type;
 }
 
 bool Graph::reaches(int fromNode, int toNode) const {
@@ -319,9 +344,13 @@ std::vector<Diagnostic> Graph::validate() const {
         }
     }
 
-    // The target a Gaussian Splatting node renders into, if connected.
-    auto splattingTarget = [&](const Node* splatting) -> const Node* {
-        return splatting && splatting->kind == NodeKind::GaussianSplatting ? inputNode(splatting->id, 2) : nullptr;
+    // Targets are empty images; what reads an image needs one with a result.
+    auto checkRenderedImage = [&](const Node& node) {
+        const Node* source = inputNode(node.id, 0);
+        if (inputType(node.id, 0) == PinType::Image && !producesImage(source->kind)) {
+            report(Severity::Error, node.id,
+                   "Needs a rendered image, e.g. from Gaussian Splatting, Tensor to Image or Resample.");
+        }
     };
 
     for (const auto& node : nodes_) {
@@ -351,28 +380,20 @@ std::vector<Diagnostic> Graph::validate() const {
             }
             break;
         }
-        case NodeKind::Present: {
-            const Node* source = inputNode(node.id, 0);
-            if (source && source->kind != NodeKind::GaussianSplatting) {
-                report(Severity::Error, node.id, "Present needs a rendered image, e.g. from Gaussian Splatting.");
-            } else if (const Node* target = splattingTarget(source);
-                       target && target->kind != NodeKind::SwapchainTarget) {
-                report(Severity::Error, node.id,
-                       "Present shows swapchain images; render into a Swapchain Target to present.");
+        case NodeKind::Present:
+        case NodeKind::ImageToTensor:
+        case NodeKind::Resample:
+            checkRenderedImage(node);
+            if (node.kind == NodeKind::Resample) {
+                const auto& p = node.as<ResampleParams>();
+                if (p.width == 0 || p.height == 0) {
+                    report(Severity::Error, node.id, "Width and height must not be zero.");
+                }
             }
             break;
-        }
-        case NodeKind::ImageToTensor: {
-            const Node* source = inputNode(node.id, 0);
-            if (source && source->kind != NodeKind::GaussianSplatting) {
-                report(Severity::Error, node.id, "Image to Tensor needs a rendered image, e.g. from Gaussian Splatting.");
-            } else if (const Node* target = splattingTarget(source);
-                       target && target->kind != NodeKind::OffscreenTarget) {
-                report(Severity::Error, node.id,
-                       "Only offscreen images can be processed; render into an Offscreen Target.");
-            }
+        case NodeKind::Preview:
+            checkRenderedImage(node);
             break;
-        }
         case NodeKind::OffscreenTarget: {
             const auto& p = node.as<OffscreenTargetParams>();
             if (p.width == 0 || p.height == 0) {
@@ -399,9 +420,21 @@ std::vector<Diagnostic> Graph::validate() const {
             if (node.as<ImageFileWriterParams>().path.empty()) {
                 report(Severity::Error, node.id, "No output file is set.");
             }
+            checkRenderedImage(node);
             break;
         default:
             break;
+        }
+    }
+
+    // Run executes once, outside the window's frame loop, which owns the
+    // swapchain images.
+    for (const Node* sink : sinks) {
+        const auto upstream = upstreamOf(sink->id);
+        if (std::any_of(upstream.begin(), upstream.end(),
+                        [&](int id) { return findNode(id)->kind == NodeKind::SwapchainTarget; })) {
+            report(Severity::Error, sink->id,
+                   "Run cannot use the window's swapchain images; render into an Offscreen Target for it.");
         }
     }
 

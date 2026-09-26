@@ -1,9 +1,11 @@
 /**
  * TESTS:
- * - planDefaultGraph: the default graph plans the chain Scene/Camera/Target -> Splatting -> Present
+ * - planDefaultGraph: the default graph plans Present and everything feeding it, depth first
  * - planFailsOnErrors: a graph with errors yields no plan but keeps the diagnostics
  * - cameraChangesDoNotRebuild: camera parameters and node ids do not require new pipelines
- * - pipelineChangesRebuild: scene path, backend and splatting parameters require new pipelines
+ * - pipelineChangesRebuild: scene path, splatting parameters and new nodes require new pipelines
+ * - planProcessedLiveGraph: a swapchain rendering resampled, encoded, decoded and presented is a
+ *   valid live plan; a Preview reading from the swapchain is an error on the Preview
  * - gsplatConfigMapping: SplattingParams map field by field onto klartraum::GsplatConfig
  * - planRunGraph: a graph with sinks plans the nodes feeding them in dependency order
  * - planLiveAndRunIndependently: an error in the run part leaves the live plan intact and vice versa
@@ -13,6 +15,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <functional>
 
 #include "klartraum/gaussian_splatting_factory.hpp"
 #include "klartraum/vulkan_gaussian_splatting_types.hpp"
@@ -32,20 +35,30 @@ int findKind(const Graph& graph, NodeKind kind) {
     return -1;
 }
 
+PinRef out(int node, int slot = 0) { return {node, PinDirection::Output, slot}; }
+PinRef in(int node, int slot = 0) { return {node, PinDirection::Input, slot}; }
+
+LivePlan livePlan(const Graph& graph) {
+    const CompilePlan plan = planGraph(graph);
+    EXPECT_TRUE(plan.live.has_value());
+    return plan.live.value_or(LivePlan{});
+}
+
 } // namespace
 
 TEST(GraphCompiler, planDefaultGraph) {
     const Graph graph = makeGaussianSplattingGraph("scene.spz", SplattingBackend::Raster);
     const CompilePlan plan = planGraph(graph);
     ASSERT_TRUE(plan.ok());
-    const SplattingPlan& p = *plan.splatting;
+    const LivePlan& p = *plan.live;
     EXPECT_EQ(p.presentNode, findKind(graph, NodeKind::Present));
-    EXPECT_EQ(p.splattingNode, findKind(graph, NodeKind::GaussianSplatting));
-    EXPECT_EQ(p.sceneNode, findKind(graph, NodeKind::Scene));
     EXPECT_EQ(p.cameraNode, findKind(graph, NodeKind::Camera));
-    EXPECT_EQ(p.targetNode, findKind(graph, NodeKind::SwapchainTarget));
-    EXPECT_EQ(p.scenePath, "scene.spz");
-    EXPECT_EQ(p.params.backend, SplattingBackend::Raster);
+    const std::vector<int> expected = {
+        findKind(graph, NodeKind::Present), findKind(graph, NodeKind::GaussianSplatting),
+        findKind(graph, NodeKind::Scene), findKind(graph, NodeKind::Camera),
+        findKind(graph, NodeKind::SwapchainTarget)};
+    EXPECT_EQ(p.nodes, expected);
+    EXPECT_TRUE(p.contains(findKind(graph, NodeKind::Scene)));
 }
 
 TEST(GraphCompiler, planFailsOnErrors) {
@@ -58,38 +71,86 @@ TEST(GraphCompiler, planFailsOnErrors) {
 
 TEST(GraphCompiler, cameraChangesDoNotRebuild) {
     Graph graph = makeGaussianSplattingGraph("scene.spz");
-    const SplattingPlan before = *planGraph(graph).splatting;
+    const LivePlan before = livePlan(graph);
 
     graph.findNode(findKind(graph, NodeKind::Camera))->as<CameraParams>().distance = 5.0f;
     const int otherCamera = graph.addNode(NodeKind::Camera);
-    graph.connect({otherCamera, PinDirection::Output, 0},
-                  {findKind(graph, NodeKind::GaussianSplatting), PinDirection::Input, 1});
-    const SplattingPlan after = *planGraph(graph).splatting;
+    graph.connect(out(otherCamera), in(findKind(graph, NodeKind::GaussianSplatting), 1));
+    const LivePlan after = livePlan(graph);
 
     EXPECT_EQ(after.cameraNode, otherCamera);
     EXPECT_FALSE(after.needsRebuildFrom(before));
+    // Corresponding nodes sit at the same positions.
+    ASSERT_EQ(after.nodes.size(), before.nodes.size());
+    EXPECT_EQ(after.nodes[3], otherCamera);
+    EXPECT_EQ(before.nodes[3], findKind(graph, NodeKind::Camera));
 }
 
 TEST(GraphCompiler, pipelineChangesRebuild) {
     const Graph graph = makeGaussianSplattingGraph("scene.spz");
-    const SplattingPlan base = *planGraph(graph).splatting;
+    const LivePlan base = livePlan(graph);
+    auto changed = [&](const std::function<void(Graph&)>& change) {
+        Graph other = graph;
+        change(other);
+        return livePlan(other).needsRebuildFrom(base);
+    };
+    auto splatting = [](Graph& g) -> SplattingParams& {
+        return g.findNode(findKind(g, NodeKind::GaussianSplatting))->as<SplattingParams>();
+    };
 
-    SplattingPlan scene = base;
-    scene.scenePath = "other.spz";
-    EXPECT_TRUE(scene.needsRebuildFrom(base));
+    EXPECT_TRUE(changed([](Graph& g) { g.findNode(findKind(g, NodeKind::Scene))->as<SceneParams>().path = "o.spz"; }));
+    EXPECT_TRUE(changed([&](Graph& g) {
+        auto& p = splatting(g);
+        p.backend = p.backend == SplattingBackend::Raster ? SplattingBackend::Compute : SplattingBackend::Raster;
+    }));
+    EXPECT_TRUE(changed([&](Graph& g) { splatting(g).spreadMultiplier = 3.0f; }));
+    EXPECT_TRUE(changed([&](Graph& g) { splatting(g).shDegree = 0; }));
+    // A Resample between the rendering and Present.
+    EXPECT_TRUE(changed([](Graph& g) {
+        const int resample = g.addNode(NodeKind::Resample);
+        g.connect(out(findKind(g, NodeKind::GaussianSplatting)), in(resample));
+        g.connect(out(resample), in(findKind(g, NodeKind::Present)));
+    }));
+    EXPECT_FALSE(changed([](Graph& g) { g.findNode(findKind(g, NodeKind::Scene))->title = "Renamed"; }));
+}
 
-    SplattingPlan backend = base;
-    backend.params.backend = base.params.backend == SplattingBackend::Raster ? SplattingBackend::Compute
-                                                                             : SplattingBackend::Raster;
-    EXPECT_TRUE(backend.needsRebuildFrom(base));
+TEST(GraphCompiler, planProcessedLiveGraph) {
+    // Rendering -> Resample -> Image to Tensor -> encoder -> decoder ->
+    // Tensor to Image -> Present, all on the swapchain rendering.
+    Graph graph = makeGaussianSplattingGraph("scene.spz");
+    const int splatting = findKind(graph, NodeKind::GaussianSplatting);
+    const int present = findKind(graph, NodeKind::Present);
+    const int resample = graph.addNode(NodeKind::Resample);
+    const int toTensor = graph.addNode(NodeKind::ImageToTensor);
+    const int encoder = graph.addNode(NodeKind::OnnxModel);
+    const int decoder = graph.addNode(NodeKind::OnnxModel);
+    const int toImage = graph.addNode(NodeKind::TensorToImage);
+    graph.findNode(encoder)->as<OnnxModelParams>().path = "enc.onnx";
+    graph.findNode(decoder)->as<OnnxModelParams>().path = "dec.onnx";
+    ASSERT_FALSE(graph.connect(out(splatting), in(resample)).has_value());
+    ASSERT_FALSE(graph.connect(out(resample), in(toTensor)).has_value());
+    ASSERT_FALSE(graph.connect(out(toTensor), in(encoder)).has_value());
+    ASSERT_FALSE(graph.connect(out(encoder), in(decoder)).has_value());
+    ASSERT_FALSE(graph.connect(out(decoder), in(toImage)).has_value());
+    ASSERT_FALSE(graph.connect(out(toImage), in(present)).has_value());
 
-    SplattingPlan spread = base;
-    spread.params.spreadMultiplier = 3.0f;
-    EXPECT_TRUE(spread.needsRebuildFrom(base));
+    const CompilePlan plan = planGraph(graph);
+    for (const auto& d : plan.diagnostics) {
+        EXPECT_NE(d.severity, Severity::Error) << d.message;
+    }
+    ASSERT_TRUE(plan.live.has_value());
+    EXPECT_EQ(plan.live->nodes.size(), 10u);
+    EXPECT_FALSE(plan.run.has_value());
 
-    SplattingPlan sh = base;
-    sh.params.shDegree = 0;
-    EXPECT_TRUE(sh.needsRebuildFrom(base));
+    // Run cannot read the swapchain.
+    const int preview = graph.addNode(NodeKind::Preview);
+    ASSERT_FALSE(graph.connect(out(resample), in(preview)).has_value());
+    const CompilePlan withPreview = planGraph(graph);
+    EXPECT_TRUE(withPreview.live.has_value());
+    EXPECT_FALSE(withPreview.run.has_value());
+    EXPECT_TRUE(std::any_of(withPreview.diagnostics.begin(), withPreview.diagnostics.end(), [&](const Diagnostic& d) {
+        return d.severity == Severity::Error && d.node == preview;
+    }));
 }
 
 TEST(GraphCompiler, gsplatConfigMapping) {
@@ -132,7 +193,7 @@ TEST(GraphCompiler, gsplatConfigMapping) {
 TEST(GraphCompiler, planRunGraph) {
     const Graph graph = makeAutoencoderGraph("in.png", "enc.onnx", "dec.onnx", "out.png");
     const CompilePlan plan = planGraph(graph);
-    EXPECT_FALSE(plan.splatting.has_value());
+    EXPECT_FALSE(plan.live.has_value());
     ASSERT_TRUE(plan.run.has_value());
     EXPECT_EQ(plan.run->nodes.size(), 5u);
     EXPECT_EQ(plan.run->sinks.size(), 2u);
@@ -148,14 +209,14 @@ TEST(GraphCompiler, planLiveAndRunIndependently) {
 
     // The image file has no path: only the run part is affected.
     CompilePlan plan = planGraph(graph);
-    EXPECT_TRUE(plan.splatting.has_value());
+    EXPECT_TRUE(plan.live.has_value());
     EXPECT_FALSE(plan.run.has_value());
 
     graph.findNode(image)->as<ImageFileParams>().path = "in.png";
     graph.findNode(findKind(graph, NodeKind::Scene))->as<SceneParams>().path.clear();
     graph.touch();
     plan = planGraph(graph);
-    EXPECT_FALSE(plan.splatting.has_value());
+    EXPECT_FALSE(plan.live.has_value());
     EXPECT_TRUE(plan.run.has_value());
 }
 

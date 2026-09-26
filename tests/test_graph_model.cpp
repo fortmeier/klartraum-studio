@@ -15,7 +15,11 @@
  * - validateReportsUnusedNodes: nodes not feeding Present are reported as info
  * - runOnlyGraphIsValid: a graph with sinks but no Present validates without errors
  * - validateNothingToDo: a graph without Present and sinks is an error
- * - validateOffscreenRules: Present needs a swapchain rendering, Image to Tensor an offscreen one
+ * - validateImageSources: Present and Image to Tensor take renderings into either target, not the
+ *   empty targets themselves; Run cannot read the swapchain
+ * - sinksAcceptImages: Preview and Image File Writer take tensors and images, other inputs one type
+ * - validateTensorToImageRules: a Tensor to Image result feeds sinks, Image to Tensor and Present;
+ *   sinks fed with images need offscreen renderings
  * - validateMissingPaths: image, model and output files must be set
  * - upstreamAndOrder: upstreamOf collects dependencies; topologicalOrder places producers first
  **/
@@ -38,9 +42,9 @@ bool hasDiagnostic(const std::vector<Diagnostic>& diagnostics, Severity severity
                        [&](const Diagnostic& d) { return d.severity == severity && d.node == node; });
 }
 
-int findKind(const Graph& graph, NodeKind kind) {
+int findKind(const Graph& graph, NodeKind kind, int skip = 0) {
     for (const auto& node : graph.nodes()) {
-        if (node.kind == kind) {
+        if (node.kind == kind && skip-- == 0) {
             return node.id;
         }
     }
@@ -193,22 +197,76 @@ TEST(GraphModel, validateNothingToDo) {
     EXPECT_TRUE(hasDiagnostic(graph.validate(), Severity::Error, -1));
 }
 
-TEST(GraphModel, validateOffscreenRules) {
-    // Present fed by a splatting that renders offscreen.
+TEST(GraphModel, validateImageSources) {
+    // Present fed by a splatting that renders offscreen: stretched to the window.
     Graph graph = makeGaussianSplattingGraph("scene.spz");
     const int offscreen = graph.addNode(NodeKind::OffscreenTarget);
     const int splatting = findKind(graph, NodeKind::GaussianSplatting);
+    const int present = findKind(graph, NodeKind::Present);
     ASSERT_FALSE(graph.connect(out(offscreen), in(splatting, 2)).has_value());
-    EXPECT_TRUE(hasDiagnostic(graph.validate(), Severity::Error, findKind(graph, NodeKind::Present)));
+    EXPECT_FALSE(graph.hasErrors());
 
-    // Image to Tensor fed by a splatting that renders into the swapchain.
+    // ... but not the empty target itself.
+    ASSERT_FALSE(graph.connect(out(offscreen), in(present)).has_value());
+    EXPECT_TRUE(hasDiagnostic(graph.validate(), Severity::Error, present));
+
+    // Image to Tensor fed by a splatting that renders into the swapchain:
+    // fine live, an error on the sink for Run.
     Graph other = makeGaussianSplattingGraph("scene.spz");
     const int toTensor = other.addNode(NodeKind::ImageToTensor);
     const int preview = other.addNode(NodeKind::Preview);
     ASSERT_FALSE(other.connect(out(findKind(other, NodeKind::GaussianSplatting)), in(toTensor)).has_value());
     ASSERT_FALSE(other.connect(out(toTensor), in(preview)).has_value());
-    EXPECT_TRUE(hasDiagnostic(other.validate(), Severity::Error, toTensor));
+    EXPECT_FALSE(hasDiagnostic(other.validate(), Severity::Error, toTensor));
+    EXPECT_TRUE(hasDiagnostic(other.validate(), Severity::Error, preview));
     EXPECT_FALSE(hasDiagnostic(other.validate(), Severity::Error, findKind(other, NodeKind::Present)));
+}
+
+TEST(GraphModel, sinksAcceptImages) {
+    Graph graph;
+    const int file = graph.addNode(NodeKind::ImageFile);
+    const int toImage = graph.addNode(NodeKind::TensorToImage);
+    const int preview = graph.addNode(NodeKind::Preview);
+    const int writer = graph.addNode(NodeKind::ImageFileWriter);
+    const int onnx = graph.addNode(NodeKind::OnnxModel);
+    EXPECT_FALSE(graph.connect(out(file), in(toImage)).has_value());
+    EXPECT_FALSE(graph.connect(out(toImage), in(preview)).has_value());
+    EXPECT_FALSE(graph.connect(out(toImage), in(writer)).has_value());
+    EXPECT_TRUE(graph.connect(out(toImage), in(onnx)).has_value());
+    EXPECT_EQ(graph.inputType(preview, 0), PinType::Image);
+    EXPECT_EQ(graph.inputType(toImage, 0), PinType::Tensor);
+    EXPECT_EQ(graph.inputType(onnx, 0), std::nullopt);
+}
+
+TEST(GraphModel, validateTensorToImageRules) {
+    Graph graph = makeAutoencoderGraph("in.png", "enc.onnx", "dec.onnx", "out.png");
+    const int decoder = findKind(graph, NodeKind::OnnxModel, 1);
+    const int toImage = graph.addNode(NodeKind::TensorToImage);
+    const int toTensor = graph.addNode(NodeKind::ImageToTensor);
+    const int writer = findKind(graph, NodeKind::ImageFileWriter);
+    const int preview = findKind(graph, NodeKind::Preview);
+    ASSERT_FALSE(graph.connect(out(decoder), in(toImage)).has_value());
+    ASSERT_FALSE(graph.connect(out(toImage), in(writer)).has_value());
+    ASSERT_FALSE(graph.connect(out(toImage), in(toTensor)).has_value());
+    ASSERT_FALSE(graph.connect(out(toTensor), in(preview)).has_value());
+    EXPECT_FALSE(graph.hasErrors());
+
+    const int present = graph.addNode(NodeKind::Present);
+    ASSERT_FALSE(graph.connect(out(toImage), in(present)).has_value());
+    EXPECT_FALSE(graph.hasErrors());
+
+    // A sink fed with a splatting that renders into the swapchain.
+    Graph live = makeGaussianSplattingGraph("scene.spz");
+    const int liveWriter = live.addNode(NodeKind::ImageFileWriter);
+    ASSERT_FALSE(live.connect(out(findKind(live, NodeKind::GaussianSplatting)), in(liveWriter)).has_value());
+    EXPECT_TRUE(hasDiagnostic(live.validate(), Severity::Error, liveWriter));
+
+    // ... and one rendering offscreen.
+    Graph offscreen = makeSplatAutoencoderGraph("scene.spz", "enc.onnx", "dec.onnx");
+    const int offscreenWriter = offscreen.addNode(NodeKind::ImageFileWriter);
+    ASSERT_FALSE(
+        offscreen.connect(out(findKind(offscreen, NodeKind::GaussianSplatting)), in(offscreenWriter)).has_value());
+    EXPECT_FALSE(offscreen.hasErrors());
 }
 
 TEST(GraphModel, validateMissingPaths) {

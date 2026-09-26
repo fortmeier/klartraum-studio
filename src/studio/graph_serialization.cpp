@@ -40,6 +40,8 @@ json paramsToJson(const NodeParams& params) {
                 return {{"width", p.width}, {"height", p.height}};
             } else if constexpr (std::is_same_v<T, ImageFileParams>) {
                 return {{"path", p.path}, {"width", p.width}, {"height", p.height}};
+            } else if constexpr (std::is_same_v<T, ResampleParams>) {
+                return {{"width", p.width}, {"height", p.height}, {"filter", filterName(p.filter)}};
             } else if constexpr (std::is_same_v<T, OnnxModelParams> || std::is_same_v<T, ImageFileWriterParams>) {
                 return {{"path", p.path}};
             } else {
@@ -98,6 +100,14 @@ NodeParams paramsFromJson(NodeKind kind, const json& j) {
                 read(j, "path", p.path);
                 read(j, "width", p.width);
                 read(j, "height", p.height);
+            } else if constexpr (std::is_same_v<T, ResampleParams>) {
+                read(j, "width", p.width);
+                read(j, "height", p.height);
+                std::string filter;
+                read(j, "filter", filter);
+                if (filter == filterName(ResampleFilter::Nearest)) {
+                    p.filter = ResampleFilter::Nearest;
+                }
             } else if constexpr (std::is_same_v<T, OnnxModelParams> || std::is_same_v<T, ImageFileWriterParams>) {
                 read(j, "path", p.path);
             }
@@ -107,6 +117,10 @@ NodeParams paramsFromJson(NodeKind kind, const json& j) {
 }
 
 } // namespace
+
+std::string paramsToString(const NodeParams& params) {
+    return paramsToJson(params).dump();
+}
 
 std::string toJson(const Graph& graph) {
     json nodes = json::array();

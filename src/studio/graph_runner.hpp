@@ -13,14 +13,16 @@
 #include "studio/tensor_shapes.hpp"
 
 namespace klartraum {
+class ComputeGraphElement;
 class GaussianDataStandard;
+class KlartraumEngine;
 class VulkanContext;
 } // namespace klartraum
 
 namespace kstudio {
 
-// How a run finds its inputs and places its outputs; paths are the ones
-// stored in the graph.
+// How a run or the live graph finds its inputs and places its outputs; paths
+// are the ones stored in the graph.
 struct RunContext {
     // Resolves an input file (image, ONNX model); throws if it is missing.
     std::function<std::filesystem::path(const std::string&)> resolveInput;
@@ -44,5 +46,22 @@ struct RunResult {
 // std::runtime_error naming the failing node.
 RunResult runGraph(klartraum::VulkanContext& vulkanContext, const Graph& graph, const RunPlan& plan,
                    const RunContext& context);
+
+// The klartraum elements built for the live plan.
+struct BuiltGraph {
+    std::shared_ptr<klartraum::ComputeGraphElement> root;
+    // Maps elements to the authoring node they were built for (see
+    // introspect()).
+    std::map<const klartraum::ComputeGraphElement*, int> owners;
+};
+
+// Builds the live plan's nodes for the engine's current swapchain, one path
+// per swapchain image, and adds them to the engine; the plan's camera gets
+// the engine's camera UBO. The Present node shows a rendering into the
+// swapchain as it is and stretches any other image to the window. Meant to
+// run inside a KlartraumEngine graph builder. Throws std::runtime_error
+// naming the failing node.
+BuiltGraph buildLiveGraph(klartraum::KlartraumEngine& engine, const Graph& graph, const LivePlan& plan,
+                          const RunContext& context);
 
 } // namespace kstudio
