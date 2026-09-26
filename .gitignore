@@ -1,0 +1,6 @@
+build/
+build*.log
+*.ktgraph.json
+!examples/*.ktgraph.json
+.vscode/
+.DS_Store
