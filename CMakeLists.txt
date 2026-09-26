@@ -9,7 +9,7 @@ include(FetchContent)
 # klartraum (Vulkan compute-graph framework). Point FETCHCONTENT_SOURCE_DIR_KLARTRAUM
 # at a local checkout to build against it instead of the pinned upstream branch.
 set(KLARTRAUM_GIT_REPOSITORY "https://github.com/fortmeier/klartraum.git" CACHE STRING "klartraum repository")
-set(KLARTRAUM_GIT_TAG "develop" CACHE STRING "klartraum branch, tag or commit")
+set(KLARTRAUM_GIT_TAG "feature/image-resample" CACHE STRING "klartraum branch, tag or commit")
 FetchContent_Declare(
   klartraum
   GIT_REPOSITORY ${KLARTRAUM_GIT_REPOSITORY}
