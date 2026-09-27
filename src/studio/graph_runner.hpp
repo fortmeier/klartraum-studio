@@ -17,7 +17,8 @@
 namespace klartraum {
 class ComputeGraphElement;
 class GaussianDataStandard;
-class HostValues;
+template <typename T> class HostValues;
+using HostFloat = HostValues<float>;
 class KlartraumEngine;
 class VulkanContext;
 } // namespace klartraum
@@ -59,7 +60,7 @@ RunResult runGraph(klartraum::VulkanContext& vulkanContext, const Graph& graph, 
 // Upload Number node (`component` -1), or input `component` of a Make
 // Transform node that is not connected, which takes the node's value.
 struct HostBinding {
-    std::shared_ptr<klartraum::HostValues> values;
+    std::shared_ptr<klartraum::HostFloat> values;
     int node = 0;
     int component = -1;
 };

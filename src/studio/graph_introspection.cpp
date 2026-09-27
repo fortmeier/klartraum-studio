@@ -26,8 +26,8 @@ ElementCategory categorize(std::string_view type) {
         return ElementCategory::Image;
     }
     if (starts("GeneralComputation") || starts("BufferTransformation") || starts("CopyBuffer") ||
-        starts("OnnxNetwork") || starts("ImageResample") || starts("TransformBufferPass") ||
-        starts("GaussianTransformPass") || starts("GaussianMergePass")) {
+        starts("OnnxNetwork") || starts("ImageResample") || starts("TransformBuffer") ||
+        starts("GaussianTransform") || starts("GaussianMerge")) {
         return ElementCategory::Compute;
     }
     if (starts("RenderPass")) {

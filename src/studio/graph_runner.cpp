@@ -7,14 +7,16 @@
 
 #include "klartraum/computegraph/computegraph.hpp"
 #include "klartraum/computegraph/generalcomputation.hpp"
+#include "klartraum/computegraph/gaussianmerge.hpp"
+#include "klartraum/computegraph/gaussiantransform.hpp"
 #include "klartraum/computegraph/hostvalues.hpp"
 #include "klartraum/computegraph/imageresample.hpp"
 #include "klartraum/computegraph/imageviewsrc.hpp"
 #include "klartraum/computegraph/noop.hpp"
 #include "klartraum/computegraph/tensorelement.hpp"
+#include "klartraum/computegraph/transformbuffer.hpp"
 #include "klartraum/draw_component.hpp"
 #include "klartraum/gaussian_data_standard.hpp"
-#include "klartraum/gaussian_passes.hpp"
 #include "klartraum/gaussian_splatting_factory.hpp"
 #include "klartraum/interface_camera_orbit.hpp"
 #include "klartraum/klartraum_core.hpp"
@@ -312,12 +314,11 @@ private:
         return it->second;
     }
 
-    // Owns the elements of a pass building Gaussians: the pass and the
-    // buffers it writes.
-    void ownGaussianPass(const klartraum::ComputeGraphElementPtr& pass, const klartraum::GaussianSoABuffers& output,
-                         const Node& node) {
-        pass->setName(node.title);
-        owners_[pass.get()] = node.id;
+    // Owns an element building Gaussians and the buffers it writes.
+    void ownGaussianElement(const klartraum::ComputeGraphElementPtr& element,
+                            const klartraum::GaussianSoABuffers& output, const Node& node) {
+        element->setName(node.title);
+        owners_[element.get()] = node.id;
         for (const auto* ref : output.all()) {
             owners_[ref->buffer().get()] = node.id;
         }
@@ -345,7 +346,7 @@ private:
             // Evaluated on the CPU for the bindings of the nodes they feed.
             break;
         case NodeKind::UploadNumber: {
-            auto values = std::make_shared<klartraum::HostValues>(vc_, 1u);
+            auto values = std::make_shared<klartraum::HostFloat>(vc_, 1u);
             values->setName(node.title);
             owners_[values.get()] = node.id;
             bindings_.push_back(HostBinding{values, node.id, -1});
@@ -360,31 +361,31 @@ private:
                     continue;
                 }
                 // An unconnected input takes the node's value, set every frame.
-                auto values = std::make_shared<klartraum::HostValues>(vc_, 1u);
+                auto values = std::make_shared<klartraum::HostFloat>(vc_, 1u);
                 values->setName(node.title + " " + std::string(kindInfo(node.kind).inputs[i].name));
                 owners_[values.get()] = node.id;
                 inserted_.insert(values.get());
                 bindings_.push_back(HostBinding{values, node.id, i});
                 parameters[i] = klartraum::BufferRef{values};
             }
-            const auto transform = klartraum::makeTransformBuffer(vc_, parameters);
-            transform.pass->setName(node.title);
-            owners_[transform.pass.get()] = node.id;
+            const auto transform = klartraum::createTransformBuffer(vc_, parameters);
+            transform.element->setName(node.title);
+            owners_[transform.element.get()] = node.id;
             owners_[transform.transform.buffer().get()] = node.id;
             transforms_[node.id] = transform.transform;
             break;
         }
         case NodeKind::TransformGaussiansGpu: {
-            const auto moved = klartraum::transformGaussiansPass(vc_, builtValue(gaussians_, node, 0),
-                                                                 builtValue(transforms_, node, 1));
-            ownGaussianPass(moved.pass, moved.output, node);
+            const auto moved = klartraum::createGaussianTransform(vc_, builtValue(gaussians_, node, 0),
+                                                                  builtValue(transforms_, node, 1));
+            ownGaussianElement(moved.element, moved.output, node);
             gaussians_[node.id] = moved.output;
             break;
         }
         case NodeKind::MergeGaussiansGpu: {
             const auto merged =
-                klartraum::mergeGaussiansPass(vc_, builtValue(gaussians_, node, 0), builtValue(gaussians_, node, 1));
-            ownGaussianPass(merged.pass, merged.output, node);
+                klartraum::createGaussianMerge(vc_, builtValue(gaussians_, node, 0), builtValue(gaussians_, node, 1));
+            ownGaussianElement(merged.element, merged.output, node);
             gaussians_[node.id] = merged.output;
             break;
         }

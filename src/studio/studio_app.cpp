@@ -2074,7 +2074,7 @@ void StudioApp::drawNodeInspector(Node& node) {
     }
     case NodeKind::UploadNumber:
         ImGui::SeparatorText("Upload");
-        ImGui::TextWrapped("Copies the CPU number into a klartraum::HostValues buffer before every frame, so "
+        ImGui::TextWrapped("Copies the CPU number into a klartraum::HostFloat buffer before every frame, so "
                            "GPU nodes read the current value without the graph being rebuilt.");
         break;
     case NodeKind::MakeTransform: {
