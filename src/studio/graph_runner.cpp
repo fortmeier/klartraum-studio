@@ -317,18 +317,8 @@ private:
             const auto start = std::chrono::steady_clock::now();
             auto model = context_.loadGaussians(gaussianParts(graph_, node.id));
             hostStep(std::format("{}: {} Gaussians", node.title, model->count()), start);
-            const auto& buffers = model->buffers();
-            for (const klartraum::ComputeGraphElement* element :
-                 {static_cast<klartraum::ComputeGraphElement*>(buffers.pos.get()),
-                  static_cast<klartraum::ComputeGraphElement*>(buffers.rot.get()),
-                  static_cast<klartraum::ComputeGraphElement*>(buffers.scale.get()),
-                  static_cast<klartraum::ComputeGraphElement*>(buffers.colAlpha.get()),
-                  static_cast<klartraum::ComputeGraphElement*>(buffers.shR.get()),
-                  static_cast<klartraum::ComputeGraphElement*>(buffers.shG.get()),
-                  static_cast<klartraum::ComputeGraphElement*>(buffers.shB.get())}) {
-                if (element) {
-                    owners_[element] = node.id;
-                }
+            for (const auto* ref : model->buffers().all()) {
+                owners_[ref->buffer().get()] = node.id;
             }
             gaussians_[node.id] = model;
             break;
