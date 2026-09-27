@@ -22,6 +22,8 @@ enum class PinType { Gaussians, Camera, Image, Tensor };
 
 enum class NodeKind {
     Scene,
+    TransformGaussians,
+    MergeGaussians,
     Camera,
     SwapchainTarget,
     GaussianSplatting,
@@ -44,7 +46,21 @@ enum class ResampleFilter { Nearest, Bilinear };
 
 struct SceneParams {
     std::string path;
+    bool flipY = false;  // mirror across the Y axis, e.g. for Nerfstudio exports
     bool operator==(const SceneParams&) const = default;
+};
+
+// Moves Gaussians: scaled about the origin, rotated (degrees about X, then Y,
+// then Z) and translated.
+struct TransformGaussiansParams {
+    std::array<float, 3> translation = {0.0f, 0.0f, 0.0f};
+    std::array<float, 3> rotation = {0.0f, 0.0f, 0.0f};
+    float scale = 1.0f;
+    bool operator==(const TransformGaussiansParams&) const = default;
+};
+
+struct MergeGaussiansParams {
+    bool operator==(const MergeGaussiansParams&) const = default;
 };
 
 // Orbit camera. These values are applied live and never require a rebuild.
@@ -131,7 +147,7 @@ struct ImageFileWriterParams {
     bool operator==(const ImageFileWriterParams&) const = default;
 };
 
-using NodeParams = std::variant<SceneParams, CameraParams, SwapchainTargetParams, SplattingParams, PresentParams,
+using NodeParams = std::variant<SceneParams, TransformGaussiansParams, MergeGaussiansParams, CameraParams, SwapchainTargetParams, SplattingParams, PresentParams,
                                 OffscreenTargetParams, ImageFileParams, ImageToTensorParams, TensorToImageParams,
                                 ResampleParams, OnnxModelParams, PreviewParams, ImageFileWriterParams>;
 
@@ -280,6 +296,11 @@ Graph makeGaussianSplattingGraph(const std::string& scenePath, SplattingBackend 
 // previewed and written to `outputPath` on Run.
 Graph makeAutoencoderGraph(const std::string& imagePath, const std::string& encoderPath,
                            const std::string& decoderPath, const std::string& outputPath);
+
+// Two scenes in one Gaussian Splatting: `movedScene` is transformed by
+// `transform` and merged with `scene`, seen through `camera`.
+Graph makeCombinedScenesGraph(const std::string& scenePath, const SceneParams& movedScene,
+                              const TransformGaussiansParams& transform, const CameraParams& camera = {});
 
 // A Gaussian-splatting rendering into an offscreen image, fed through the
 // encoder and decoder and previewed on Run.

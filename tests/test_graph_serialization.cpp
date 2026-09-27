@@ -6,6 +6,7 @@
  * - rejectsMalformedFiles: wrong format tags, unknown kinds, bad links and invalid JSON throw
  * - saveAndLoadFile: saveGraph/loadGraph write and read a file on disk
  * - roundTripComputeNodes: image file, offscreen, ONNX and writer parameters are saved and restored
+ * - roundTripGaussianNodes: scene flips, transforms and resample settings are saved and restored
  **/
 
 #include <gtest/gtest.h>
@@ -145,6 +146,22 @@ TEST(GraphSerialization, roundTripComputeNodes) {
             node.as<ImageFileParams>().height = 16;
         }
     }
+    const Graph loaded = fromJson(toJson(graph));
+    ASSERT_EQ(loaded.nodes().size(), graph.nodes().size());
+    for (const auto& node : graph.nodes()) {
+        const Node* other = loaded.findNode(node.id);
+        ASSERT_NE(other, nullptr);
+        EXPECT_TRUE(other->params == node.params) << node.title;
+    }
+    EXPECT_EQ(toJson(loaded), toJson(graph));
+}
+
+TEST(GraphSerialization, roundTripGaussianNodes) {
+    TransformGaussiansParams placement{{0.5f, -1.0f, 0.25f}, {10.0f, 20.0f, -30.0f}, 1.6f};
+    Graph graph = makeCombinedScenesGraph("scene.spz", SceneParams{"lantern.spz", true}, placement);
+    const int resample = graph.addNode(NodeKind::Resample);
+    graph.findNode(resample)->as<ResampleParams>() = {64, 32, ResampleFilter::Nearest};
+
     const Graph loaded = fromJson(toJson(graph));
     ASSERT_EQ(loaded.nodes().size(), graph.nodes().size());
     for (const auto& node : graph.nodes()) {

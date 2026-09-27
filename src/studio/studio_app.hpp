@@ -28,7 +28,7 @@ class GaussianDataStandard;
 namespace kstudio {
 
 // The example graphs offered in File > Examples.
-enum class Example { GaussianSplatting, Autoencoder, SplatAutoencoder };
+enum class Example { GaussianSplatting, Autoencoder, SplatAutoencoder, CombinedScenes };
 std::optional<Example> exampleFromName(std::string_view name);
 
 struct StudioOptions {
@@ -101,7 +101,12 @@ private:
     void installBuilder(const std::optional<LivePlan>& plan, const Graph& graph);
     // How the live graph and Run find their inputs.
     RunContext runContext();
-    std::shared_ptr<klartraum::GaussianDataStandard> loadModel(const std::string& path);
+    // A scene file's Gaussians, cached per file.
+    std::shared_ptr<const std::vector<klartraum::Gaussian3D>> loadScene(const std::string& path, bool flipY);
+    // Assembled and uploaded Gaussians, cached per parts.
+    std::shared_ptr<klartraum::GaussianDataStandard> loadGaussians(const std::vector<GaussianPart>& parts);
+    // How many Gaussians a loaded scene file has.
+    std::optional<size_t> sceneCount(const SceneParams& scene);
     void syncCamera();
     void pushCameraParams(const CameraParams& params);
     void refreshProfiling();
@@ -161,7 +166,8 @@ private:
     std::string builderError_;
     bool autoApply_ = true;
     bool applyRequested_ = false;
-    std::map<std::string, std::shared_ptr<klartraum::GaussianDataStandard>> models_;
+    std::map<std::string, std::shared_ptr<klartraum::GaussianDataStandard>> models_;  // by partsKey()
+    std::map<std::pair<std::string, bool>, std::shared_ptr<const std::vector<klartraum::Gaussian3D>>> scenes_;
 
     // Run
     OnnxInfoCache onnxInfo_;

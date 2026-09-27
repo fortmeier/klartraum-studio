@@ -19,7 +19,9 @@ json paramsToJson(const NodeParams& params) {
         [](const auto& p) -> json {
             using T = std::decay_t<decltype(p)>;
             if constexpr (std::is_same_v<T, SceneParams>) {
-                return {{"path", p.path}};
+                return {{"path", p.path}, {"flipY", p.flipY}};
+            } else if constexpr (std::is_same_v<T, TransformGaussiansParams>) {
+                return {{"translation", p.translation}, {"rotation", p.rotation}, {"scale", p.scale}};
             } else if constexpr (std::is_same_v<T, CameraParams>) {
                 return {{"azimuth", p.azimuth},
                         {"elevation", p.elevation},
@@ -65,6 +67,11 @@ NodeParams paramsFromJson(NodeKind kind, const json& j) {
             using T = std::decay_t<decltype(p)>;
             if constexpr (std::is_same_v<T, SceneParams>) {
                 read(j, "path", p.path);
+                read(j, "flipY", p.flipY);
+            } else if constexpr (std::is_same_v<T, TransformGaussiansParams>) {
+                read(j, "translation", p.translation);
+                read(j, "rotation", p.rotation);
+                read(j, "scale", p.scale);
             } else if constexpr (std::is_same_v<T, CameraParams>) {
                 read(j, "azimuth", p.azimuth);
                 read(j, "elevation", p.elevation);

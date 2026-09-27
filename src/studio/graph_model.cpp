@@ -10,6 +10,8 @@ namespace kstudio {
 namespace {
 
 constexpr PinDesc kSceneOutputs[] = {{"Gaussians", PinType::Gaussians}};
+constexpr PinDesc kGaussiansInputs[] = {{"Gaussians", PinType::Gaussians}};
+constexpr PinDesc kMergeInputs[] = {{"A", PinType::Gaussians}, {"B", PinType::Gaussians}};
 constexpr PinDesc kCameraOutputs[] = {{"Camera", PinType::Camera}};
 constexpr PinDesc kImageOutputs[] = {{"Image", PinType::Image}};
 constexpr PinDesc kSplattingInputs[] = {
@@ -26,6 +28,10 @@ const NodeKindInfo kKinds[] = {
     {NodeKind::Scene, "scene", "Scene", "Sources", "Loads a 3D Gaussian model from an .spz file.", {}, kSceneOutputs},
     {NodeKind::ImageFile, "image_file", "Image File", "Sources",
      "Loads an image file (PNG, JPEG, ...) as a 1x3xHxW tensor with values in [0, 1].", {}, kTensorOutputs},
+    {NodeKind::TransformGaussians, "transform_gaussians", "Transform", "Gaussians",
+     "Scales, rotates and moves Gaussians (klartraum::transformGaussians).", kGaussiansInputs, kSceneOutputs},
+    {NodeKind::MergeGaussians, "merge_gaussians", "Merge", "Gaussians", "Combines two sets of Gaussians into one.",
+     kMergeInputs, kSceneOutputs},
     {NodeKind::Camera, "camera", "Orbit Camera", "Rendering", "Camera uniform buffer driven by an orbit camera.", {},
      kCameraOutputs},
     {NodeKind::SwapchainTarget, "swapchain_target", "Swapchain Target", "Rendering",
@@ -97,6 +103,8 @@ std::string_view filterName(ResampleFilter filter) {
 NodeParams defaultParams(NodeKind kind) {
     switch (kind) {
     case NodeKind::Scene: return SceneParams{};
+    case NodeKind::TransformGaussians: return TransformGaussiansParams{};
+    case NodeKind::MergeGaussians: return MergeGaussiansParams{};
     case NodeKind::Camera: return CameraParams{};
     case NodeKind::SwapchainTarget: return SwapchainTargetParams{};
     case NodeKind::GaussianSplatting: return SplattingParams{};
@@ -367,6 +375,11 @@ std::vector<Diagnostic> Graph::validate() const {
                 report(Severity::Error, node.id, "No scene file is set.");
             }
             break;
+        case NodeKind::TransformGaussians:
+            if (!(node.as<TransformGaussiansParams>().scale > 0.0f)) {
+                report(Severity::Error, node.id, "Scale must be greater than zero.");
+            }
+            break;
         case NodeKind::GaussianSplatting: {
             const Node* target = inputNode(node.id, 2);
             if (target && target->kind != NodeKind::SwapchainTarget && target->kind != NodeKind::OffscreenTarget) {
@@ -521,6 +534,33 @@ Graph makeAutoencoderGraph(const std::string& imagePath, const std::string& enco
     graph.connect(out(encoder), in(decoder));
     graph.connect(out(decoder), in(preview));
     graph.connect(out(decoder), in(writer));
+    return graph;
+}
+
+Graph makeCombinedScenesGraph(const std::string& scenePath, const SceneParams& movedScene,
+                              const TransformGaussiansParams& transform, const CameraParams& cameraParams) {
+    Graph graph;
+    const int scene = graph.addNode(NodeKind::Scene, {0.0f, 0.0f});
+    const int moved = graph.addNode(NodeKind::Scene, {0.0f, 160.0f});
+    const int move = graph.addNode(NodeKind::TransformGaussians, {300.0f, 160.0f});
+    const int merge = graph.addNode(NodeKind::MergeGaussians, {600.0f, 60.0f});
+    const int camera = graph.addNode(NodeKind::Camera, {600.0f, 230.0f});
+    const int target = graph.addNode(NodeKind::SwapchainTarget, {600.0f, 360.0f});
+    const int splatting = graph.addNode(NodeKind::GaussianSplatting, {900.0f, 170.0f});
+    const int present = graph.addNode(NodeKind::Present, {1200.0f, 210.0f});
+
+    graph.findNode(scene)->as<SceneParams>().path = scenePath;
+    graph.findNode(moved)->as<SceneParams>() = movedScene;
+    graph.findNode(move)->as<TransformGaussiansParams>() = transform;
+    graph.findNode(camera)->as<CameraParams>() = cameraParams;
+
+    graph.connect(out(scene), in(merge, 0));
+    graph.connect(out(moved), in(move));
+    graph.connect(out(move), in(merge, 1));
+    graph.connect(out(merge), in(splatting, 0));
+    graph.connect(out(camera), in(splatting, 1));
+    graph.connect(out(target), in(splatting, 2));
+    graph.connect(out(splatting), in(present));
     return graph;
 }
 

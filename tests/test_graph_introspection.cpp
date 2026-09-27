@@ -187,7 +187,7 @@ TEST(GraphIntrospection, builtGraphMatchesCompiledElements) {
         engine.enableProfiling();
         auto model = std::make_shared<klartraum::GaussianDataStandard>(engine.getVulkanContext(), scene);
         RunContext context;
-        context.loadScene = [&](const std::string&) { return model; };
+        context.loadGaussians = [&](const std::vector<GaussianPart>&) { return model; };
 
         const BuiltGraph built = buildLiveGraph(engine, graph, plan, context);
         const ElementGraph introspected = introspect(built.root, built.owners, plan.presentNode);

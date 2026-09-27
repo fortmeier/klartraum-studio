@@ -221,6 +221,11 @@ bool comboUint(const char* label, uint32_t& value, std::initializer_list<uint32_
 
 // Sample files, relative to the klartraum sources (see resolveInputPath).
 constexpr const char* kSampleScene = "3rdparty/spz/samples/racoonfamily.spz";
+constexpr const char* kSampleLantern = "data/lantern.spz";
+// The combined-scenes example puts the lantern on the lawn in front of the
+// raccoon stump and looks at both.
+const TransformGaussiansParams kLanternPlacement{{0.68f, -1.0f, -0.68f}, {0.0f, 20.0f, 0.0f}, 1.6f};
+const CameraParams kLanternView{1.57f, -0.35f, 1.9f, {-0.45f, 0.35f, -1.0f}, UpAxis::Y};
 constexpr const char* kSampleImage = "data/lantern.jpg";
 constexpr const char* kSampleEncoder = "data/onnx/simple_encoder.onnx";
 constexpr const char* kSampleDecoder = "data/onnx/simple_decoder.onnx";
@@ -252,6 +257,7 @@ std::optional<Example> exampleFromName(std::string_view name) {
     if (name == "gaussian-splatting") return Example::GaussianSplatting;
     if (name == "autoencoder") return Example::Autoencoder;
     if (name == "splat-autoencoder") return Example::SplatAutoencoder;
+    if (name == "combined-scenes") return Example::CombinedScenes;
     return std::nullopt;
 }
 
@@ -309,6 +315,11 @@ void StudioApp::loadExample(Example example) {
     case Example::Autoencoder:
         setGraph(makeAutoencoderGraph(kSampleImage, kSampleEncoder, kSampleDecoder, "autoencoded.png"), {});
         break;
+    case Example::CombinedScenes: {
+        const std::string scene = options_.scenePath.empty() ? defaultScenePath() : options_.scenePath;
+        setGraph(makeCombinedScenesGraph(scene, SceneParams{kSampleLantern, true}, kLanternPlacement, kLanternView), {});
+        break;
+    }
     case Example::SplatAutoencoder: {
         const std::string scene = options_.scenePath.empty() ? defaultScenePath() : options_.scenePath;
         setGraph(makeSplatAutoencoderGraph(scene, kSampleEncoder, kSampleDecoder), {});
@@ -472,22 +483,43 @@ void StudioApp::updatePlan() {
     appliedPlan_ = pending;
 }
 
-std::shared_ptr<klartraum::GaussianDataStandard> StudioApp::loadModel(const std::string& path) {
+std::shared_ptr<const std::vector<klartraum::Gaussian3D>> StudioApp::loadScene(const std::string& path, bool flipY) {
     const auto resolved = resolveInputPath(path);
     if (!resolved) {
         throw std::runtime_error("scene file not found: " + path);
     }
-    const std::string key = resolved->string();
+    const auto key = std::make_pair(resolved->string(), flipY);
+    if (auto it = scenes_.find(key); it != scenes_.end()) {
+        return it->second;
+    }
+    auto scene = std::make_shared<const std::vector<klartraum::Gaussian3D>>(
+        klartraum::loadGaussiansSpz(resolved->string(), flipY));
+    if (scene->empty()) {
+        throw std::runtime_error("scene has no Gaussians: " + path);
+    }
+    scenes_[key] = scene;
+    return scene;
+}
+
+std::shared_ptr<klartraum::GaussianDataStandard> StudioApp::loadGaussians(const std::vector<GaussianPart>& parts) {
+    const std::string key = partsKey(parts);
     if (auto it = models_.find(key); it != models_.end()) {
         return it->second;
     }
-    auto& vc = engine_.getVulkanContext();
-    auto model = std::make_shared<klartraum::GaussianDataStandard>(vc, key);
-    if (model->count() == 0) {
-        throw std::runtime_error("scene has no Gaussians: " + key);
-    }
+    auto model = std::make_shared<klartraum::GaussianDataStandard>(
+        engine_.getVulkanContext(),
+        assembleGaussians(parts, [this](const std::string& path, bool flipY) { return loadScene(path, flipY); }));
     models_[key] = model;
     return model;
+}
+
+std::optional<size_t> StudioApp::sceneCount(const SceneParams& scene) {
+    const auto resolved = resolveInputPath(scene.path);
+    if (!resolved) {
+        return std::nullopt;
+    }
+    auto it = scenes_.find(std::make_pair(resolved->string(), scene.flipY));
+    return it == scenes_.end() ? std::nullopt : std::optional<size_t>(it->second->size());
 }
 
 RunContext StudioApp::runContext() {
@@ -500,7 +532,7 @@ RunContext StudioApp::runContext() {
         return *resolved;
     };
     context.resolveOutput = [this](const std::string& path) { return resolveOutputPath(path); };
-    context.loadScene = [this](const std::string& path) { return loadModel(path); };
+    context.loadGaussians = [this](const std::vector<GaussianPart>& parts) { return loadGaussians(parts); };
     context.onnxInfo = [this](const std::string& path, std::string& error) { return onnxInfo(path, error); };
     return context;
 }
@@ -579,17 +611,24 @@ bool StudioApp::apply(const LivePlan& plan, const Graph& graph) {
             pushCameraParams(camera->as<CameraParams>());
         }
     }
-    // Drop models that the running graph no longer uses.
-    std::set<std::string> keep;
+    // Drop Gaussians that the running graph no longer uses. The scene files
+    // it uses stay loaded, so moving a scene does not read them again.
+    std::set<std::string> keepModels;
+    std::set<std::pair<std::string, bool>> keepScenes;
     for (int id : plan.nodes) {
         const Node* node = graph.findNode(id);
-        if (node->kind == NodeKind::Scene) {
-            if (auto resolved = resolveInputPath(node->as<SceneParams>().path)) {
-                keep.insert(resolved->string());
+        if (node->kind == NodeKind::GaussianSplatting) {
+            const auto parts = gaussianParts(graph, graph.inputLink(id, 0)->fromNode);
+            keepModels.insert(partsKey(parts));
+            for (const auto& part : parts) {
+                if (auto resolved = resolveInputPath(part.path)) {
+                    keepScenes.emplace(resolved->string(), part.flipY);
+                }
             }
         }
     }
-    std::erase_if(models_, [&](const auto& entry) { return !keep.contains(entry.first); });
+    std::erase_if(models_, [&](const auto& entry) { return !keepModels.contains(entry.first); });
+    std::erase_if(scenes_, [&](const auto& entry) { return !keepScenes.contains(entry.first); });
 
     setStatus(std::format("Compiled {} elements", compiled_.nodes.size()));
     return true;
@@ -763,6 +802,9 @@ void StudioApp::drawMenuBar() {
             if (ImGui::MenuItem("Splatting autoencoder (offscreen, run)")) {
                 loadExample(Example::SplatAutoencoder);
             }
+            if (ImGui::MenuItem("Raccoons and lantern (live)")) {
+                loadExample(Example::CombinedScenes);
+            }
             ImGui::EndMenu();
         }
         if (ImGui::MenuItem("New Empty Graph")) {
@@ -846,11 +888,9 @@ void StudioApp::drawOverview() {
             const Node& node = *appliedGraph_.findNode(id);
             if (node.kind == NodeKind::GaussianSplatting) {
                 ImGui::Text("Backend: %s", std::string(backendName(node.as<SplattingParams>().backend)).c_str());
-            } else if (node.kind == NodeKind::Scene) {
-                if (auto resolved = resolveInputPath(node.as<SceneParams>().path)) {
-                    if (auto it = models_.find(resolved->string()); it != models_.end()) {
-                        ImGui::Text("Gaussians: %u", it->second->count());
-                    }
+                const auto parts = gaussianParts(appliedGraph_, appliedGraph_.inputLink(id, 0)->fromNode);
+                if (auto it = models_.find(partsKey(parts)); it != models_.end()) {
+                    ImGui::Text("Gaussians: %u", it->second->count());
                 }
             }
         }
@@ -1113,13 +1153,20 @@ void StudioApp::drawAuthoringEditor() {
         case NodeKind::Scene: {
             const auto& path = node.as<SceneParams>().path;
             ImGui::TextUnformatted(path.empty() ? "(no file)" : std::filesystem::path(path).filename().string().c_str());
-            if (auto resolved = resolveInputPath(path)) {
-                if (auto it = models_.find(resolved->string()); it != models_.end()) {
-                    ImGui::Text("%u Gaussians", it->second->count());
-                }
+            if (auto count = sceneCount(node.as<SceneParams>())) {
+                ImGui::Text("%zu Gaussians", *count);
             }
             break;
         }
+        case NodeKind::TransformGaussians: {
+            const auto& p = node.as<TransformGaussiansParams>();
+            ImGui::Text("move %.2f %.2f %.2f", p.translation[0], p.translation[1], p.translation[2]);
+            ImGui::Text("turn %.0f %.0f %.0f", p.rotation[0], p.rotation[1], p.rotation[2]);
+            ImGui::Text("scale %.2f", p.scale);
+            break;
+        }
+        case NodeKind::MergeGaussians:
+            break;
         case NodeKind::Camera: {
             const auto& p = node.as<CameraParams>();
             ImGui::Text("az %.2f  el %.2f", p.azimuth, p.elevation);
@@ -1665,24 +1712,49 @@ void StudioApp::drawNodeInspector(Node& node) {
         ImGui::SeparatorText("Scene");
         changed |= inputText("File", p.path);
         if (ImGui::BeginCombo("Samples", "choose...")) {
-            for (const char* sample : {"3rdparty/spz/samples/racoonfamily.spz", "3rdparty/spz/samples/hornedlizard.spz"}) {
+            for (const char* sample : {"3rdparty/spz/samples/racoonfamily.spz", "3rdparty/spz/samples/hornedlizard.spz",
+                                       kSampleLantern}) {
                 if (ImGui::Selectable(std::filesystem::path(sample).filename().string().c_str())) {
                     p.path = sample;
+                    // The lantern is a Nerfstudio export, upside down otherwise.
+                    p.flipY = std::string_view(sample) == kSampleLantern;
                     changed = true;
                 }
             }
             ImGui::EndCombo();
         }
+        changed |= ImGui::Checkbox("Flip Y", &p.flipY);
+        ImGui::SameLine();
+        ImGui::TextDisabled("(mirror across the Y axis, e.g. for Nerfstudio exports)");
         if (auto resolved = resolveInputPath(p.path)) {
             ImGui::TextDisabled("%s", resolved->string().c_str());
-            if (auto it = models_.find(resolved->string()); it != models_.end()) {
-                ImGui::Text("%u Gaussians loaded", it->second->count());
+            if (auto count = sceneCount(p)) {
+                ImGui::Text("%zu Gaussians loaded", *count);
             }
         } else if (!p.path.empty()) {
             ImGui::TextColored(severityColor(Severity::Error), "File not found");
         }
         break;
     }
+    case NodeKind::TransformGaussians: {
+        auto& p = node.as<TransformGaussiansParams>();
+        ImGui::SeparatorText("Transform");
+        changed |= ImGui::DragFloat3("Translation", p.translation.data(), 0.01f);
+        changed |= ImGui::DragFloat3("Rotation (deg)", p.rotation.data(), 0.5f, -360.0f, 360.0f, "%.1f");
+        changed |= ImGui::DragFloat("Scale", &p.scale, 0.005f, 0.001f, 1000.0f, "%.3f", ImGuiSliderFlags_Logarithmic);
+        if (ImGui::Button("Reset")) {
+            p = TransformGaussiansParams{};
+            changed = true;
+        }
+        ImGui::TextWrapped("Scales about the origin, rotates about X, then Y, then Z, then moves. Orientations and "
+                           "view-dependent colours turn along. Changes rebuild the Gaussians once you let go.");
+        break;
+    }
+    case NodeKind::MergeGaussians:
+        ImGui::SeparatorText("Merge");
+        ImGui::TextWrapped("Combines the Gaussians of A and B into one set that a single Gaussian Splatting "
+                           "renders, so the two sort correctly against each other. Chain Merge nodes for more.");
+        break;
     case NodeKind::Camera: {
         auto& p = node.as<CameraParams>();
         const bool active = appliedPlan_ && appliedPlan_->cameraNode == node.id;

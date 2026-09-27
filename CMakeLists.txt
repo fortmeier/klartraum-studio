@@ -71,6 +71,7 @@ add_library(klartraum_studio_core STATIC
   src/studio/image_io.cpp
   src/studio/onnx_info.cpp
   src/studio/tensor_shapes.cpp
+  src/studio/gaussian_sources.cpp
   src/studio/graph_runner.cpp
   src/studio/preview_texture.cpp
   src/studio/studio_app.cpp
@@ -116,6 +117,7 @@ if(KLARTRAUM_STUDIO_BUILD_TESTS)
     tests/test_onnx_info.cpp
     tests/test_tensor_shapes.cpp
     tests/test_graph_runner.cpp
+    tests/test_gaussian_sources.cpp
   )
   target_link_libraries(klartraum_studio_tests PRIVATE klartraum_studio_core GTest::gtest_main)
   include(GoogleTest)

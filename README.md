@@ -20,7 +20,8 @@ Nodes stand for klartraum's public building blocks:
 
 | Group | Nodes |
 |---|---|
-| Sources | *Scene* (`.spz` Gaussians), *Image File* (PNG, JPEG, … resized to W×H, as a 1×3×H×W tensor) |
+| Sources | *Scene* (`.spz` Gaussians, optionally mirrored across Y for Nerfstudio exports), *Image File* (PNG, JPEG, … resized to W×H, as a 1×3×H×W tensor) |
+| Gaussians | *Transform* (scale, rotate about X/Y/Z, translate; `klartraum::transformGaussians`, which turns orientations and view-dependent colour along), *Merge* (two sets of Gaussians into one, rendered and sorted together) |
 | Rendering | *Orbit Camera*, *Swapchain Target*, *Offscreen Target* (W×H), *Gaussian Splatting* (compute or raster backend, all `GsplatConfig` settings) |
 | Compute | *Image to Tensor* (image → 1×3×H×W tensor), *Tensor to Image* (1×3×H×W tensor → H×W image), *Resample* (image → W×H image, nearest or bilinear; `klartraum::ImageResample`), *ONNX Model* (`klartraum::OnnxNetwork`; Conv, ConvTranspose, Relu, Reshape, Transpose) |
 | Outputs | *Present* (live; images other than a swapchain rendering are stretched to the window), *Preview* and *Image File Writer* (run; they take an image tensor or an image) |
@@ -73,6 +74,7 @@ support.
 ./build/klartraum_studio                                # live Gaussian-splatting graph
 ./build/klartraum_studio --example autoencoder          # image file -> encoder -> decoder -> preview + PNG
 ./build/klartraum_studio --example splat-autoencoder    # offscreen splatting -> encoder -> decoder -> preview
+./build/klartraum_studio --example combined-scenes      # raccoon scene + transformed lantern, merged and rendered live
 ./build/klartraum_studio my.ktgraph.json                # open a saved graph
 ./build/klartraum_studio --backend compute --spz path/to/scene.spz --profile
 ```
@@ -83,6 +85,13 @@ klartraum's sample models (`data/onnx/simple_encoder.onnx`,
 `data/lantern.jpg`. Press **Run** (F5) to compute it. The preview shows the
 reconstructed image, and `autoencoded.png` is written next to the graph file
 (or into the working directory for an unsaved graph).
+
+The combined-scenes example merges the raccoon stump with klartraum's
+`data/lantern.spz`, loaded with *Flip Y* and placed on the lawn beside the
+stump by a *Transform* node. Transform and Merge work on the Gaussians before
+they are uploaded: each Gaussian Splatting input is assembled on the CPU from
+its scene files and uploaded once. Scene files stay loaded while the live
+graph uses them, so moving a scene only re-assembles and re-uploads.
 
 The default graph uses the raster backend. The compute (tile-binned) backend
 shows the classic projection → binning → sort → gather → bounds → splat
@@ -168,3 +177,6 @@ tests run headlessly:
   *Resample*; a mismatch is reported when the live graph is built.
 - ONNX models need a single input. Only the operators klartraum implements are
   supported, and the editor lists any others.
+- *Transform* scales uniformly; Gaussians cannot be stretched along one axis.
+  Changing a transform rebuilds the live graph (on the CPU, once you let go of
+  the control), so it is not an animation tool.

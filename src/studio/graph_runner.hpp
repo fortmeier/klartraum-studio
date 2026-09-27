@@ -7,6 +7,7 @@
 #include <string>
 #include <vector>
 
+#include "studio/gaussian_sources.hpp"
 #include "studio/graph_compiler.hpp"
 #include "studio/graph_introspection.hpp"
 #include "studio/image_io.hpp"
@@ -28,8 +29,9 @@ struct RunContext {
     std::function<std::filesystem::path(const std::string&)> resolveInput;
     // Resolves where an output file goes.
     std::function<std::filesystem::path(const std::string&)> resolveOutput;
-    // Loads (or returns a cached) scene for a Scene node's path.
-    std::function<std::shared_ptr<klartraum::GaussianDataStandard>(const std::string&)> loadScene;
+    // Uploads (or returns cached) Gaussians assembled from scene files; see
+    // gaussianParts().
+    std::function<std::shared_ptr<klartraum::GaussianDataStandard>(const std::vector<GaussianPart>&)> loadGaussians;
     OnnxInfoProvider onnxInfo;
 };
 

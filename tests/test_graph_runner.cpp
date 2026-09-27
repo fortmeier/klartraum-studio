@@ -16,6 +16,8 @@
  *   decoded and presented builds as the live graph and renders frames (GPU)
  * - liveReportsShapeMismatch: a model fed with the window-sized rendering fails the live build
  *   with the model's title (GPU)
+ * - liveCombinedScenes: two scenes, one of them transformed, merge into one Gaussian
+ *   Splatting that holds the Gaussians of both and renders frames (GPU)
  * - runReportsFailingNode: a missing input file fails the run with the node's title (GPU)
  **/
 
@@ -65,8 +67,12 @@ protected:
             return std::filesystem::path(path);
         };
         context.resolveOutput = [this](const std::string& path) { return outputDir / path; };
-        context.loadScene = [this](const std::string& path) {
-            return std::make_shared<klartraum::GaussianDataStandard>(vc(), path);
+        context.loadGaussians = [this](const std::vector<GaussianPart>& parts) {
+            return std::make_shared<klartraum::GaussianDataStandard>(
+                vc(), assembleGaussians(parts, [](const std::string& path, bool flipY) {
+                    return std::make_shared<const std::vector<klartraum::Gaussian3D>>(
+                        klartraum::loadGaussiansSpz(path, flipY));
+                }));
         };
         context.onnxInfo = [this](const std::string& path, std::string& error) { return onnx.get(path, &error); };
     }
@@ -355,6 +361,45 @@ TEST_F(GraphRunnerTest, liveReportsShapeMismatch) {
     } catch (const std::runtime_error& e) {
         EXPECT_TRUE(std::string(e.what()).starts_with("Encoder: the model expects a")) << e.what();
     }
+}
+
+TEST_F(GraphRunnerTest, liveCombinedScenes) {
+    const std::string lantern = (kRoot / "data/lantern.spz").string();
+    if (!std::filesystem::exists(lantern)) {
+        GTEST_SKIP() << "sample not found: " << lantern;
+    }
+    TransformGaussiansParams placement;
+    placement.translation = {0.6f, -1.0f, -0.6f};
+    placement.rotation = {0.0f, 30.0f, 0.0f};
+    const Graph graph = makeCombinedScenesGraph(kScene, SceneParams{lantern, true}, placement);
+    const CompilePlan compiled = planGraph(graph);
+    ASSERT_TRUE(compiled.live.has_value());
+
+    std::vector<std::vector<GaussianPart>> requested;
+    std::shared_ptr<klartraum::GaussianDataStandard> model;
+    RunContext recording = context;
+    recording.loadGaussians = [&](const std::vector<GaussianPart>& parts) {
+        requested.push_back(parts);
+        model = context.loadGaussians(parts);
+        return model;
+    };
+    auto& engine = frontend->getKlartraumEngine();
+    const BuiltGraph built = buildLiveGraph(engine, graph, *compiled.live, recording);
+    for (int i = 0; i < 2; ++i) {
+        engine.step();
+    }
+    vkDeviceWaitIdle(vc().getDevice());
+
+    ASSERT_EQ(requested.size(), 1u);
+    ASSERT_EQ(requested[0].size(), 2u);
+    EXPECT_EQ(model->count(), klartraum::loadGaussiansSpz(kScene).size() +
+                                  klartraum::loadGaussiansSpz(lantern, true).size());
+    // The scene buffers belong to the Merge node feeding the splatting.
+    const ElementGraph elements = introspect(built.root, built.owners, compiled.live->presentNode);
+    EXPECT_EQ(std::count_if(elements.nodes.begin(), elements.nodes.end(),
+                            [&](const ElementNode& n) { return n.owner == findKind(graph, NodeKind::MergeGaussians); }),
+              7);
+    engine.clearComputeGraphs();
 }
 
 TEST_F(GraphRunnerTest, runReportsFailingNode) {

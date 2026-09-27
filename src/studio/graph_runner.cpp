@@ -290,7 +290,9 @@ private:
     void buildNode(const Node& node) {
         switch (node.kind) {
         case NodeKind::Scene:
-            scenes_[node.id] = context_.loadScene(node.as<SceneParams>().path);
+        case NodeKind::TransformGaussians:
+        case NodeKind::MergeGaussians:
+            // Assembled for the Gaussian Splatting node they feed.
             break;
         case NodeKind::Camera:
             if (live_) {
@@ -334,7 +336,8 @@ private:
                                                       static_cast<float>(size.width) / static_cast<float>(size.height)});
             }
 
-            auto model = built(scenes_, node, 0);
+            const int source = graph_.inputLink(node.id, 0)->fromNode;
+            auto model = context_.loadGaussians(gaussianParts(graph_, source));
             const auto& buffers = model->buffers();
             for (const klartraum::ComputeGraphElement* element :
                  {static_cast<klartraum::ComputeGraphElement*>(buffers.pos.get()),
@@ -345,7 +348,7 @@ private:
                   static_cast<klartraum::ComputeGraphElement*>(buffers.shG.get()),
                   static_cast<klartraum::ComputeGraphElement*>(buffers.shB.get())}) {
                 if (element) {
-                    owners_[element] = graph_.inputNode(node.id, 0)->id;
+                    owners_[element] = source;
                 }
             }
 
@@ -458,7 +461,6 @@ private:
     const bool live_;
     const uint32_t numPaths_;
 
-    std::map<int, std::shared_ptr<klartraum::GaussianDataStandard>> scenes_;
     std::map<int, std::shared_ptr<klartraum::ImageViewSrc>> targets_;
     std::map<int, VkExtent2D> targetSizes_;
     std::shared_ptr<klartraum::ImageViewSrc> swapchain_;
