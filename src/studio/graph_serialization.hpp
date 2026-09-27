@@ -11,7 +11,9 @@ namespace kstudio {
 // with their parameters and editor positions, and the links.
 std::string toJson(const Graph& graph);
 
-// Throws std::runtime_error with a readable message on malformed input.
+// Throws std::runtime_error with a readable message on malformed input. Files
+// from before Upload Gaussians existed, with scenes linked straight into
+// Gaussian Splatting, get an Upload Gaussians node on each such link.
 Graph fromJson(const std::string& text);
 
 // A node's parameters as they are stored, e.g. for comparing them.

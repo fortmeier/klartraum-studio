@@ -18,10 +18,30 @@ namespace kstudio {
 //  - the run part, everything feeding a sink (Preview, Image File Writer),
 //    is executed once each time the user presses Run.
 
-enum class PinType { Gaussians, Camera, Image, Tensor };
+// Gaussians and numbers are CPU data until an upload node puts them into GPU
+// buffers; images, tensors, transforms and camera buffers live on the GPU.
+enum class PinType { GaussiansCpu, GaussiansGpu, Camera, Image, Tensor, NumberCpu, NumberGpu, TransformGpu };
+
+// Where a node's work happens: on the GPU, on the CPU, or moving data between
+// them.
+enum class ExecutionSite { Gpu, Cpu, Upload, Readback };
+
+// What a node is: elements of the klartraum compute graph, a klartraum
+// function the studio calls on the CPU, or the studio's own code.
+enum class Implementation { ComputeGraph, KlartraumFunction, Studio };
 
 enum class NodeKind {
     Scene,
+    TransformGaussians,
+    MergeGaussians,
+    UploadGaussians,
+    Number,
+    Time,
+    Sine,
+    UploadNumber,
+    MakeTransform,
+    TransformGaussiansGpu,
+    MergeGaussiansGpu,
     Camera,
     SwapchainTarget,
     GaussianSplatting,
@@ -44,7 +64,69 @@ enum class ResampleFilter { Nearest, Bilinear };
 
 struct SceneParams {
     std::string path;
+    bool flipY = false;  // mirror across the Y axis, e.g. for Nerfstudio exports
     bool operator==(const SceneParams&) const = default;
+};
+
+// Moves Gaussians: scaled about the origin, rotated (degrees about X, then Y,
+// then Z) and translated.
+struct TransformGaussiansParams {
+    std::array<float, 3> translation = {0.0f, 0.0f, 0.0f};
+    std::array<float, 3> rotation = {0.0f, 0.0f, 0.0f};
+    float scale = 1.0f;
+    bool operator==(const TransformGaussiansParams&) const = default;
+};
+
+struct MergeGaussiansParams {
+    bool operator==(const MergeGaussiansParams&) const = default;
+};
+
+struct UploadGaussiansParams {
+    bool operator==(const UploadGaussiansParams&) const = default;
+};
+
+// CPU numbers, evaluated every frame.
+struct NumberParams {
+    float value = 0.0f;
+    bool operator==(const NumberParams&) const = default;
+};
+
+// Seconds since the studio started, times `speed`.
+struct TimeParams {
+    float speed = 1.0f;
+    bool operator==(const TimeParams&) const = default;
+};
+
+// amplitude * sin(frequency * 2 pi * x + phase) + offset, phase in degrees.
+struct SineParams {
+    float amplitude = 1.0f;
+    float frequency = 1.0f;
+    float phase = 0.0f;
+    float offset = 0.0f;
+    bool operator==(const SineParams&) const = default;
+};
+
+struct UploadNumberParams {
+    bool operator==(const UploadNumberParams&) const = default;
+};
+
+// A GPU transform from x, y, z, pitch, yaw, roll (degrees, about X, then Y,
+// then Z) and scale; inputs that are not connected take these values.
+struct MakeTransformParams {
+    std::array<float, 3> translation = {0.0f, 0.0f, 0.0f};
+    std::array<float, 3> rotation = {0.0f, 0.0f, 0.0f};  // pitch, yaw, roll
+    float scale = 1.0f;
+    bool operator==(const MakeTransformParams&) const = default;
+    // In input order: x, y, z, pitch, yaw, roll, scale.
+    float component(int index) const { return index < 3 ? translation[index] : index < 6 ? rotation[index - 3] : scale; }
+};
+
+struct TransformGaussiansGpuParams {
+    bool operator==(const TransformGaussiansGpuParams&) const = default;
+};
+
+struct MergeGaussiansGpuParams {
+    bool operator==(const MergeGaussiansGpuParams&) const = default;
 };
 
 // Orbit camera. These values are applied live and never require a rebuild.
@@ -131,7 +213,9 @@ struct ImageFileWriterParams {
     bool operator==(const ImageFileWriterParams&) const = default;
 };
 
-using NodeParams = std::variant<SceneParams, CameraParams, SwapchainTargetParams, SplattingParams, PresentParams,
+using NodeParams = std::variant<SceneParams, TransformGaussiansParams, MergeGaussiansParams, UploadGaussiansParams,
+                                NumberParams, TimeParams, SineParams, UploadNumberParams, MakeTransformParams,
+                                TransformGaussiansGpuParams, MergeGaussiansGpuParams, CameraParams, SwapchainTargetParams, SplattingParams, PresentParams,
                                 OffscreenTargetParams, ImageFileParams, ImageToTensorParams, TensorToImageParams,
                                 ResampleParams, OnnxModelParams, PreviewParams, ImageFileWriterParams>;
 
@@ -140,6 +224,8 @@ struct PinDesc {
     PinType type;
     // An input may accept a second type (sinks take tensors and images).
     std::optional<PinType> alsoAccepts = std::nullopt;
+    // An optional input may stay unconnected; the node then uses a parameter.
+    bool optional = false;
 
     bool accepts(PinType other) const { return other == type || other == alsoAccepts; }
 };
@@ -152,6 +238,12 @@ struct NodeKindInfo {
     std::string_view description;
     std::span<const PinDesc> inputs;
     std::span<const PinDesc> outputs;
+    ExecutionSite site;
+    Implementation implementation;
+    std::string_view implementedBy;  // the klartraum class or function, or the studio code
+    std::string_view timing;         // when the work happens
+    // Parameters that apply while the live graph runs, without rebuilding it.
+    bool liveParams = false;
 };
 
 const NodeKindInfo& kindInfo(NodeKind kind);
@@ -160,6 +252,8 @@ std::optional<NodeKind> kindFromName(std::string_view name);
 std::string_view pinTypeName(PinType type);
 std::string_view backendName(SplattingBackend backend);
 std::string_view filterName(ResampleFilter filter);
+std::string_view siteName(ExecutionSite site);
+std::string_view implementationName(Implementation implementation);
 NodeParams defaultParams(NodeKind kind);
 // Preview and Image File Writer: executed by Run.
 bool isSink(NodeKind kind);
@@ -280,6 +374,18 @@ Graph makeGaussianSplattingGraph(const std::string& scenePath, SplattingBackend 
 // previewed and written to `outputPath` on Run.
 Graph makeAutoencoderGraph(const std::string& imagePath, const std::string& encoderPath,
                            const std::string& decoderPath, const std::string& outputPath);
+
+// Two scenes in one Gaussian Splatting: `movedScene` is transformed by
+// `transform` and merged with `scene`, seen through `camera`.
+Graph makeCombinedScenesGraph(const std::string& scenePath, const SceneParams& movedScene,
+                              const TransformGaussiansParams& transform, const CameraParams& camera = {});
+
+// Like makeCombinedScenesGraph, but moved and merged on the GPU every frame:
+// `movedScene` is placed by a Make Transform whose yaw swings by `swing` over
+// time (Time -> Sine -> Upload Number).
+Graph makeAnimatedScenesGraph(const std::string& scenePath, const SceneParams& movedScene,
+                              const MakeTransformParams& placement, const SineParams& swing,
+                              const CameraParams& camera = {});
 
 // A Gaussian-splatting rendering into an offscreen image, fed through the
 // encoder and decoder and previewed on Run.

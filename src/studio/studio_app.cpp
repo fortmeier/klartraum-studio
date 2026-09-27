@@ -1,6 +1,7 @@
 #include "studio/studio_app.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <format>
 #include <set>
 
@@ -14,6 +15,7 @@
 #include "klartraum/klartraum_core.hpp"
 #include "klartraum/interface_camera_orbit.hpp"
 
+#include "studio/cpu_numbers.hpp"
 #include "studio/graph_layout.hpp"
 #include "studio/graph_serialization.hpp"
 
@@ -56,12 +58,46 @@ ImU32 rgb(int r, int g, int b, int a = 255) { return IM_COL32(r, g, b, a); }
 
 ImU32 pinColor(PinType type) {
     switch (type) {
-    case PinType::Gaussians: return rgb(236, 178, 72);
+    case PinType::GaussiansCpu: return rgb(176, 164, 140);
+    case PinType::GaussiansGpu: return rgb(236, 178, 72);
+    case PinType::NumberCpu: return rgb(176, 176, 132);
+    case PinType::NumberGpu: return rgb(238, 218, 96);
+    case PinType::TransformGpu: return rgb(110, 214, 214);
     case PinType::Camera: return rgb(110, 196, 140);
     case PinType::Image: return rgb(96, 160, 240);
     case PinType::Tensor: return rgb(206, 120, 226);
     }
     return rgb(200, 200, 200);
+}
+
+// Where a node runs, as shown in badges.
+ImU32 siteColor(ExecutionSite site) {
+    switch (site) {
+    case ExecutionSite::Gpu: return rgb(110, 190, 255);
+    case ExecutionSite::Cpu: return rgb(240, 185, 100);
+    case ExecutionSite::Upload: return rgb(195, 155, 255);
+    case ExecutionSite::Readback: return rgb(120, 215, 170);
+    }
+    return rgb(200, 200, 200);
+}
+
+// Rings around nodes that become elements of a klartraum compute graph, and
+// the outline of elements the studio added on its own.
+const ImU32 kLiveGraphColor = IM_COL32(90, 170, 255, 255);
+const ImU32 kRunGraphColor = IM_COL32(120, 210, 130, 255);
+const ImU32 kStudioAddedColor = IM_COL32(240, 185, 100, 255);
+
+// GPU memory of uploaded Gaussians: position, rotation, scale, colour and
+// opacity, and 3 x 15 SH coefficients, as floats.
+double gaussianBytes(uint32_t count) {
+    return count * (3.0 + 4.0 + 3.0 + 4.0 + 45.0) * sizeof(float);
+}
+
+// "GPU  klartraum graph": where a node runs and what it is made of.
+void executionBadge(const NodeKindInfo& info) {
+    ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(siteColor(info.site)), "%s", std::string(siteName(info.site)).c_str());
+    ImGui::SameLine(0.0f, 6.0f);
+    ImGui::TextDisabled("%s", std::string(implementationName(info.implementation)).c_str());
 }
 
 ImU32 kindColor(NodeKind kind) {
@@ -76,6 +112,14 @@ ImU32 kindColor(NodeKind kind) {
     case NodeKind::ImageToTensor: return rgb(110, 70, 140);
     case NodeKind::TensorToImage: return rgb(70, 90, 150);
     case NodeKind::Resample: return rgb(50, 110, 130);
+    case NodeKind::UploadGaussians: return rgb(110, 80, 150);
+    case NodeKind::Number:
+    case NodeKind::Time:
+    case NodeKind::Sine: return rgb(110, 110, 70);
+    case NodeKind::UploadNumber: return rgb(120, 100, 40);
+    case NodeKind::MakeTransform: return rgb(40, 120, 120);
+    case NodeKind::TransformGaussiansGpu:
+    case NodeKind::MergeGaussiansGpu: return rgb(150, 100, 40);
     case NodeKind::OnnxModel: return rgb(150, 60, 110);
     case NodeKind::Preview: return rgb(60, 110, 100);
     case NodeKind::ImageFileWriter: return rgb(60, 100, 70);
@@ -134,7 +178,8 @@ void pinIcon(PinType type, bool connected, float size) {
     const float r = size * 0.3f;
     const ImU32 color = pinColor(type);
     switch (type) {
-    case PinType::Gaussians:
+    case PinType::GaussiansCpu:
+    case PinType::GaussiansGpu:
         if (connected) {
             drawList->AddRectFilled(ImVec2(c.x - r, c.y - r), ImVec2(c.x + r, c.y + r), color);
         } else {
@@ -155,6 +200,21 @@ void pinIcon(PinType type, bool connected, float size) {
             drawList->AddCircleFilled(c, r, color);
         } else {
             drawList->AddCircle(c, r, color, 0, 1.5f);
+        }
+        break;
+    case PinType::NumberCpu:
+    case PinType::NumberGpu:
+        if (connected) {
+            drawList->AddCircleFilled(c, r * 0.7f, color);
+        } else {
+            drawList->AddCircle(c, r * 0.7f, color, 0, 1.5f);
+        }
+        break;
+    case PinType::TransformGpu:
+        if (connected) {
+            drawList->AddRectFilled(ImVec2(c.x - r, c.y - r), ImVec2(c.x + r, c.y + r), color, r * 0.5f);
+        } else {
+            drawList->AddRect(ImVec2(c.x - r, c.y - r), ImVec2(c.x + r, c.y + r), color, r * 0.5f, 0, 1.5f);
         }
         break;
     case PinType::Tensor: {
@@ -221,12 +281,21 @@ bool comboUint(const char* label, uint32_t& value, std::initializer_list<uint32_
 
 // Sample files, relative to the klartraum sources (see resolveInputPath).
 constexpr const char* kSampleScene = "3rdparty/spz/samples/racoonfamily.spz";
+constexpr const char* kSampleLantern = "data/lantern.spz";
+// The combined-scenes example puts the lantern on the lawn in front of the
+// raccoon stump and looks at both.
+const TransformGaussiansParams kLanternPlacement{{0.68f, -1.0f, -0.68f}, {0.0f, 20.0f, 0.0f}, 1.6f};
+const CameraParams kLanternView{1.57f, -0.35f, 1.9f, {-0.45f, 0.35f, -1.0f}, UpAxis::Y};
 constexpr const char* kSampleImage = "data/lantern.jpg";
 constexpr const char* kSampleEncoder = "data/onnx/simple_encoder.onnx";
 constexpr const char* kSampleDecoder = "data/onnx/simple_decoder.onnx";
 
 std::string defaultScenePath() {
     return kSampleScene;
+}
+
+double elapsedMs(std::chrono::steady_clock::time_point start) {
+    return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
 }
 
 std::string fileName(const std::string& path) {
@@ -252,6 +321,8 @@ std::optional<Example> exampleFromName(std::string_view name) {
     if (name == "gaussian-splatting") return Example::GaussianSplatting;
     if (name == "autoencoder") return Example::Autoencoder;
     if (name == "splat-autoencoder") return Example::SplatAutoencoder;
+    if (name == "combined-scenes") return Example::CombinedScenes;
+    if (name == "animated-scenes") return Example::AnimatedScenes;
     return std::nullopt;
 }
 
@@ -309,6 +380,21 @@ void StudioApp::loadExample(Example example) {
     case Example::Autoencoder:
         setGraph(makeAutoencoderGraph(kSampleImage, kSampleEncoder, kSampleDecoder, "autoencoded.png"), {});
         break;
+    case Example::CombinedScenes: {
+        const std::string scene = options_.scenePath.empty() ? defaultScenePath() : options_.scenePath;
+        setGraph(makeCombinedScenesGraph(scene, SceneParams{kSampleLantern, true}, kLanternPlacement, kLanternView), {});
+        break;
+    }
+    case Example::AnimatedScenes: {
+        const std::string scene = options_.scenePath.empty() ? defaultScenePath() : options_.scenePath;
+        MakeTransformParams placement;
+        placement.translation = kLanternPlacement.translation;
+        placement.scale = kLanternPlacement.scale;
+        // Swings 30 degrees either way around the combined example's 20, once every 4 seconds.
+        const SineParams swing{30.0f, 0.25f, 0.0f, kLanternPlacement.rotation[1]};
+        setGraph(makeAnimatedScenesGraph(scene, SceneParams{kSampleLantern, true}, placement, swing, kLanternView), {});
+        break;
+    }
     case Example::SplatAutoencoder: {
         const std::string scene = options_.scenePath.empty() ? defaultScenePath() : options_.scenePath;
         setGraph(makeSplatAutoencoderGraph(scene, kSampleEncoder, kSampleDecoder), {});
@@ -468,26 +554,128 @@ void StudioApp::updatePlan() {
                 element.owner = it->second;
             }
         }
+        for (auto& binding : liveBindings_) {
+            if (auto it = renamed.find(binding.node); it != renamed.end()) {
+                binding.node = it->second;
+            }
+        }
+        // The running graph now stands for the current one.
+        appliedGraph_ = graph_;
     }
     appliedPlan_ = pending;
 }
 
-std::shared_ptr<klartraum::GaussianDataStandard> StudioApp::loadModel(const std::string& path) {
+std::shared_ptr<const std::vector<klartraum::Gaussian3D>> StudioApp::loadScene(const std::string& path, bool flipY) {
     const auto resolved = resolveInputPath(path);
     if (!resolved) {
         throw std::runtime_error("scene file not found: " + path);
     }
-    const std::string key = resolved->string();
-    if (auto it = models_.find(key); it != models_.end()) {
+    const auto key = std::make_pair(resolved->string(), flipY);
+    if (auto it = scenes_.find(key); it != scenes_.end()) {
         return it->second;
     }
-    auto& vc = engine_.getVulkanContext();
-    auto model = std::make_shared<klartraum::GaussianDataStandard>(vc, key);
-    if (model->count() == 0) {
-        throw std::runtime_error("scene has no Gaussians: " + key);
+    const auto start = std::chrono::steady_clock::now();
+    auto scene = std::make_shared<const std::vector<klartraum::Gaussian3D>>(
+        klartraum::loadGaussiansSpz(resolved->string(), flipY));
+    if (scene->empty()) {
+        throw std::runtime_error("scene has no Gaussians: " + path);
     }
+    logHostStep(std::format("decoded {} ({} Gaussians)", fileName(path), scene->size()), elapsedMs(start));
+    scenes_[key] = scene;
+    return scene;
+}
+
+std::shared_ptr<klartraum::GaussianDataStandard> StudioApp::loadGaussians(const std::vector<GaussianPart>& parts) {
+    const std::string key = partsKey(parts);
+    if (auto it = models_.find(key); it != models_.end()) {
+        logHostStep(std::format("reused uploaded Gaussians ({})", it->second->count()), 0.0);
+        return it->second;
+    }
+    auto gaussians =
+        assembleGaussians(parts, [this](const std::string& path, bool flipY) { return loadScene(path, flipY); });
+    if (parts.size() > 1 || !(parts[0].transform == Similarity{})) {
+        // Placing and concatenating is timed together with the upload below.
+        logHostStep(std::format("assembled {} Gaussians from {} part(s)", gaussians.size(), parts.size()), 0.0);
+    }
+    const auto start = std::chrono::steady_clock::now();
+    auto model = std::make_shared<klartraum::GaussianDataStandard>(engine_.getVulkanContext(), std::move(gaussians));
+    logHostStep(std::format("uploaded {:.0f} MB", gaussianBytes(model->count()) / 1e6), elapsedMs(start));
     models_[key] = model;
     return model;
+}
+
+void StudioApp::logHostStep(const std::string& step, double milliseconds) {
+    if (hostLog_) {
+        hostLog_->push_back(milliseconds > 0.0 ? std::format("{} ({:.0f} ms)", step, milliseconds) : step);
+    }
+}
+
+std::shared_ptr<klartraum::GaussianDataStandard> StudioApp::uploadedGaussians(const Graph& graph, int node) const {
+    try {
+        auto it = models_.find(partsKey(gaussianParts(graph, node)));
+        return it == models_.end() ? nullptr : it->second;
+    } catch (const std::exception&) {
+        return nullptr;  // inputs not connected
+    }
+}
+
+void StudioApp::drawExecutionInfo(const Node& node) {
+    const auto& info = kindInfo(node.kind);
+    ImGui::SeparatorText("Runs as");
+    executionBadge(info);
+    ImGui::TextWrapped("Implemented by %s", std::string(info.implementedBy).c_str());
+    ImGui::TextWrapped("Runs %s.", std::string(info.timing).c_str());
+
+    const bool graphNode = info.implementation == Implementation::ComputeGraph;
+    auto describe = [&](const char* part, bool used, const ElementGraph* compiled) {
+        if (!used) {
+            return;
+        }
+        if (!graphNode) {
+            ImGui::BulletText("Prepares data for the %s graph; not part of a klartraum graph.", part);
+            return;
+        }
+        int own = 0, added = 0;
+        if (compiled) {
+            for (const auto& element : compiled->nodes) {
+                if (element.owner == node.id) {
+                    ++(element.inserted ? added : own);
+                }
+            }
+        }
+        if (!compiled || compiled->empty()) {
+            ImGui::BulletText("In the %s klartraum graph (not built yet).", part);
+        } else if (own + added == 0) {
+            ImGui::BulletText("In the %s klartraum graph, without elements of its own here.", part);
+        } else if (added > 0) {
+            ImGui::BulletText("In the %s klartraum graph: %d elements, %d more added by the studio.", part, own, added);
+        } else {
+            ImGui::BulletText("In the %s klartraum graph: %d elements.", part, own);
+        }
+    };
+    const bool live = plan_.live && plan_.live->contains(node.id);
+    const bool run = plan_.run && std::find(plan_.run->nodes.begin(), plan_.run->nodes.end(), node.id) !=
+                                      plan_.run->nodes.end();
+    describe("live", live, appliedPlan_ && appliedPlan_->contains(node.id) ? &compiled_ : nullptr);
+    describe("run", run, lastRun_ ? &lastRun_->compiled : nullptr);
+    if (!live && !run) {
+        ImGui::TextDisabled("Not used by the live or the run graph.");
+    }
+    if (node.kind == NodeKind::UploadGaussians) {
+        if (auto model = uploadedGaussians(graph_, node.id)) {
+            ImGui::Text("Uploaded: %u Gaussians, %.0f MB of GPU buffers", model->count(),
+                        gaussianBytes(model->count()) / 1e6);
+        }
+    }
+}
+
+std::optional<size_t> StudioApp::sceneCount(const SceneParams& scene) {
+    const auto resolved = resolveInputPath(scene.path);
+    if (!resolved) {
+        return std::nullopt;
+    }
+    auto it = scenes_.find(std::make_pair(resolved->string(), scene.flipY));
+    return it == scenes_.end() ? std::nullopt : std::optional<size_t>(it->second->size());
 }
 
 RunContext StudioApp::runContext() {
@@ -500,7 +688,9 @@ RunContext StudioApp::runContext() {
         return *resolved;
     };
     context.resolveOutput = [this](const std::string& path) { return resolveOutputPath(path); };
-    context.loadScene = [this](const std::string& path) { return loadModel(path); };
+    context.loadGaussians = [this](const std::vector<GaussianPart>& parts) { return loadGaussians(parts); };
+    context.hostStep = [this](const std::string& step, double milliseconds) { logHostStep(step, milliseconds); };
+    context.time = secondsSinceStart();
     context.onnxInfo = [this](const std::string& path, std::string& error) { return onnxInfo(path, error); };
     return context;
 }
@@ -509,6 +699,7 @@ void StudioApp::installBuilder(const std::optional<LivePlan>& plan, const Graph&
     if (!plan) {
         compiled_ = {};
         compiledSignature_.clear();
+        liveBindings_.clear();
         // Without a live graph the window is only cleared; the builder keeps
         // it resizable.
         engine_.setGraphBuilder([](klartraum::KlartraumEngine& e) { e.add(e.createRenderPass()); });
@@ -518,16 +709,22 @@ void StudioApp::installBuilder(const std::optional<LivePlan>& plan, const Graph&
     // recreation, so it must not throw: errors are reported via builderError_.
     // It keeps a copy of the graph, which the user goes on editing.
     engine_.setGraphBuilder([this, plan = *plan, graph](klartraum::KlartraumEngine& e) {
+        liveHostSteps_.clear();
+        hostLog_ = &liveHostSteps_;
         try {
             BuiltGraph built = buildLiveGraph(e, graph, plan, runContext());
-            compiled_ = introspect(built.root, built.owners, plan.presentNode);
+            compiled_ = introspect(built.root, built.owners, plan.presentNode, built.inserted);
+            liveBindings_ = std::move(built.bindings);
+            applyBindings(graph, liveBindings_, secondsSinceStart());
             builderError_.clear();
         } catch (const std::exception& ex) {
+            liveBindings_.clear();
             e.clearComputeGraphs();
             e.setCameraUBO(nullptr);
             compiled_ = {};
             builderError_ = ex.what();
         }
+        hostLog_ = nullptr;
 
         // Keep the user's arrangement across swapchain rebuilds; lay out anew
         // only when the graph's structure changed.
@@ -579,17 +776,24 @@ bool StudioApp::apply(const LivePlan& plan, const Graph& graph) {
             pushCameraParams(camera->as<CameraParams>());
         }
     }
-    // Drop models that the running graph no longer uses.
-    std::set<std::string> keep;
+    // Drop Gaussians that the running graph no longer uses. The scene files
+    // it uses stay loaded, so moving a scene does not read them again.
+    std::set<std::string> keepModels;
+    std::set<std::pair<std::string, bool>> keepScenes;
     for (int id : plan.nodes) {
         const Node* node = graph.findNode(id);
-        if (node->kind == NodeKind::Scene) {
-            if (auto resolved = resolveInputPath(node->as<SceneParams>().path)) {
-                keep.insert(resolved->string());
+        if (node->kind == NodeKind::UploadGaussians) {
+            const auto parts = gaussianParts(graph, id);
+            keepModels.insert(partsKey(parts));
+            for (const auto& part : parts) {
+                if (auto resolved = resolveInputPath(part.path)) {
+                    keepScenes.emplace(resolved->string(), part.flipY);
+                }
             }
         }
     }
-    std::erase_if(models_, [&](const auto& entry) { return !keep.contains(entry.first); });
+    std::erase_if(models_, [&](const auto& entry) { return !keepModels.contains(entry.first); });
+    std::erase_if(scenes_, [&](const auto& entry) { return !keepScenes.contains(entry.first); });
 
     setStatus(std::format("Compiled {} elements", compiled_.nodes.size()));
     return true;
@@ -695,6 +899,12 @@ void StudioApp::run() {
         return;
     }
 
+    runHostSteps_.clear();
+    hostLog_ = &runHostSteps_;
+    struct StopLogging {
+        std::vector<std::string>*& log;
+        ~StopLogging() { log = nullptr; }
+    } stopLogging{hostLog_};
     try {
         RunResult result = runGraph(engine_.getVulkanContext(), graph_, *plan_.run, runContext());
         previews_.clear();
@@ -717,8 +927,27 @@ void StudioApp::run() {
     }
 }
 
+void StudioApp::updateLiveValues() {
+    if (liveBindings_.empty() || !appliedPlan_) {
+        return;
+    }
+    // Live parameters are edited in the current graph; while it still
+    // compiles to the running pipelines, its values apply.
+    const bool current = plan_.live && !plan_.live->needsRebuildFrom(*appliedPlan_);
+    try {
+        applyBindings(current ? graph_ : appliedGraph_, liveBindings_, secondsSinceStart());
+    } catch (const std::exception&) {
+        // An input was disconnected; the plan reports it, and the values stay.
+    }
+}
+
+double StudioApp::secondsSinceStart() const {
+    return std::chrono::duration<double>(std::chrono::steady_clock::now() - start_).count();
+}
+
 void StudioApp::drawGui() {
     syncCamera();
+    updateLiveValues();
     if (runRequested_) {
         run();
     }
@@ -762,6 +991,12 @@ void StudioApp::drawMenuBar() {
             }
             if (ImGui::MenuItem("Splatting autoencoder (offscreen, run)")) {
                 loadExample(Example::SplatAutoencoder);
+            }
+            if (ImGui::MenuItem("Raccoons and lantern (live)")) {
+                loadExample(Example::CombinedScenes);
+            }
+            if (ImGui::MenuItem("Raccoons and swinging lantern (live, GPU)")) {
+                loadExample(Example::AnimatedScenes);
             }
             ImGui::EndMenu();
         }
@@ -846,15 +1081,19 @@ void StudioApp::drawOverview() {
             const Node& node = *appliedGraph_.findNode(id);
             if (node.kind == NodeKind::GaussianSplatting) {
                 ImGui::Text("Backend: %s", std::string(backendName(node.as<SplattingParams>().backend)).c_str());
-            } else if (node.kind == NodeKind::Scene) {
-                if (auto resolved = resolveInputPath(node.as<SceneParams>().path)) {
-                    if (auto it = models_.find(resolved->string()); it != models_.end()) {
-                        ImGui::Text("Gaussians: %u", it->second->count());
-                    }
+            } else if (node.kind == NodeKind::UploadGaussians) {
+                if (auto model = uploadedGaussians(appliedGraph_, id)) {
+                    ImGui::Text("%s: %u Gaussians", node.title.c_str(), model->count());
                 }
             }
         }
         ImGui::Text("Compiled elements: %zu", compiled_.nodes.size());
+        if (!liveHostSteps_.empty() && ImGui::TreeNode("CPU steps of the last live build")) {
+            for (const auto& step : liveHostSteps_) {
+                ImGui::BulletText("%s", step.c_str());
+            }
+            ImGui::TreePop();
+        }
     } else {
         ImGui::TextDisabled("No graph compiled");
     }
@@ -964,6 +1203,12 @@ void StudioApp::drawRunControls() {
         for (const auto& file : lastRun_->written) {
             ImGui::TextDisabled("wrote %s", file.string().c_str());
         }
+        if (!runHostSteps_.empty() && ImGui::TreeNode("CPU steps of the last run")) {
+            for (const auto& step : runHostSteps_) {
+                ImGui::BulletText("%s", step.c_str());
+            }
+            ImGui::TreePop();
+        }
     }
 }
 
@@ -1068,7 +1313,23 @@ void StudioApp::drawAuthoringEditor() {
         }
     }
 
+    // Nodes that become elements of the klartraum compute graphs.
+    std::set<int> liveGraphNodes;
+    std::set<int> runGraphNodes;
+    auto inGraph = [&](int id) {
+        return kindInfo(graph_.findNode(id)->kind).implementation == Implementation::ComputeGraph;
+    };
+    if (plan_.live) {
+        std::copy_if(plan_.live->nodes.begin(), plan_.live->nodes.end(),
+                     std::inserter(liveGraphNodes, liveGraphNodes.end()), inGraph);
+    }
+    if (plan_.run) {
+        std::copy_if(plan_.run->nodes.begin(), plan_.run->nodes.end(),
+                     std::inserter(runGraphNodes, runGraphNodes.end()), inGraph);
+    }
+
     drawEditorToolbar(false);
+    drawLegend();
     ed::SetCurrentEditor(authoringEditor_);
     ed::Begin("authoring");
 
@@ -1106,6 +1367,7 @@ void StudioApp::drawAuthoringEditor() {
         const ImVec2 headerMin = ImGui::GetItemRectMin();
         const ImVec2 headerMax = ImGui::GetItemRectMax();
         ImGui::Dummy(ImVec2(0.0f, 2.0f));
+        executionBadge(kindInfo(node.kind));
 
         // A short summary; the parameters are edited in the inspector.
         ImGui::PushStyleColor(ImGuiCol_Text, bodyText);
@@ -1113,13 +1375,49 @@ void StudioApp::drawAuthoringEditor() {
         case NodeKind::Scene: {
             const auto& path = node.as<SceneParams>().path;
             ImGui::TextUnformatted(path.empty() ? "(no file)" : std::filesystem::path(path).filename().string().c_str());
-            if (auto resolved = resolveInputPath(path)) {
-                if (auto it = models_.find(resolved->string()); it != models_.end()) {
-                    ImGui::Text("%u Gaussians", it->second->count());
-                }
+            if (auto count = sceneCount(node.as<SceneParams>())) {
+                ImGui::Text("%zu Gaussians", *count);
             }
             break;
         }
+        case NodeKind::TransformGaussians: {
+            const auto& p = node.as<TransformGaussiansParams>();
+            ImGui::Text("move %.2f %.2f %.2f", p.translation[0], p.translation[1], p.translation[2]);
+            ImGui::Text("turn %.0f %.0f %.0f", p.rotation[0], p.rotation[1], p.rotation[2]);
+            ImGui::Text("scale %.2f", p.scale);
+            break;
+        }
+        case NodeKind::MergeGaussians:
+        case NodeKind::TransformGaussiansGpu:
+        case NodeKind::MergeGaussiansGpu:
+            break;
+        case NodeKind::Number:
+        case NodeKind::Time:
+        case NodeKind::Sine:
+        case NodeKind::UploadNumber:
+            try {
+                const int source = node.kind == NodeKind::UploadNumber
+                                       ? (graph_.inputLink(node.id, 0) ? graph_.inputLink(node.id, 0)->fromNode : -1)
+                                       : node.id;
+                if (source >= 0) {
+                    ImGui::Text("= %.3f", evaluateNumber(graph_, source, secondsSinceStart()));
+                }
+            } catch (const std::exception&) {
+                ImGui::TextDisabled("(input missing)");
+            }
+            break;
+        case NodeKind::MakeTransform: {
+            const auto& p = node.as<MakeTransformParams>();
+            ImGui::Text("move %.2f %.2f %.2f", p.translation[0], p.translation[1], p.translation[2]);
+            ImGui::Text("turn %.0f %.0f %.0f", p.rotation[0], p.rotation[1], p.rotation[2]);
+            ImGui::Text("scale %.2f", p.scale);
+            break;
+        }
+        case NodeKind::UploadGaussians:
+            if (auto model = uploadedGaussians(graph_, node.id)) {
+                ImGui::Text("%u Gaussians, %.0f MB", model->count(), gaussianBytes(model->count()) / 1e6);
+            }
+            break;
         case NodeKind::Camera: {
             const auto& p = node.as<CameraParams>();
             ImGui::Text("az %.2f  el %.2f", p.azimuth, p.elevation);
@@ -1231,6 +1529,7 @@ void StudioApp::drawAuthoringEditor() {
         ImGui::PopID();
         ed::EndNode();
         drawNodeHeader(nodeId, headerMin, headerMax, kindColor(node.kind));
+        drawGraphRings(nodeId, liveGraphNodes.contains(node.id), runGraphNodes.contains(node.id));
 
         if (unused) {
             ImGui::PopStyleVar();
@@ -1313,7 +1612,7 @@ void StudioApp::drawAuthoringEditor() {
                 group = info.group;
                 ImGui::SeparatorText(std::string(group).c_str());
             }
-            if (ImGui::MenuItem(std::string(info.title).c_str())) {
+            if (ImGui::MenuItem(std::string(info.title).c_str(), std::string(siteName(info.site)).c_str())) {
                 const int id = graph_.addNode(info.kind, newNodePosition_);
                 if (info.kind == NodeKind::Scene) {
                     graph_.findNode(id)->as<SceneParams>().path = defaultScenePath();
@@ -1326,7 +1625,10 @@ void StudioApp::drawAuthoringEditor() {
                 modified_ = true;
             }
             if (ImGui::IsItemHovered()) {
-                ImGui::SetTooltip("%s", std::string(info.description).c_str());
+                ImGui::SetTooltip("%s\n%s, %s: %s", std::string(info.description).c_str(),
+                                  std::string(siteName(info.site)).c_str(),
+                                  std::string(implementationName(info.implementation)).c_str(),
+                                  std::string(info.implementedBy).c_str());
             }
         }
         ImGui::EndPopup();
@@ -1410,6 +1712,44 @@ void StudioApp::handleFit(int& pendingFrames) {
     if (pendingFrames > 0 && --pendingFrames == 0) {
         ed::NavigateToContent(0.0f);
     }
+}
+
+void StudioApp::drawGraphRings(ed::NodeId node, bool live, bool run) {
+    if (!live && !run) {
+        return;
+    }
+    const ImVec2 pos = ed::GetNodePosition(node);
+    const ImVec2 size = ed::GetNodeSize(node);
+    if (pos.x == FLT_MAX || size.x <= 0.0f) {
+        return;
+    }
+    const float rounding = ed::GetStyle().NodeRounding;
+    ImDrawList* drawList = ed::GetNodeBackgroundDrawList(node);
+    float pad = 5.0f;
+    for (const auto& [member, color] : {std::pair{live, kLiveGraphColor}, std::pair{run, kRunGraphColor}}) {
+        if (member) {
+            drawList->AddRect(ImVec2(pos.x - pad, pos.y - pad), ImVec2(pos.x + size.x + pad, pos.y + size.y + pad),
+                              color, rounding + pad, 0, 2.5f);
+            pad += 5.0f;
+        }
+    }
+}
+
+void StudioApp::drawLegend() {
+    auto chip = [](ImU32 color, const char* text) {
+        ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(color), "%s", text);
+        ImGui::SameLine();
+    };
+    ImGui::TextDisabled("Runs on:");
+    ImGui::SameLine();
+    for (ExecutionSite site : {ExecutionSite::Gpu, ExecutionSite::Cpu, ExecutionSite::Upload, ExecutionSite::Readback}) {
+        chip(siteColor(site), std::string(siteName(site)).c_str());
+    }
+    ImGui::TextDisabled(" Made of: klartraum graph elements | a klartraum function | studio code.  Ring:");
+    ImGui::SameLine();
+    chip(kLiveGraphColor, "live graph");
+    chip(kRunGraphColor, "run graph");
+    ImGui::NewLine();
 }
 
 void StudioApp::drawNodeHeader(ed::NodeId node, ImVec2 headerMin, ImVec2 headerMax, ImU32 color) {
@@ -1526,6 +1866,8 @@ void StudioApp::drawCompiledEditor() {
         const bool highlighted = highlightOwner >= 0 && node.owner == highlightOwner;
         if (highlighted) {
             ed::PushStyleColor(ed::StyleColor_NodeBorder, ImVec4(1.0f, 0.84f, 0.35f, 1.0f));
+        } else if (node.inserted) {
+            ed::PushStyleColor(ed::StyleColor_NodeBorder, ImGui::ColorConvertU32ToFloat4(kStudioAddedColor));
         }
 
         ed::BeginNode(nodeId);
@@ -1539,6 +1881,9 @@ void StudioApp::drawCompiledEditor() {
         const ImVec2 headerMax = ImGui::GetItemRectMax();
         ImGui::Dummy(ImVec2(0.0f, 2.0f));
 
+        if (node.inserted) {
+            ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(kStudioAddedColor), "added by studio");
+        }
         ImGui::TextDisabled("%s", node.type.c_str());
         if (!node.outputs.empty()) {
             // The single output sits at the right of the type row.
@@ -1577,7 +1922,7 @@ void StudioApp::drawCompiledEditor() {
         ImGui::PopID();
         ed::EndNode();
         drawNodeHeader(nodeId, headerMin, headerMax, categoryColor(node.category));
-        if (highlighted) {
+        if (highlighted || node.inserted) {
             ed::PopStyleColor();
         }
     }
@@ -1653,6 +1998,7 @@ void StudioApp::drawNodeInspector(Node& node) {
     if (inputText("Title", node.title)) {
         modified_ = true;
     }
+    drawExecutionInfo(node);
 
     // Parameters that need new pipelines touch the graph's revision; the
     // compiler decides whether a rebuild is really needed.
@@ -1665,24 +2011,106 @@ void StudioApp::drawNodeInspector(Node& node) {
         ImGui::SeparatorText("Scene");
         changed |= inputText("File", p.path);
         if (ImGui::BeginCombo("Samples", "choose...")) {
-            for (const char* sample : {"3rdparty/spz/samples/racoonfamily.spz", "3rdparty/spz/samples/hornedlizard.spz"}) {
+            for (const char* sample : {"3rdparty/spz/samples/racoonfamily.spz", "3rdparty/spz/samples/hornedlizard.spz",
+                                       kSampleLantern}) {
                 if (ImGui::Selectable(std::filesystem::path(sample).filename().string().c_str())) {
                     p.path = sample;
+                    // The lantern is a Nerfstudio export, upside down otherwise.
+                    p.flipY = std::string_view(sample) == kSampleLantern;
                     changed = true;
                 }
             }
             ImGui::EndCombo();
         }
+        changed |= ImGui::Checkbox("Flip Y", &p.flipY);
+        ImGui::SameLine();
+        ImGui::TextDisabled("(mirror across the Y axis, e.g. for Nerfstudio exports)");
         if (auto resolved = resolveInputPath(p.path)) {
             ImGui::TextDisabled("%s", resolved->string().c_str());
-            if (auto it = models_.find(resolved->string()); it != models_.end()) {
-                ImGui::Text("%u Gaussians loaded", it->second->count());
+            if (auto count = sceneCount(p)) {
+                ImGui::Text("%zu Gaussians loaded", *count);
             }
         } else if (!p.path.empty()) {
             ImGui::TextColored(severityColor(Severity::Error), "File not found");
         }
         break;
     }
+    case NodeKind::TransformGaussians: {
+        auto& p = node.as<TransformGaussiansParams>();
+        ImGui::SeparatorText("Transform");
+        changed |= ImGui::DragFloat3("Translation", p.translation.data(), 0.01f);
+        changed |= ImGui::DragFloat3("Rotation (deg)", p.rotation.data(), 0.5f, -360.0f, 360.0f, "%.1f");
+        changed |= ImGui::DragFloat("Scale", &p.scale, 0.005f, 0.001f, 1000.0f, "%.3f", ImGuiSliderFlags_Logarithmic);
+        if (ImGui::Button("Reset")) {
+            p = TransformGaussiansParams{};
+            changed = true;
+        }
+        ImGui::TextWrapped("Scales about the origin, rotates about X, then Y, then Z, then moves. Orientations and "
+                           "view-dependent colours turn along. Changes rebuild the Gaussians once you let go.");
+        break;
+    }
+    case NodeKind::Number: {
+        auto& p = node.as<NumberParams>();
+        ImGui::SeparatorText("Number");
+        changed |= ImGui::DragFloat("Value", &p.value, 0.01f);
+        break;
+    }
+    case NodeKind::Time: {
+        auto& p = node.as<TimeParams>();
+        ImGui::SeparatorText("Time");
+        changed |= ImGui::DragFloat("Speed", &p.speed, 0.01f);
+        ImGui::Text("t = %.2f s", secondsSinceStart() * p.speed);
+        ImGui::TextDisabled("Seconds since the studio started, times the speed.");
+        break;
+    }
+    case NodeKind::Sine: {
+        auto& p = node.as<SineParams>();
+        ImGui::SeparatorText("amplitude * sin(frequency * 2 pi * x + phase) + offset");
+        changed |= ImGui::DragFloat("Amplitude", &p.amplitude, 0.1f);
+        changed |= ImGui::DragFloat("Frequency", &p.frequency, 0.01f);
+        changed |= ImGui::DragFloat("Phase (deg)", &p.phase, 1.0f);
+        changed |= ImGui::DragFloat("Offset", &p.offset, 0.1f);
+        break;
+    }
+    case NodeKind::UploadNumber:
+        ImGui::SeparatorText("Upload");
+        ImGui::TextWrapped("Copies the CPU number into a klartraum::HostFloat buffer before every frame, so "
+                           "GPU nodes read the current value without the graph being rebuilt.");
+        break;
+    case NodeKind::MakeTransform: {
+        auto& p = node.as<MakeTransformParams>();
+        ImGui::SeparatorText("Transform (GPU)");
+        changed |= ImGui::DragFloat3("Translation", p.translation.data(), 0.01f);
+        changed |= ImGui::DragFloat3("Pitch Yaw Roll", p.rotation.data(), 0.5f, -360.0f, 360.0f, "%.1f");
+        changed |= ImGui::DragFloat("Scale", &p.scale, 0.005f, 0.001f, 1000.0f, "%.3f", ImGuiSliderFlags_Logarithmic);
+        std::string connected;
+        for (int i = 0; i < 7; ++i) {
+            if (graph_.inputLink(node.id, i)) {
+                connected += (connected.empty() ? "" : ", ") + std::string(kindInfo(node.kind).inputs[i].name);
+            }
+        }
+        if (!connected.empty()) {
+            ImGui::TextWrapped("Taken from the inputs instead: %s.", connected.c_str());
+        }
+        ImGui::TextWrapped("Values apply while the graph runs, without rebuilding it. Rotates about X (pitch), "
+                           "then Y (yaw), then Z (roll); scales and rotates about the origin, then moves.");
+        break;
+    }
+    case NodeKind::TransformGaussiansGpu:
+        ImGui::SeparatorText("Transform (GPU)");
+        ImGui::TextWrapped("Writes moved copies of the Gaussians every frame: positions, orientations, sizes and "
+                           "view-dependent colour follow the transform.");
+        break;
+    case NodeKind::MergeGaussiansGpu:
+        ImGui::SeparatorText("Merge (GPU)");
+        ImGui::TextWrapped("Writes A's and B's Gaussians into one set every frame, so one Gaussian Splatting "
+                           "renders and depth-sorts them together.");
+        break;
+    case NodeKind::MergeGaussians:
+        ImGui::SeparatorText("Merge");
+        ImGui::TextWrapped("Combines the Gaussians of A and B into one set that a single Gaussian Splatting "
+                           "renders, so the two sort correctly against each other. Chain Merge nodes for more.");
+        break;
     case NodeKind::Camera: {
         auto& p = node.as<CameraParams>();
         const bool active = appliedPlan_ && appliedPlan_->cameraNode == node.id;
@@ -1924,6 +2352,11 @@ void StudioApp::drawElementInspector(const ElementNode& element) {
     ImGui::TextUnformatted(element.label().c_str());
     ImGui::PopStyleColor();
     ImGui::TextDisabled("Compiled klartraum element (read-only)");
+    if (element.inserted) {
+        ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(kStudioAddedColor), "Added by the studio");
+        ImGui::TextWrapped("No node asks for this element directly; the studio adds it to connect nodes, e.g. a "
+                           "layout transition or Present's resample into the swapchain.");
+    }
     ImGui::Separator();
     ImGui::Text("Type: %s", element.type.c_str());
     ImGui::Text("Name: %s", element.name.empty() ? "(unnamed)" : element.name.c_str());

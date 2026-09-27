@@ -20,17 +20,47 @@ Nodes stand for klartraum's public building blocks:
 
 | Group | Nodes |
 |---|---|
-| Sources | *Scene* (`.spz` Gaussians), *Image File* (PNG, JPEG, … resized to W×H, as a 1×3×H×W tensor) |
+| Sources | *Scene* (`.spz` Gaussians into CPU memory, optionally mirrored across Y for Nerfstudio exports), *Image File* (PNG, JPEG, … resized to W×H, as a 1×3×H×W tensor) |
+| Gaussians (CPU) | *Transform* (scale, rotate about X/Y/Z, translate; `klartraum::transformGaussians`, which turns orientations and view-dependent colour along), *Merge* (two sets of Gaussians into one, rendered and sorted together), *Upload Gaussians* (into the GPU buffers of a `klartraum::GaussianDataStandard`) |
+| Gaussians (GPU) | *Make Transform* (a transform buffer from x, y, z, pitch, yaw, roll and scale; unconnected inputs take the node's values, which apply without rebuilding; `klartraum::TransformBuffer`), *Transform (GPU)* (`klartraum::GaussianTransform`), *Merge (GPU)* (`klartraum::GaussianMerge`), all running every frame |
+| Numbers (CPU) | *Number*, *Time* (seconds since start), *Sine* (amplitude · sin(frequency · 2π · x + phase) + offset), evaluated by the studio every frame; *Upload Number* (`klartraum::HostFloat`, copied into a GPU buffer before every frame) |
 | Rendering | *Orbit Camera*, *Swapchain Target*, *Offscreen Target* (W×H), *Gaussian Splatting* (compute or raster backend, all `GsplatConfig` settings) |
 | Compute | *Image to Tensor* (image → 1×3×H×W tensor), *Tensor to Image* (1×3×H×W tensor → H×W image), *Resample* (image → W×H image, nearest or bilinear; `klartraum::ImageResample`), *ONNX Model* (`klartraum::OnnxNetwork`; Conv, ConvTranspose, Relu, Reshape, Transpose) |
 | Outputs | *Present* (live; images other than a swapchain rendering are stretched to the window), *Preview* and *Image File Writer* (run; they take an image tensor or an image) |
 
-Pins are typed (Gaussians, Camera, Image, Tensor), and the graph is validated
+Pins are typed (Gaussians on the CPU, Gaussians on the GPU, Camera, Image,
+Tensor), and the graph is validated
 as you edit it. The checks cover missing inputs and files, Run reading the
 window's swapchain images (render into an *Offscreen Target* for it), tensor
 shapes propagated through ONNX models
 (the model's declared input vs. what it gets), unsupported ONNX operators, and
 tensors that are not images feeding a Preview.
+
+### Where things run
+
+Not everything in a graph runs on the GPU or belongs to klartraum's compute
+graph, and the editor shows which is which:
+
+- Under each node's title, a badge says **where** it runs (`GPU`, `CPU`,
+  `CPU->GPU` for uploads, `GPU->CPU` for readbacks) and **what it is made
+  of**: elements of the *klartraum graph*, a *klartraum function* the studio
+  calls on the CPU (e.g. `loadGaussiansSpz`, `transformGaussians`), or
+  *studio* code. The inspector's *Runs as* section adds when it runs and the
+  exact class or function; the add-node menu shows the same.
+- A **blue ring** marks nodes that become elements of the live klartraum
+  compute graph, a **green ring** those in the Run graph. Nodes without a ring
+  prepare data on the CPU or read results back.
+- Gaussians stay CPU data (grey links) until an *Upload Gaussians* node puts
+  them into GPU buffers (orange links); Gaussian Splatting only accepts
+  uploaded Gaussians. Graph files from before the Upload node existed get one
+  inserted when they are loaded.
+- In the compiled graph, elements the studio adds on its own (layout
+  transitions, Present's resample into the swapchain, conversions for
+  Preview/Writer inputs, the Run root) are outlined and labelled *added by
+  studio*.
+- The overview lists the CPU steps of the last live build and the last run
+  with their durations: decoding scene files, assembling, uploading, decoding
+  images.
 
 The **compiled graph** view is read-only. It shows the element DAG klartraum
 actually compiled, for the live graph or the last run, found by walking
@@ -73,6 +103,8 @@ support.
 ./build/klartraum_studio                                # live Gaussian-splatting graph
 ./build/klartraum_studio --example autoencoder          # image file -> encoder -> decoder -> preview + PNG
 ./build/klartraum_studio --example splat-autoencoder    # offscreen splatting -> encoder -> decoder -> preview
+./build/klartraum_studio --example combined-scenes      # raccoon scene + transformed lantern, merged and rendered live
+./build/klartraum_studio --example animated-scenes      # the same on the GPU, the lantern swinging over time
 ./build/klartraum_studio my.ktgraph.json                # open a saved graph
 ./build/klartraum_studio --backend compute --spz path/to/scene.spz --profile
 ```
@@ -83,6 +115,22 @@ klartraum's sample models (`data/onnx/simple_encoder.onnx`,
 `data/lantern.jpg`. Press **Run** (F5) to compute it. The preview shows the
 reconstructed image, and `autoencoded.png` is written next to the graph file
 (or into the working directory for an unsaved graph).
+
+The combined-scenes example merges the raccoon stump with klartraum's
+`data/lantern.spz`, loaded with *Flip Y* and placed on the lawn beside the
+stump by a *Transform* node. Transform and Merge work on the Gaussians before
+they are uploaded: each Gaussian Splatting input is assembled on the CPU from
+its scene files and uploaded once. Scene files stay loaded while the live
+graph uses them, so moving a scene only re-assembles and re-uploads.
+
+The animated-scenes example does the placing on the GPU instead: both scenes
+are uploaded as they are, a *Make Transform* holds the lantern's placement,
+and its yaw comes from *Time* → *Sine* → *Upload Number*. Every frame the
+studio evaluates the CPU numbers and sets the uploaded values; klartraum
+copies them into the frame's buffers right before submitting it, and the
+*Transform (GPU)* and *Merge (GPU)* passes write the Gaussians the splatting
+renders. Numbers, Time, Sine and Make Transform values apply without
+rebuilding the graph.
 
 The default graph uses the raster backend. The compute (tile-binned) backend
 shows the classic projection → binning → sort → gather → bounds → splat
@@ -168,3 +216,6 @@ tests run headlessly:
   *Resample*; a mismatch is reported when the live graph is built.
 - ONNX models need a single input. Only the operators klartraum implements are
   supported, and the editor lists any others.
+- *Transform* scales uniformly; Gaussians cannot be stretched along one axis.
+  Changing a transform rebuilds the live graph (on the CPU, once you let go of
+  the control), so it is not an animation tool.

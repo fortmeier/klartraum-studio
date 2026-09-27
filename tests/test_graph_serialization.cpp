@@ -6,6 +6,9 @@
  * - rejectsMalformedFiles: wrong format tags, unknown kinds, bad links and invalid JSON throw
  * - saveAndLoadFile: saveGraph/loadGraph write and read a file on disk
  * - roundTripComputeNodes: image file, offscreen, ONNX and writer parameters are saved and restored
+ * - roundTripGaussianNodes: scene flips, transforms and resample settings are saved and restored
+ * - oldFilesGetUploadNodes: a file linking a Scene straight into Gaussian Splatting loads with an
+ *   Upload Gaussians node in between
  **/
 
 #include <gtest/gtest.h>
@@ -153,4 +156,35 @@ TEST(GraphSerialization, roundTripComputeNodes) {
         EXPECT_TRUE(other->params == node.params) << node.title;
     }
     EXPECT_EQ(toJson(loaded), toJson(graph));
+}
+
+TEST(GraphSerialization, roundTripGaussianNodes) {
+    TransformGaussiansParams placement{{0.5f, -1.0f, 0.25f}, {10.0f, 20.0f, -30.0f}, 1.6f};
+    Graph graph = makeCombinedScenesGraph("scene.spz", SceneParams{"lantern.spz", true}, placement);
+    const int resample = graph.addNode(NodeKind::Resample);
+    graph.findNode(resample)->as<ResampleParams>() = {64, 32, ResampleFilter::Nearest};
+
+    const Graph loaded = fromJson(toJson(graph));
+    ASSERT_EQ(loaded.nodes().size(), graph.nodes().size());
+    for (const auto& node : graph.nodes()) {
+        const Node* other = loaded.findNode(node.id);
+        ASSERT_NE(other, nullptr);
+        EXPECT_TRUE(other->params == node.params) << node.title;
+    }
+    EXPECT_EQ(toJson(loaded), toJson(graph));
+}
+
+TEST(GraphSerialization, oldFilesGetUploadNodes) {
+    const std::string old = R"({"format": "klartraum-studio-graph", "version": 1,
+        "nodes": [{"id": 1, "kind": "scene", "params": {"path": "scene.spz"}, "position": [0, 0]},
+                  {"id": 2, "kind": "gaussian_splatting", "position": [400, 100]}],
+        "links": [{"from": [1, 0], "to": [2, 0]}]})";
+    const Graph graph = fromJson(old);
+    ASSERT_EQ(graph.nodes().size(), 3u);
+    const Node* upload = graph.inputNode(2, 0);
+    ASSERT_NE(upload, nullptr);
+    EXPECT_EQ(upload->kind, NodeKind::UploadGaussians);
+    EXPECT_EQ(upload->position, (Vec2{200.0f, 50.0f}));
+    ASSERT_NE(graph.inputNode(upload->id, 0), nullptr);
+    EXPECT_EQ(graph.inputNode(upload->id, 0)->id, 1);
 }

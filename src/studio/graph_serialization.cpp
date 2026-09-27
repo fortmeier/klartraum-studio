@@ -19,7 +19,15 @@ json paramsToJson(const NodeParams& params) {
         [](const auto& p) -> json {
             using T = std::decay_t<decltype(p)>;
             if constexpr (std::is_same_v<T, SceneParams>) {
-                return {{"path", p.path}};
+                return {{"path", p.path}, {"flipY", p.flipY}};
+            } else if constexpr (std::is_same_v<T, TransformGaussiansParams> || std::is_same_v<T, MakeTransformParams>) {
+                return {{"translation", p.translation}, {"rotation", p.rotation}, {"scale", p.scale}};
+            } else if constexpr (std::is_same_v<T, NumberParams>) {
+                return {{"value", p.value}};
+            } else if constexpr (std::is_same_v<T, TimeParams>) {
+                return {{"speed", p.speed}};
+            } else if constexpr (std::is_same_v<T, SineParams>) {
+                return {{"amplitude", p.amplitude}, {"frequency", p.frequency}, {"phase", p.phase}, {"offset", p.offset}};
             } else if constexpr (std::is_same_v<T, CameraParams>) {
                 return {{"azimuth", p.azimuth},
                         {"elevation", p.elevation},
@@ -65,6 +73,20 @@ NodeParams paramsFromJson(NodeKind kind, const json& j) {
             using T = std::decay_t<decltype(p)>;
             if constexpr (std::is_same_v<T, SceneParams>) {
                 read(j, "path", p.path);
+                read(j, "flipY", p.flipY);
+            } else if constexpr (std::is_same_v<T, TransformGaussiansParams> || std::is_same_v<T, MakeTransformParams>) {
+                read(j, "translation", p.translation);
+                read(j, "rotation", p.rotation);
+                read(j, "scale", p.scale);
+            } else if constexpr (std::is_same_v<T, NumberParams>) {
+                read(j, "value", p.value);
+            } else if constexpr (std::is_same_v<T, TimeParams>) {
+                read(j, "speed", p.speed);
+            } else if constexpr (std::is_same_v<T, SineParams>) {
+                read(j, "amplitude", p.amplitude);
+                read(j, "frequency", p.frequency);
+                read(j, "phase", p.phase);
+                read(j, "offset", p.offset);
             } else if constexpr (std::is_same_v<T, CameraParams>) {
                 read(j, "azimuth", p.azimuth);
                 read(j, "elevation", p.elevation);
@@ -114,6 +136,21 @@ NodeParams paramsFromJson(NodeKind kind, const json& j) {
         },
         params);
     return params;
+}
+
+// Whether `from` -> `to` would link CPU Gaussians into an input that wants
+// them on the GPU.
+bool linksCpuToGpuGaussians(const Graph& graph, const PinRef& from, const PinRef& to) {
+    const Node* source = graph.findNode(from.node);
+    const Node* target = graph.findNode(to.node);
+    if (!source || !target) {
+        return false;
+    }
+    const auto& outputs = kindInfo(source->kind).outputs;
+    const auto& inputs = kindInfo(target->kind).inputs;
+    return from.slot >= 0 && from.slot < static_cast<int>(outputs.size()) && to.slot >= 0 &&
+           to.slot < static_cast<int>(inputs.size()) && outputs[from.slot].type == PinType::GaussiansCpu &&
+           inputs[to.slot].type == PinType::GaussiansGpu;
 }
 
 } // namespace
@@ -173,7 +210,18 @@ Graph fromJson(const std::string& text) {
             const PinRef from{j.at("from").at(0).get<int>(), PinDirection::Output, j.at("from").at(1).get<int>()};
             const PinRef to{j.at("to").at(0).get<int>(), PinDirection::Input, j.at("to").at(1).get<int>()};
             if (auto error = graph.connect(from, to)) {
-                throw std::runtime_error("invalid link: " + *error);
+                if (!linksCpuToGpuGaussians(graph, from, to)) {
+                    throw std::runtime_error("invalid link: " + *error);
+                }
+                // Before Upload Gaussians existed, scenes fed Gaussian
+                // Splatting directly: put the upload in between.
+                const Node& source = *graph.findNode(from.node);
+                const Node& target = *graph.findNode(to.node);
+                const int upload = graph.addNode(
+                    NodeKind::UploadGaussians,
+                    {(source.position.x + target.position.x) * 0.5f, (source.position.y + target.position.y) * 0.5f});
+                graph.connect(from, {upload, PinDirection::Input, 0});
+                graph.connect({upload, PinDirection::Output, 0}, to);
             }
         }
     } catch (const json::exception& e) {

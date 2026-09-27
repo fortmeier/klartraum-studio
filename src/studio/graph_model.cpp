@@ -9,11 +9,30 @@ namespace kstudio {
 
 namespace {
 
-constexpr PinDesc kSceneOutputs[] = {{"Gaussians", PinType::Gaussians}};
+constexpr PinDesc kCpuGaussiansOutputs[] = {{"Gaussians", PinType::GaussiansCpu}};
+constexpr PinDesc kTransformInputs[] = {{"In", PinType::GaussiansCpu}};
+constexpr PinDesc kTransformOutputs[] = {{"Out", PinType::GaussiansCpu}};
+constexpr PinDesc kUploadInputs[] = {{"CPU", PinType::GaussiansCpu}};
+constexpr PinDesc kMergeInputs[] = {{"A", PinType::GaussiansCpu}, {"B", PinType::GaussiansCpu}};
+constexpr PinDesc kUploadOutputs[] = {{"GPU", PinType::GaussiansGpu}};
+constexpr PinDesc kGpuMergeInputs[] = {{"A", PinType::GaussiansGpu}, {"B", PinType::GaussiansGpu}};
+constexpr PinDesc kGpuTransformInputs[] = {{"Gaussians", PinType::GaussiansGpu}, {"Transform", PinType::TransformGpu}};
+constexpr PinDesc kGpuGaussiansOutputs[] = {{"Gaussians", PinType::GaussiansGpu}};
+constexpr PinDesc kNumberOutputs[] = {{"Value", PinType::NumberCpu}};
+constexpr PinDesc kSineInputs[] = {{"X", PinType::NumberCpu}};
+constexpr PinDesc kUploadNumberInputs[] = {{"CPU", PinType::NumberCpu}};
+constexpr PinDesc kUploadNumberOutputs[] = {{"GPU", PinType::NumberGpu}};
+constexpr PinDesc kMakeTransformInputs[] = {
+    {"X", PinType::NumberGpu, std::nullopt, true},     {"Y", PinType::NumberGpu, std::nullopt, true},
+    {"Z", PinType::NumberGpu, std::nullopt, true},     {"Pitch", PinType::NumberGpu, std::nullopt, true},
+    {"Yaw", PinType::NumberGpu, std::nullopt, true},   {"Roll", PinType::NumberGpu, std::nullopt, true},
+    {"Scale", PinType::NumberGpu, std::nullopt, true},
+};
+constexpr PinDesc kMakeTransformOutputs[] = {{"Transform", PinType::TransformGpu}};
 constexpr PinDesc kCameraOutputs[] = {{"Camera", PinType::Camera}};
 constexpr PinDesc kImageOutputs[] = {{"Image", PinType::Image}};
 constexpr PinDesc kSplattingInputs[] = {
-    {"Gaussians", PinType::Gaussians},
+    {"Gaussians", PinType::GaussiansGpu},
     {"Camera", PinType::Camera},
     {"Target", PinType::Image},
 };
@@ -22,34 +41,82 @@ constexpr PinDesc kTensorInputs[] = {{"Tensor", PinType::Tensor}};
 constexpr PinDesc kTensorOutputs[] = {{"Tensor", PinType::Tensor}};
 constexpr PinDesc kSinkInputs[] = {{"Tensor", PinType::Tensor, PinType::Image}};
 
+using enum ExecutionSite;
+using enum Implementation;
+
+constexpr std::string_view kOnBuild = "once, when the graph is built";
+constexpr std::string_view kEveryExecution = "every frame (live) or every run";
+
 const NodeKindInfo kKinds[] = {
-    {NodeKind::Scene, "scene", "Scene", "Sources", "Loads a 3D Gaussian model from an .spz file.", {}, kSceneOutputs},
+    {NodeKind::Scene, "scene", "Scene", "Sources", "Loads a 3D Gaussian model from an .spz file into CPU memory.", {},
+     kCpuGaussiansOutputs, Cpu, KlartraumFunction, "klartraum::loadGaussiansSpz", kOnBuild},
     {NodeKind::ImageFile, "image_file", "Image File", "Sources",
-     "Loads an image file (PNG, JPEG, ...) as a 1x3xHxW tensor with values in [0, 1].", {}, kTensorOutputs},
+     "Loads an image file (PNG, JPEG, ...) as a 1x3xHxW tensor with values in [0, 1].", {}, kTensorOutputs, Upload,
+     ComputeGraph, "decoded by the studio (stb_image), uploaded into a klartraum::TensorElement", kOnBuild},
+    {NodeKind::Number, "number", "Number", "Numbers (CPU)", "A constant number.", {}, kNumberOutputs, Cpu, Studio,
+     "evaluated by the studio (kstudio::evaluateNumber)", "every frame (live), once per run", true},
+    {NodeKind::Time, "time", "Time", "Numbers (CPU)", "Seconds since the studio started, times a speed.", {},
+     kNumberOutputs, Cpu, Studio, "evaluated by the studio (kstudio::evaluateNumber)",
+     "every frame (live), once per run", true},
+    {NodeKind::Sine, "sine", "Sine", "Numbers (CPU)",
+     "amplitude * sin(frequency * 2 pi * x + phase) + offset, e.g. to swing something back and forth over time.",
+     kSineInputs, kNumberOutputs, Cpu, Studio, "evaluated by the studio (kstudio::evaluateNumber)",
+     "every frame (live), once per run", true},
+    {NodeKind::UploadNumber, "upload_number", "Upload Number", "Numbers (CPU)",
+     "Copies a CPU number into a GPU buffer before every frame, without rebuilding the graph.", kUploadNumberInputs,
+     kUploadNumberOutputs, Upload, ComputeGraph, "klartraum::HostFloat", "every frame (live), once per run"},
+    {NodeKind::TransformGaussians, "transform_gaussians", "Transform (CPU)", "Gaussians (CPU)",
+     "Scales, rotates and moves Gaussians in CPU memory.", kTransformInputs, kTransformOutputs, Cpu,
+     KlartraumFunction, "klartraum::transformGaussians", kOnBuild},
+    {NodeKind::MergeGaussians, "merge_gaussians", "Merge (CPU)", "Gaussians (CPU)",
+     "Combines two sets of Gaussians in CPU memory into one.", kMergeInputs, kCpuGaussiansOutputs, Cpu, Studio,
+     "kstudio::assembleGaussians", kOnBuild},
+    {NodeKind::UploadGaussians, "upload_gaussians", "Upload Gaussians", "Gaussians (CPU)",
+     "Uploads Gaussians into the GPU buffers a Gaussian Splatting reads.", kUploadInputs, kUploadOutputs,
+     Upload, ComputeGraph, "klartraum::GaussianDataStandard (7 buffer elements)", kOnBuild},
+    {NodeKind::MakeTransform, "make_transform", "Make Transform", "Gaussians (GPU)",
+     "A GPU transform from translation, rotation (degrees about X, then Y, then Z) and scale. Inputs that are "
+     "not connected take the node's values, which apply without rebuilding.",
+     kMakeTransformInputs, kMakeTransformOutputs, Gpu, ComputeGraph, "klartraum::TransformBuffer",
+     kEveryExecution, true},
+    {NodeKind::TransformGaussiansGpu, "transform_gaussians_gpu", "Transform (GPU)", "Gaussians (GPU)",
+     "Moves Gaussians on the GPU by a transform, every frame.", kGpuTransformInputs, kGpuGaussiansOutputs, Gpu,
+     ComputeGraph, "klartraum::GaussianTransform", kEveryExecution},
+    {NodeKind::MergeGaussiansGpu, "merge_gaussians_gpu", "Merge (GPU)", "Gaussians (GPU)",
+     "Combines two sets of Gaussians on the GPU, every frame.", kGpuMergeInputs, kGpuGaussiansOutputs, Gpu,
+     ComputeGraph, "klartraum::GaussianMerge", kEveryExecution},
     {NodeKind::Camera, "camera", "Orbit Camera", "Rendering", "Camera uniform buffer driven by an orbit camera.", {},
-     kCameraOutputs},
+     kCameraOutputs, Upload, ComputeGraph, "klartraum::InterfaceCameraOrbit writing a klartraum::CameraUboType",
+     "every frame (live), once per run", true},
     {NodeKind::SwapchainTarget, "swapchain_target", "Swapchain Target", "Rendering",
-     "The window's swapchain images, rendered into directly.", {}, kImageOutputs},
+     "The window's swapchain images, rendered into directly.", {}, kImageOutputs, Gpu, ComputeGraph,
+     "klartraum::ImageViewSrc over the swapchain", "every frame (live only)"},
     {NodeKind::OffscreenTarget, "offscreen_target", "Offscreen Target", "Rendering",
-     "An image of fixed size to render into for further processing.", {}, kImageOutputs},
+     "An image of fixed size to render into for further processing.", {}, kImageOutputs, Gpu, ComputeGraph,
+     "klartraum::OffscreenTarget", kEveryExecution},
     {NodeKind::GaussianSplatting, "gaussian_splatting", "Gaussian Splatting", "Rendering",
-     "Renders the Gaussians into the target image (klartraum::createGaussianSplatting).", kSplattingInputs,
-     kImageOutputs},
+     "Renders the Gaussians into the target image.", kSplattingInputs, kImageOutputs, Gpu, ComputeGraph,
+     "klartraum::createGaussianSplatting", kEveryExecution},
     {NodeKind::ImageToTensor, "image_to_tensor", "Image to Tensor", "Compute",
-     "Converts a rendered offscreen image into a 1x3xHxW tensor.", kImageInputs, kTensorOutputs},
+     "Converts a rendered image into a 1x3xHxW tensor.", kImageInputs, kTensorOutputs, Gpu, ComputeGraph,
+     "klartraum::GeneralComputation (image_to_tensor.comp)", kEveryExecution},
     {NodeKind::TensorToImage, "tensor_to_image", "Tensor to Image", "Compute",
-     "Converts a 1x3xHxW tensor (values in [0, 1]) into an HxW image.", kTensorInputs, kImageOutputs},
-    {NodeKind::Resample, "resample", "Resample", "Compute",
-     "Resamples an image to a fixed size (klartraum::ImageResample).", kImageInputs, kImageOutputs},
-    {NodeKind::OnnxModel, "onnx_model", "ONNX Model", "Compute",
-     "Runs an ONNX network (klartraum::OnnxNetwork) on a tensor.", kTensorInputs, kTensorOutputs},
+     "Converts a 1x3xHxW tensor (values in [0, 1]) into an HxW image.", kTensorInputs, kImageOutputs, Gpu,
+     ComputeGraph, "klartraum::GeneralComputation (tensor_to_image.comp)", kEveryExecution},
+    {NodeKind::Resample, "resample", "Resample", "Compute", "Resamples an image to a fixed size.", kImageInputs,
+     kImageOutputs, Gpu, ComputeGraph, "klartraum::ImageResample", kEveryExecution},
+    {NodeKind::OnnxModel, "onnx_model", "ONNX Model", "Compute", "Runs an ONNX network on a tensor.", kTensorInputs,
+     kTensorOutputs, Gpu, ComputeGraph, "klartraum::OnnxNetwork", kEveryExecution},
     {NodeKind::Present, "present", "Present", "Outputs",
-     "Shows the image in the window every frame, stretched to the window's size.", kImageInputs, {}},
+     "Shows the image in the window every frame, stretched to the window's size.", kImageInputs, {}, Gpu,
+     ComputeGraph, "klartraum::ImageResample and ImageViewSrcTransition into the swapchain, added by the studio",
+     "every frame (live only)"},
     {NodeKind::Preview, "preview", "Preview", "Outputs",
-     "Shows a 1- or 3-channel image tensor, or an offscreen image, when the graph is run.", kSinkInputs, {}},
+     "Shows a 1- or 3-channel image tensor, or an image, when the graph is run.", kSinkInputs, {}, Readback, Studio,
+     "read back by the studio, shown as an ImGui texture", "every run"},
     {NodeKind::ImageFileWriter, "image_file_writer", "Image File Writer", "Outputs",
-     "Writes a 1- or 3-channel image tensor, or an offscreen image, to a PNG file when the graph is run.",
-     kSinkInputs, {}},
+     "Writes a 1- or 3-channel image tensor, or an image, to a PNG file when the graph is run.", kSinkInputs, {},
+     Readback, Studio, "read back by the studio, written with stb_image_write", "every run"},
 };
 
 } // namespace
@@ -78,7 +145,11 @@ std::optional<NodeKind> kindFromName(std::string_view name) {
 
 std::string_view pinTypeName(PinType type) {
     switch (type) {
-    case PinType::Gaussians: return "Gaussians";
+    case PinType::GaussiansCpu: return "Gaussians (CPU)";
+    case PinType::GaussiansGpu: return "Gaussians (GPU)";
+    case PinType::NumberCpu: return "Number (CPU)";
+    case PinType::NumberGpu: return "Number (GPU)";
+    case PinType::TransformGpu: return "Transform (GPU)";
     case PinType::Camera: return "Camera";
     case PinType::Image: return "Image";
     case PinType::Tensor: return "Tensor";
@@ -97,6 +168,16 @@ std::string_view filterName(ResampleFilter filter) {
 NodeParams defaultParams(NodeKind kind) {
     switch (kind) {
     case NodeKind::Scene: return SceneParams{};
+    case NodeKind::TransformGaussians: return TransformGaussiansParams{};
+    case NodeKind::MergeGaussians: return MergeGaussiansParams{};
+    case NodeKind::UploadGaussians: return UploadGaussiansParams{};
+    case NodeKind::Number: return NumberParams{};
+    case NodeKind::Time: return TimeParams{};
+    case NodeKind::Sine: return SineParams{};
+    case NodeKind::UploadNumber: return UploadNumberParams{};
+    case NodeKind::MakeTransform: return MakeTransformParams{};
+    case NodeKind::TransformGaussiansGpu: return TransformGaussiansGpuParams{};
+    case NodeKind::MergeGaussiansGpu: return MergeGaussiansGpuParams{};
     case NodeKind::Camera: return CameraParams{};
     case NodeKind::SwapchainTarget: return SwapchainTargetParams{};
     case NodeKind::GaussianSplatting: return SplattingParams{};
@@ -115,6 +196,25 @@ NodeParams defaultParams(NodeKind kind) {
 
 bool isSink(NodeKind kind) {
     return kind == NodeKind::Preview || kind == NodeKind::ImageFileWriter;
+}
+
+std::string_view siteName(ExecutionSite site) {
+    switch (site) {
+    case ExecutionSite::Gpu: return "GPU";
+    case ExecutionSite::Cpu: return "CPU";
+    case ExecutionSite::Upload: return "CPU->GPU";
+    case ExecutionSite::Readback: return "GPU->CPU";
+    }
+    return "?";
+}
+
+std::string_view implementationName(Implementation implementation) {
+    switch (implementation) {
+    case Implementation::ComputeGraph: return "klartraum graph";
+    case Implementation::KlartraumFunction: return "klartraum function";
+    case Implementation::Studio: return "studio";
+    }
+    return "?";
 }
 
 bool producesImage(NodeKind kind) {
@@ -202,8 +302,14 @@ std::optional<std::string> Graph::checkConnection(PinRef from, PinRef to) const 
         return "Unknown pin.";
     }
     if (!inputs[to.slot].accepts(outputs[from.slot].type)) {
-        return std::format("Cannot connect {} to {}.", pinTypeName(outputs[from.slot].type),
-                           pinTypeName(inputs[to.slot].type));
+        std::string message = std::format("Cannot connect {} to {}.", pinTypeName(outputs[from.slot].type),
+                                          pinTypeName(inputs[to.slot].type));
+        if (outputs[from.slot].type == PinType::GaussiansCpu && inputs[to.slot].type == PinType::GaussiansGpu) {
+            message += " Put an Upload Gaussians node in between.";
+        } else if (outputs[from.slot].type == PinType::NumberCpu && inputs[to.slot].type == PinType::NumberGpu) {
+            message += " Put an Upload Number node in between.";
+        }
+        return message;
     }
     if (from.node == to.node || reaches(to.node, from.node)) {
         return "This link would create a cycle.";
@@ -356,7 +462,7 @@ std::vector<Diagnostic> Graph::validate() const {
     for (const auto& node : nodes_) {
         const auto& inputs = kindInfo(node.kind).inputs;
         for (int slot = 0; slot < static_cast<int>(inputs.size()); ++slot) {
-            if (!inputLink(node.id, slot)) {
+            if (!inputs[slot].optional && !inputLink(node.id, slot)) {
                 report(Severity::Error, node.id, std::format("Input '{}' is not connected.", inputs[slot].name));
             }
         }
@@ -365,6 +471,16 @@ std::vector<Diagnostic> Graph::validate() const {
         case NodeKind::Scene:
             if (node.as<SceneParams>().path.empty()) {
                 report(Severity::Error, node.id, "No scene file is set.");
+            }
+            break;
+        case NodeKind::TransformGaussians:
+            if (!(node.as<TransformGaussiansParams>().scale > 0.0f)) {
+                report(Severity::Error, node.id, "Scale must be greater than zero.");
+            }
+            break;
+        case NodeKind::MakeTransform:
+            if (!inputLink(node.id, 6) && !(node.as<MakeTransformParams>().scale > 0.0f)) {
+                report(Severity::Error, node.id, "Scale must be greater than zero.");
             }
             break;
         case NodeKind::GaussianSplatting: {
@@ -476,18 +592,20 @@ void Graph::clear() {
 
 Graph makeGaussianSplattingGraph(const std::string& scenePath, SplattingBackend backend) {
     Graph graph;
-    const int scene = graph.addNode(NodeKind::Scene, {40.0f, 20.0f});
-    const int camera = graph.addNode(NodeKind::Camera, {40.0f, 170.0f});
-    const int target = graph.addNode(NodeKind::SwapchainTarget, {40.0f, 300.0f});
-    const int splatting = graph.addNode(NodeKind::GaussianSplatting, {340.0f, 130.0f});
-    const int present = graph.addNode(NodeKind::Present, {640.0f, 170.0f});
+    const int scene = graph.addNode(NodeKind::Scene, {0.0f, 0.0f});
+    const int upload = graph.addNode(NodeKind::UploadGaussians, {300.0f, 0.0f});
+    const int camera = graph.addNode(NodeKind::Camera, {300.0f, 170.0f});
+    const int target = graph.addNode(NodeKind::SwapchainTarget, {300.0f, 320.0f});
+    const int splatting = graph.addNode(NodeKind::GaussianSplatting, {600.0f, 130.0f});
+    const int present = graph.addNode(NodeKind::Present, {900.0f, 170.0f});
 
     graph.findNode(scene)->as<SceneParams>().path = scenePath;
     graph.findNode(splatting)->as<SplattingParams>().backend = backend;
 
     auto out = [](int node) { return PinRef{node, PinDirection::Output, 0}; };
     auto in = [](int node, int slot) { return PinRef{node, PinDirection::Input, slot}; };
-    graph.connect(out(scene), in(splatting, 0));
+    graph.connect(out(scene), in(upload, 0));
+    graph.connect(out(upload), in(splatting, 0));
     graph.connect(out(camera), in(splatting, 1));
     graph.connect(out(target), in(splatting, 2));
     graph.connect(out(splatting), in(present, 0));
@@ -524,17 +642,89 @@ Graph makeAutoencoderGraph(const std::string& imagePath, const std::string& enco
     return graph;
 }
 
+Graph makeCombinedScenesGraph(const std::string& scenePath, const SceneParams& movedScene,
+                              const TransformGaussiansParams& transform, const CameraParams& cameraParams) {
+    Graph graph;
+    const int scene = graph.addNode(NodeKind::Scene, {0.0f, 0.0f});
+    const int moved = graph.addNode(NodeKind::Scene, {0.0f, 160.0f});
+    const int move = graph.addNode(NodeKind::TransformGaussians, {300.0f, 160.0f});
+    const int merge = graph.addNode(NodeKind::MergeGaussians, {600.0f, 60.0f});
+    const int upload = graph.addNode(NodeKind::UploadGaussians, {900.0f, 60.0f});
+    const int camera = graph.addNode(NodeKind::Camera, {900.0f, 230.0f});
+    const int target = graph.addNode(NodeKind::SwapchainTarget, {900.0f, 380.0f});
+    const int splatting = graph.addNode(NodeKind::GaussianSplatting, {1200.0f, 170.0f});
+    const int present = graph.addNode(NodeKind::Present, {1500.0f, 210.0f});
+
+    graph.findNode(scene)->as<SceneParams>().path = scenePath;
+    graph.findNode(moved)->as<SceneParams>() = movedScene;
+    graph.findNode(move)->as<TransformGaussiansParams>() = transform;
+    graph.findNode(camera)->as<CameraParams>() = cameraParams;
+
+    graph.connect(out(scene), in(merge, 0));
+    graph.connect(out(moved), in(move));
+    graph.connect(out(move), in(merge, 1));
+    graph.connect(out(merge), in(upload));
+    graph.connect(out(upload), in(splatting, 0));
+    graph.connect(out(camera), in(splatting, 1));
+    graph.connect(out(target), in(splatting, 2));
+    graph.connect(out(splatting), in(present));
+    return graph;
+}
+
+Graph makeAnimatedScenesGraph(const std::string& scenePath, const SceneParams& movedScene,
+                              const MakeTransformParams& placement, const SineParams& swing,
+                              const CameraParams& cameraParams) {
+    Graph graph;
+    const int scene = graph.addNode(NodeKind::Scene, {0.0f, 0.0f});
+    const int moved = graph.addNode(NodeKind::Scene, {0.0f, 200.0f});
+    const int time = graph.addNode(NodeKind::Time, {0.0f, 420.0f});
+    const int upload = graph.addNode(NodeKind::UploadGaussians, {300.0f, 0.0f});
+    const int uploadMoved = graph.addNode(NodeKind::UploadGaussians, {300.0f, 200.0f});
+    const int sine = graph.addNode(NodeKind::Sine, {300.0f, 420.0f});
+    const int uploadYaw = graph.addNode(NodeKind::UploadNumber, {600.0f, 420.0f});
+    const int transform = graph.addNode(NodeKind::MakeTransform, {900.0f, 300.0f});
+    const int move = graph.addNode(NodeKind::TransformGaussiansGpu, {1200.0f, 200.0f});
+    const int merge = graph.addNode(NodeKind::MergeGaussiansGpu, {1500.0f, 60.0f});
+    const int camera = graph.addNode(NodeKind::Camera, {1500.0f, 260.0f});
+    const int target = graph.addNode(NodeKind::SwapchainTarget, {1500.0f, 440.0f});
+    const int splatting = graph.addNode(NodeKind::GaussianSplatting, {1800.0f, 200.0f});
+    const int present = graph.addNode(NodeKind::Present, {2100.0f, 240.0f});
+
+    graph.findNode(scene)->as<SceneParams>().path = scenePath;
+    graph.findNode(moved)->as<SceneParams>() = movedScene;
+    graph.findNode(sine)->as<SineParams>() = swing;
+    graph.findNode(sine)->title = "Swing";
+    graph.findNode(transform)->as<MakeTransformParams>() = placement;
+    graph.findNode(camera)->as<CameraParams>() = cameraParams;
+
+    graph.connect(out(scene), in(upload));
+    graph.connect(out(moved), in(uploadMoved));
+    graph.connect(out(time), in(sine));
+    graph.connect(out(sine), in(uploadYaw));
+    graph.connect(out(uploadYaw), in(transform, 4));  // yaw
+    graph.connect(out(uploadMoved), in(move, 0));
+    graph.connect(out(transform), in(move, 1));
+    graph.connect(out(upload), in(merge, 0));
+    graph.connect(out(move), in(merge, 1));
+    graph.connect(out(merge), in(splatting, 0));
+    graph.connect(out(camera), in(splatting, 1));
+    graph.connect(out(target), in(splatting, 2));
+    graph.connect(out(splatting), in(present));
+    return graph;
+}
+
 Graph makeSplatAutoencoderGraph(const std::string& scenePath, const std::string& encoderPath,
                                 const std::string& decoderPath) {
     Graph graph;
     const int scene = graph.addNode(NodeKind::Scene, {0.0f, 0.0f});
-    const int camera = graph.addNode(NodeKind::Camera, {0.0f, 150.0f});
-    const int target = graph.addNode(NodeKind::OffscreenTarget, {0.0f, 300.0f});
-    const int splatting = graph.addNode(NodeKind::GaussianSplatting, {310.0f, 120.0f});
-    const int toTensor = graph.addNode(NodeKind::ImageToTensor, {620.0f, 150.0f});
-    const int encoder = graph.addNode(NodeKind::OnnxModel, {930.0f, 150.0f});
-    const int decoder = graph.addNode(NodeKind::OnnxModel, {1240.0f, 150.0f});
-    const int preview = graph.addNode(NodeKind::Preview, {1550.0f, 100.0f});
+    const int upload = graph.addNode(NodeKind::UploadGaussians, {310.0f, 0.0f});
+    const int camera = graph.addNode(NodeKind::Camera, {310.0f, 150.0f});
+    const int target = graph.addNode(NodeKind::OffscreenTarget, {310.0f, 300.0f});
+    const int splatting = graph.addNode(NodeKind::GaussianSplatting, {620.0f, 120.0f});
+    const int toTensor = graph.addNode(NodeKind::ImageToTensor, {930.0f, 150.0f});
+    const int encoder = graph.addNode(NodeKind::OnnxModel, {1240.0f, 150.0f});
+    const int decoder = graph.addNode(NodeKind::OnnxModel, {1550.0f, 150.0f});
+    const int preview = graph.addNode(NodeKind::Preview, {1860.0f, 100.0f});
 
     graph.findNode(scene)->as<SceneParams>().path = scenePath;
     graph.findNode(encoder)->as<OnnxModelParams>().path = encoderPath;
@@ -542,7 +732,8 @@ Graph makeSplatAutoencoderGraph(const std::string& scenePath, const std::string&
     graph.findNode(decoder)->as<OnnxModelParams>().path = decoderPath;
     graph.findNode(decoder)->title = "Decoder";
 
-    graph.connect(out(scene), in(splatting, 0));
+    graph.connect(out(scene), in(upload));
+    graph.connect(out(upload), in(splatting, 0));
     graph.connect(out(camera), in(splatting, 1));
     graph.connect(out(target), in(splatting, 2));
     graph.connect(out(splatting), in(toTensor));

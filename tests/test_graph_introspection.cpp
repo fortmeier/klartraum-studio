@@ -187,7 +187,7 @@ TEST(GraphIntrospection, builtGraphMatchesCompiledElements) {
         engine.enableProfiling();
         auto model = std::make_shared<klartraum::GaussianDataStandard>(engine.getVulkanContext(), scene);
         RunContext context;
-        context.loadScene = [&](const std::string&) { return model; };
+        context.loadGaussians = [&](const std::vector<GaussianPart>&) { return model; };
 
         const BuiltGraph built = buildLiveGraph(engine, graph, plan, context);
         const ElementGraph introspected = introspect(built.root, built.owners, plan.presentNode);
@@ -212,7 +212,9 @@ TEST(GraphIntrospection, builtGraphMatchesCompiledElements) {
             return std::count_if(introspected.nodes.begin(), introspected.nodes.end(),
                                  [&](const ElementNode& n) { return n.owner == owner; });
         };
-        EXPECT_EQ(countOwned(findKind(graph, NodeKind::Scene)), 7);
+        EXPECT_EQ(countOwned(findKind(graph, NodeKind::UploadGaussians)), 7);
+        // The Scene node is CPU work: no elements.
+        EXPECT_EQ(countOwned(findKind(graph, NodeKind::Scene)), 0);
         EXPECT_EQ(countOwned(plan.cameraNode), 1);
         EXPECT_EQ(countOwned(findKind(graph, NodeKind::SwapchainTarget)), 1);
         // A rendering into the swapchain is presented as it is.

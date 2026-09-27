@@ -16,7 +16,7 @@ ElementCategory categorize(std::string_view type) {
     if (starts("BufferElement") || starts("TensorElement")) {
         return ElementCategory::Buffer;
     }
-    if (starts("UniformBufferObject")) {
+    if (starts("UniformBufferObject") || starts("HostValues")) {
         return ElementCategory::Uniform;
     }
     if (starts("ImageViewSrcTransition")) {
@@ -26,7 +26,8 @@ ElementCategory categorize(std::string_view type) {
         return ElementCategory::Image;
     }
     if (starts("GeneralComputation") || starts("BufferTransformation") || starts("CopyBuffer") ||
-        starts("OnnxNetwork") || starts("ImageResample")) {
+        starts("OnnxNetwork") || starts("ImageResample") || starts("TransformBuffer") ||
+        starts("GaussianTransform") || starts("GaussianMerge")) {
         return ElementCategory::Compute;
     }
     if (starts("RenderPass")) {
@@ -61,7 +62,8 @@ const ElementNode* ElementGraph::find(int id) const {
 }
 
 ElementGraph introspect(const std::shared_ptr<klartraum::ComputeGraphElement>& root,
-                        const std::map<const klartraum::ComputeGraphElement*, int>& owners, int defaultOwner) {
+                        const std::map<const klartraum::ComputeGraphElement*, int>& owners, int defaultOwner,
+                        const std::set<const klartraum::ComputeGraphElement*>& inserted) {
     ElementGraph graph;
     if (!root) {
         return graph;
@@ -89,6 +91,7 @@ ElementGraph introspect(const std::shared_ptr<klartraum::ComputeGraphElement>& r
         node.name = element->getName();
         node.type = element->getType();
         node.category = categorize(node.type);
+        node.inserted = inserted.contains(element.get());
         if (auto it = owners.find(element.get()); it != owners.end()) {
             node.owner = it->second;
         } else {

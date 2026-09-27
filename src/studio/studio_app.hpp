@@ -1,5 +1,6 @@
 #pragma once
 
+#include <chrono>
 #include <filesystem>
 #include <map>
 #include <memory>
@@ -28,7 +29,7 @@ class GaussianDataStandard;
 namespace kstudio {
 
 // The example graphs offered in File > Examples.
-enum class Example { GaussianSplatting, Autoencoder, SplatAutoencoder };
+enum class Example { GaussianSplatting, Autoencoder, SplatAutoencoder, CombinedScenes, AnimatedScenes };
 std::optional<Example> exampleFromName(std::string_view name);
 
 struct StudioOptions {
@@ -101,7 +102,12 @@ private:
     void installBuilder(const std::optional<LivePlan>& plan, const Graph& graph);
     // How the live graph and Run find their inputs.
     RunContext runContext();
-    std::shared_ptr<klartraum::GaussianDataStandard> loadModel(const std::string& path);
+    // A scene file's Gaussians, cached per file.
+    std::shared_ptr<const std::vector<klartraum::Gaussian3D>> loadScene(const std::string& path, bool flipY);
+    // Assembled and uploaded Gaussians, cached per parts.
+    std::shared_ptr<klartraum::GaussianDataStandard> loadGaussians(const std::vector<GaussianPart>& parts);
+    // How many Gaussians a loaded scene file has.
+    std::optional<size_t> sceneCount(const SceneParams& scene);
     void syncCamera();
     void pushCameraParams(const CameraParams& params);
     void refreshProfiling();
@@ -137,6 +143,13 @@ private:
     void deleteSelection();
     void drawEditorToolbar(bool compiled);
     void drawNodeHeader(ax::NodeEditor::NodeId node, ImVec2 headerMin, ImVec2 headerMax, ImU32 color);
+    // Rings around a node that becomes elements of the live and/or run graph.
+    void drawGraphRings(ax::NodeEditor::NodeId node, bool live, bool run);
+    void drawLegend();
+    // Inspector section: where and when a node runs, and what it is made of.
+    void drawExecutionInfo(const Node& node);
+    // The Gaussians an Upload Gaussians node of `graph` has uploaded, if any.
+    std::shared_ptr<klartraum::GaussianDataStandard> uploadedGaussians(const Graph& graph, int node) const;
     void handleFit(int& pendingFrames);
     void setStatus(std::string message, bool error = false);
     void updateWindowTitle();
@@ -159,9 +172,21 @@ private:
     std::optional<LivePlan> failedPlan_;
     std::string applyError_;
     std::string builderError_;
+    // GPU values the live graph reads, set from the graph before every frame.
+    std::vector<HostBinding> liveBindings_;
+    std::chrono::steady_clock::time_point start_ = std::chrono::steady_clock::now();
+    void updateLiveValues();
+    double secondsSinceStart() const;
     bool autoApply_ = true;
     bool applyRequested_ = false;
-    std::map<std::string, std::shared_ptr<klartraum::GaussianDataStandard>> models_;
+    std::map<std::string, std::shared_ptr<klartraum::GaussianDataStandard>> models_;  // by partsKey()
+    std::map<std::pair<std::string, bool>, std::shared_ptr<const std::vector<klartraum::Gaussian3D>>> scenes_;
+    // CPU work of the last live build and the last run, with durations; the
+    // log being written while one of them builds.
+    std::vector<std::string> liveHostSteps_;
+    std::vector<std::string> runHostSteps_;
+    std::vector<std::string>* hostLog_ = nullptr;
+    void logHostStep(const std::string& step, double milliseconds);
 
     // Run
     OnnxInfoCache onnxInfo_;
