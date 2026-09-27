@@ -18,12 +18,23 @@ namespace kstudio {
 //  - the run part, everything feeding a sink (Preview, Image File Writer),
 //    is executed once each time the user presses Run.
 
-enum class PinType { Gaussians, Camera, Image, Tensor };
+// Gaussians are CPU data until an Upload Gaussians node puts them into GPU
+// buffers; images, tensors and camera buffers live on the GPU.
+enum class PinType { GaussiansCpu, GaussiansGpu, Camera, Image, Tensor };
+
+// Where a node's work happens: on the GPU, on the CPU, or moving data between
+// them.
+enum class ExecutionSite { Gpu, Cpu, Upload, Readback };
+
+// What a node is: elements of the klartraum compute graph, a klartraum
+// function the studio calls on the CPU, or the studio's own code.
+enum class Implementation { ComputeGraph, KlartraumFunction, Studio };
 
 enum class NodeKind {
     Scene,
     TransformGaussians,
     MergeGaussians,
+    UploadGaussians,
     Camera,
     SwapchainTarget,
     GaussianSplatting,
@@ -61,6 +72,10 @@ struct TransformGaussiansParams {
 
 struct MergeGaussiansParams {
     bool operator==(const MergeGaussiansParams&) const = default;
+};
+
+struct UploadGaussiansParams {
+    bool operator==(const UploadGaussiansParams&) const = default;
 };
 
 // Orbit camera. These values are applied live and never require a rebuild.
@@ -147,7 +162,8 @@ struct ImageFileWriterParams {
     bool operator==(const ImageFileWriterParams&) const = default;
 };
 
-using NodeParams = std::variant<SceneParams, TransformGaussiansParams, MergeGaussiansParams, CameraParams, SwapchainTargetParams, SplattingParams, PresentParams,
+using NodeParams = std::variant<SceneParams, TransformGaussiansParams, MergeGaussiansParams, UploadGaussiansParams,
+                                CameraParams, SwapchainTargetParams, SplattingParams, PresentParams,
                                 OffscreenTargetParams, ImageFileParams, ImageToTensorParams, TensorToImageParams,
                                 ResampleParams, OnnxModelParams, PreviewParams, ImageFileWriterParams>;
 
@@ -168,6 +184,10 @@ struct NodeKindInfo {
     std::string_view description;
     std::span<const PinDesc> inputs;
     std::span<const PinDesc> outputs;
+    ExecutionSite site;
+    Implementation implementation;
+    std::string_view implementedBy;  // the klartraum class or function, or the studio code
+    std::string_view timing;         // when the work happens
 };
 
 const NodeKindInfo& kindInfo(NodeKind kind);
@@ -176,6 +196,8 @@ std::optional<NodeKind> kindFromName(std::string_view name);
 std::string_view pinTypeName(PinType type);
 std::string_view backendName(SplattingBackend backend);
 std::string_view filterName(ResampleFilter filter);
+std::string_view siteName(ExecutionSite site);
+std::string_view implementationName(Implementation implementation);
 NodeParams defaultParams(NodeKind kind);
 // Preview and Image File Writer: executed by Run.
 bool isSink(NodeKind kind);

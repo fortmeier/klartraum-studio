@@ -2,6 +2,7 @@
 
 #include <map>
 #include <memory>
+#include <set>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -29,6 +30,7 @@ struct ElementNode {
     std::string type;
     ElementCategory category = ElementCategory::Other;
     int owner = -1;      // authoring node this element was built for, or -1
+    bool inserted = false;  // added by the studio, not asked for by a node
     std::vector<int> inputs;   // element ids, in input-slot order
     std::vector<int> outputs;  // element ids consuming this one
 
@@ -55,9 +57,11 @@ struct ElementGraph {
 // `owners` maps elements to the authoring node they were built for. An
 // element not listed belongs to the owner of its first consumer, e.g. the
 // stages inside a Gaussian-splatting or ONNX group belong to the group's node;
-// elements with no owned consumer get `defaultOwner`.
+// elements with no owned consumer get `defaultOwner`. Elements in `inserted`
+// are marked as added by the studio.
 ElementGraph introspect(const std::shared_ptr<klartraum::ComputeGraphElement>& root,
                         const std::map<const klartraum::ComputeGraphElement*, int>& owners = {},
-                        int defaultOwner = -1);
+                        int defaultOwner = -1,
+                        const std::set<const klartraum::ComputeGraphElement*>& inserted = {});
 
 } // namespace kstudio

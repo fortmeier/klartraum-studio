@@ -55,8 +55,8 @@ TEST(GraphCompiler, planDefaultGraph) {
     EXPECT_EQ(p.cameraNode, findKind(graph, NodeKind::Camera));
     const std::vector<int> expected = {
         findKind(graph, NodeKind::Present), findKind(graph, NodeKind::GaussianSplatting),
-        findKind(graph, NodeKind::Scene), findKind(graph, NodeKind::Camera),
-        findKind(graph, NodeKind::SwapchainTarget)};
+        findKind(graph, NodeKind::UploadGaussians), findKind(graph, NodeKind::Scene),
+        findKind(graph, NodeKind::Camera), findKind(graph, NodeKind::SwapchainTarget)};
     EXPECT_EQ(p.nodes, expected);
     EXPECT_TRUE(p.contains(findKind(graph, NodeKind::Scene)));
 }
@@ -82,8 +82,8 @@ TEST(GraphCompiler, cameraChangesDoNotRebuild) {
     EXPECT_FALSE(after.needsRebuildFrom(before));
     // Corresponding nodes sit at the same positions.
     ASSERT_EQ(after.nodes.size(), before.nodes.size());
-    EXPECT_EQ(after.nodes[3], otherCamera);
-    EXPECT_EQ(before.nodes[3], findKind(graph, NodeKind::Camera));
+    EXPECT_EQ(after.nodes[4], otherCamera);
+    EXPECT_EQ(before.nodes[4], findKind(graph, NodeKind::Camera));
 }
 
 TEST(GraphCompiler, pipelineChangesRebuild) {
@@ -139,7 +139,7 @@ TEST(GraphCompiler, planProcessedLiveGraph) {
         EXPECT_NE(d.severity, Severity::Error) << d.message;
     }
     ASSERT_TRUE(plan.live.has_value());
-    EXPECT_EQ(plan.live->nodes.size(), 10u);
+    EXPECT_EQ(plan.live->nodes.size(), 11u);
     EXPECT_FALSE(plan.run.has_value());
 
     // Run cannot read the swapchain.

@@ -123,6 +123,21 @@ NodeParams paramsFromJson(NodeKind kind, const json& j) {
     return params;
 }
 
+// Whether `from` -> `to` would link CPU Gaussians into an input that wants
+// them on the GPU.
+bool linksCpuToGpuGaussians(const Graph& graph, const PinRef& from, const PinRef& to) {
+    const Node* source = graph.findNode(from.node);
+    const Node* target = graph.findNode(to.node);
+    if (!source || !target) {
+        return false;
+    }
+    const auto& outputs = kindInfo(source->kind).outputs;
+    const auto& inputs = kindInfo(target->kind).inputs;
+    return from.slot >= 0 && from.slot < static_cast<int>(outputs.size()) && to.slot >= 0 &&
+           to.slot < static_cast<int>(inputs.size()) && outputs[from.slot].type == PinType::GaussiansCpu &&
+           inputs[to.slot].type == PinType::GaussiansGpu;
+}
+
 } // namespace
 
 std::string paramsToString(const NodeParams& params) {
@@ -180,7 +195,18 @@ Graph fromJson(const std::string& text) {
             const PinRef from{j.at("from").at(0).get<int>(), PinDirection::Output, j.at("from").at(1).get<int>()};
             const PinRef to{j.at("to").at(0).get<int>(), PinDirection::Input, j.at("to").at(1).get<int>()};
             if (auto error = graph.connect(from, to)) {
-                throw std::runtime_error("invalid link: " + *error);
+                if (!linksCpuToGpuGaussians(graph, from, to)) {
+                    throw std::runtime_error("invalid link: " + *error);
+                }
+                // Before Upload Gaussians existed, scenes fed Gaussian
+                // Splatting directly: put the upload in between.
+                const Node& source = *graph.findNode(from.node);
+                const Node& target = *graph.findNode(to.node);
+                const int upload = graph.addNode(
+                    NodeKind::UploadGaussians,
+                    {(source.position.x + target.position.x) * 0.5f, (source.position.y + target.position.y) * 0.5f});
+                graph.connect(from, {upload, PinDirection::Input, 0});
+                graph.connect({upload, PinDirection::Output, 0}, to);
             }
         }
     } catch (const json::exception& e) {

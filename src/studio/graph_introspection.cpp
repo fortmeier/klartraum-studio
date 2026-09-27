@@ -61,7 +61,8 @@ const ElementNode* ElementGraph::find(int id) const {
 }
 
 ElementGraph introspect(const std::shared_ptr<klartraum::ComputeGraphElement>& root,
-                        const std::map<const klartraum::ComputeGraphElement*, int>& owners, int defaultOwner) {
+                        const std::map<const klartraum::ComputeGraphElement*, int>& owners, int defaultOwner,
+                        const std::set<const klartraum::ComputeGraphElement*>& inserted) {
     ElementGraph graph;
     if (!root) {
         return graph;
@@ -89,6 +90,7 @@ ElementGraph introspect(const std::shared_ptr<klartraum::ComputeGraphElement>& r
         node.name = element->getName();
         node.type = element->getType();
         node.category = categorize(node.type);
+        node.inserted = inserted.contains(element.get());
         if (auto it = owners.find(element.get()); it != owners.end()) {
             node.owner = it->second;
         } else {

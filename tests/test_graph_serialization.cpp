@@ -7,6 +7,8 @@
  * - saveAndLoadFile: saveGraph/loadGraph write and read a file on disk
  * - roundTripComputeNodes: image file, offscreen, ONNX and writer parameters are saved and restored
  * - roundTripGaussianNodes: scene flips, transforms and resample settings are saved and restored
+ * - oldFilesGetUploadNodes: a file linking a Scene straight into Gaussian Splatting loads with an
+ *   Upload Gaussians node in between
  **/
 
 #include <gtest/gtest.h>
@@ -170,4 +172,19 @@ TEST(GraphSerialization, roundTripGaussianNodes) {
         EXPECT_TRUE(other->params == node.params) << node.title;
     }
     EXPECT_EQ(toJson(loaded), toJson(graph));
+}
+
+TEST(GraphSerialization, oldFilesGetUploadNodes) {
+    const std::string old = R"({"format": "klartraum-studio-graph", "version": 1,
+        "nodes": [{"id": 1, "kind": "scene", "params": {"path": "scene.spz"}, "position": [0, 0]},
+                  {"id": 2, "kind": "gaussian_splatting", "position": [400, 100]}],
+        "links": [{"from": [1, 0], "to": [2, 0]}]})";
+    const Graph graph = fromJson(old);
+    ASSERT_EQ(graph.nodes().size(), 3u);
+    const Node* upload = graph.inputNode(2, 0);
+    ASSERT_NE(upload, nullptr);
+    EXPECT_EQ(upload->kind, NodeKind::UploadGaussians);
+    EXPECT_EQ(upload->position, (Vec2{200.0f, 50.0f}));
+    ASSERT_NE(graph.inputNode(upload->id, 0), nullptr);
+    EXPECT_EQ(graph.inputNode(upload->id, 0)->id, 1);
 }

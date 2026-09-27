@@ -13,7 +13,8 @@
  * - runResample: an image resampled to twice its size with nearest filtering repeats every
  *   pixel (GPU)
  * - liveProcessedGraph: the Gaussian splatting rendered into the swapchain, resampled, encoded,
- *   decoded and presented builds as the live graph and renders frames (GPU)
+ *   decoded and presented builds as the live graph and renders frames; Present's resample is
+ *   marked as added by the studio, the nodes' own elements are not (GPU)
  * - liveReportsShapeMismatch: a model fed with the window-sized rendering fails the live build
  *   with the model's title (GPU)
  * - liveCombinedScenes: two scenes, one of them transformed, merge into one Gaussian
@@ -333,7 +334,8 @@ TEST_F(GraphRunnerTest, liveProcessedGraph) {
 
     auto& engine = frontend->getKlartraumEngine();
     const BuiltGraph built = buildLiveGraph(engine, graph, *compiled.live, context);
-    const ElementGraph elements = introspect(built.root, built.owners, compiled.live->presentNode);
+    const ElementGraph elements =
+        introspect(built.root, built.owners, compiled.live->presentNode, built.inserted);
     for (int i = 0; i < 3; ++i) {
         engine.step();
     }
@@ -348,6 +350,16 @@ TEST_F(GraphRunnerTest, liveProcessedGraph) {
     EXPECT_TRUE(owns(NodeKind::Present, "ImageResample"));
     EXPECT_TRUE(owns(NodeKind::OnnxModel, "OnnxNetwork"));
     EXPECT_TRUE(owns(NodeKind::SwapchainTarget, "ImageViewSrc"));
+    // Present's resample into the swapchain is added by the studio; the
+    // Resample node's own is what the node stands for.
+    auto added = [&](NodeKind kind, std::string_view type) {
+        return std::any_of(elements.nodes.begin(), elements.nodes.end(), [&](const ElementNode& n) {
+            return n.owner == findKind(graph, kind) && n.type == type && n.inserted;
+        });
+    };
+    EXPECT_TRUE(added(NodeKind::Present, "ImageResample"));
+    EXPECT_FALSE(added(NodeKind::Resample, "ImageResample"));
+    EXPECT_FALSE(added(NodeKind::OnnxModel, "OnnxNetwork"));
     engine.clearComputeGraphs();
 }
 
@@ -394,11 +406,17 @@ TEST_F(GraphRunnerTest, liveCombinedScenes) {
     ASSERT_EQ(requested[0].size(), 2u);
     EXPECT_EQ(model->count(), klartraum::loadGaussiansSpz(kScene).size() +
                                   klartraum::loadGaussiansSpz(lantern, true).size());
-    // The scene buffers belong to the Merge node feeding the splatting.
+    // The scene buffers belong to the Upload Gaussians node; the CPU nodes
+    // before it build no elements.
     const ElementGraph elements = introspect(built.root, built.owners, compiled.live->presentNode);
-    EXPECT_EQ(std::count_if(elements.nodes.begin(), elements.nodes.end(),
-                            [&](const ElementNode& n) { return n.owner == findKind(graph, NodeKind::MergeGaussians); }),
-              7);
+    auto owned = [&](NodeKind kind) {
+        return std::count_if(elements.nodes.begin(), elements.nodes.end(),
+                             [&](const ElementNode& n) { return n.owner == findKind(graph, kind); });
+    };
+    EXPECT_EQ(owned(NodeKind::UploadGaussians), 7);
+    EXPECT_EQ(owned(NodeKind::MergeGaussians), 0);
+    EXPECT_EQ(owned(NodeKind::TransformGaussians), 0);
+    EXPECT_EQ(owned(NodeKind::Scene), 0);
     engine.clearComputeGraphs();
 }
 

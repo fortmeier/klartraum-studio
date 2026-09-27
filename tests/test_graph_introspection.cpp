@@ -212,7 +212,9 @@ TEST(GraphIntrospection, builtGraphMatchesCompiledElements) {
             return std::count_if(introspected.nodes.begin(), introspected.nodes.end(),
                                  [&](const ElementNode& n) { return n.owner == owner; });
         };
-        EXPECT_EQ(countOwned(findKind(graph, NodeKind::Scene)), 7);
+        EXPECT_EQ(countOwned(findKind(graph, NodeKind::UploadGaussians)), 7);
+        // The Scene node is CPU work: no elements.
+        EXPECT_EQ(countOwned(findKind(graph, NodeKind::Scene)), 0);
         EXPECT_EQ(countOwned(plan.cameraNode), 1);
         EXPECT_EQ(countOwned(findKind(graph, NodeKind::SwapchainTarget)), 1);
         // A rendering into the swapchain is presented as it is.

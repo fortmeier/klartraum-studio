@@ -4,6 +4,7 @@
 #include <functional>
 #include <map>
 #include <memory>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -32,6 +33,8 @@ struct RunContext {
     // Uploads (or returns cached) Gaussians assembled from scene files; see
     // gaussianParts().
     std::function<std::shared_ptr<klartraum::GaussianDataStandard>(const std::vector<GaussianPart>&)> loadGaussians;
+    // Optional: told about CPU work done while building, with its duration.
+    std::function<void(const std::string& step, double milliseconds)> hostStep;
     OnnxInfoProvider onnxInfo;
 };
 
@@ -55,6 +58,9 @@ struct BuiltGraph {
     // Maps elements to the authoring node they were built for (see
     // introspect()).
     std::map<const klartraum::ComputeGraphElement*, int> owners;
+    // Elements the studio added on its own, e.g. layout transitions and
+    // Present's resample into the swapchain.
+    std::set<const klartraum::ComputeGraphElement*> inserted;
 };
 
 // Builds the live plan's nodes for the engine's current swapchain, one path

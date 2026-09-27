@@ -20,18 +20,45 @@ Nodes stand for klartraum's public building blocks:
 
 | Group | Nodes |
 |---|---|
-| Sources | *Scene* (`.spz` Gaussians, optionally mirrored across Y for Nerfstudio exports), *Image File* (PNG, JPEG, … resized to W×H, as a 1×3×H×W tensor) |
-| Gaussians | *Transform* (scale, rotate about X/Y/Z, translate; `klartraum::transformGaussians`, which turns orientations and view-dependent colour along), *Merge* (two sets of Gaussians into one, rendered and sorted together) |
+| Sources | *Scene* (`.spz` Gaussians into CPU memory, optionally mirrored across Y for Nerfstudio exports), *Image File* (PNG, JPEG, … resized to W×H, as a 1×3×H×W tensor) |
+| Gaussians (CPU) | *Transform* (scale, rotate about X/Y/Z, translate; `klartraum::transformGaussians`, which turns orientations and view-dependent colour along), *Merge* (two sets of Gaussians into one, rendered and sorted together), *Upload Gaussians* (into the GPU buffers of a `klartraum::GaussianDataStandard`) |
 | Rendering | *Orbit Camera*, *Swapchain Target*, *Offscreen Target* (W×H), *Gaussian Splatting* (compute or raster backend, all `GsplatConfig` settings) |
 | Compute | *Image to Tensor* (image → 1×3×H×W tensor), *Tensor to Image* (1×3×H×W tensor → H×W image), *Resample* (image → W×H image, nearest or bilinear; `klartraum::ImageResample`), *ONNX Model* (`klartraum::OnnxNetwork`; Conv, ConvTranspose, Relu, Reshape, Transpose) |
 | Outputs | *Present* (live; images other than a swapchain rendering are stretched to the window), *Preview* and *Image File Writer* (run; they take an image tensor or an image) |
 
-Pins are typed (Gaussians, Camera, Image, Tensor), and the graph is validated
+Pins are typed (Gaussians on the CPU, Gaussians on the GPU, Camera, Image,
+Tensor), and the graph is validated
 as you edit it. The checks cover missing inputs and files, Run reading the
 window's swapchain images (render into an *Offscreen Target* for it), tensor
 shapes propagated through ONNX models
 (the model's declared input vs. what it gets), unsupported ONNX operators, and
 tensors that are not images feeding a Preview.
+
+### Where things run
+
+Not everything in a graph runs on the GPU or belongs to klartraum's compute
+graph, and the editor shows which is which:
+
+- Under each node's title, a badge says **where** it runs (`GPU`, `CPU`,
+  `CPU->GPU` for uploads, `GPU->CPU` for readbacks) and **what it is made
+  of**: elements of the *klartraum graph*, a *klartraum function* the studio
+  calls on the CPU (e.g. `loadGaussiansSpz`, `transformGaussians`), or
+  *studio* code. The inspector's *Runs as* section adds when it runs and the
+  exact class or function; the add-node menu shows the same.
+- A **blue ring** marks nodes that become elements of the live klartraum
+  compute graph, a **green ring** those in the Run graph. Nodes without a ring
+  prepare data on the CPU or read results back.
+- Gaussians stay CPU data (grey links) until an *Upload Gaussians* node puts
+  them into GPU buffers (orange links); Gaussian Splatting only accepts
+  uploaded Gaussians. Graph files from before the Upload node existed get one
+  inserted when they are loaded.
+- In the compiled graph, elements the studio adds on its own (layout
+  transitions, Present's resample into the swapchain, conversions for
+  Preview/Writer inputs, the Run root) are outlined and labelled *added by
+  studio*.
+- The overview lists the CPU steps of the last live build and the last run
+  with their durations: decoding scene files, assembling, uploading, decoding
+  images.
 
 The **compiled graph** view is read-only. It shows the element DAG klartraum
 actually compiled, for the live graph or the last run, found by walking

@@ -6,6 +6,10 @@
  * - connectAcceptsReversedPins: dragging from input to output yields the same link
  * - connectRejectsTypeMismatch: pins of different types cannot be linked
  * - connectReplacesInputLink: linking into an occupied input replaces the old link
+ * - gaussiansAreUploadedExplicitly: CPU Gaussians reach Gaussian Splatting only through Upload
+ *   Gaussians, and the error says so
+ * - everyKindSaysWhereItRuns: every node kind names where, when and by what it runs; only
+ *   klartraum graph nodes run on the GPU
  * - connectRejectsCycles: self links and links closing a cycle are rejected
  * - revisionTracksChanges: edits increase the graph revision
  * - defaultGraphIsValid: the Gaussian-splatting graph validates without errors
@@ -68,7 +72,7 @@ TEST(GraphModel, pinIdRoundTrip) {
 TEST(GraphModel, addAndRemoveNodes) {
     Graph graph;
     const int a = graph.addNode(NodeKind::Scene);
-    const int b = graph.addNode(NodeKind::GaussianSplatting);
+    const int b = graph.addNode(NodeKind::UploadGaussians);
     EXPECT_NE(a, b);
     ASSERT_FALSE(graph.connect(out(a), in(b, 0)).has_value());
     EXPECT_EQ(graph.links().size(), 1u);
@@ -115,11 +119,44 @@ TEST(GraphModel, connectReplacesInputLink) {
     Graph graph;
     const int sceneA = graph.addNode(NodeKind::Scene);
     const int sceneB = graph.addNode(NodeKind::Scene);
-    const int splatting = graph.addNode(NodeKind::GaussianSplatting);
-    ASSERT_FALSE(graph.connect(out(sceneA), in(splatting, 0)).has_value());
-    ASSERT_FALSE(graph.connect(out(sceneB), in(splatting, 0)).has_value());
+    const int upload = graph.addNode(NodeKind::UploadGaussians);
+    ASSERT_FALSE(graph.connect(out(sceneA), in(upload, 0)).has_value());
+    ASSERT_FALSE(graph.connect(out(sceneB), in(upload, 0)).has_value());
     EXPECT_EQ(graph.links().size(), 1u);
-    EXPECT_EQ(graph.inputLink(splatting, 0)->fromNode, sceneB);
+    EXPECT_EQ(graph.inputLink(upload, 0)->fromNode, sceneB);
+}
+
+TEST(GraphModel, gaussiansAreUploadedExplicitly) {
+    Graph graph;
+    const int scene = graph.addNode(NodeKind::Scene);
+    const int upload = graph.addNode(NodeKind::UploadGaussians);
+    const int splatting = graph.addNode(NodeKind::GaussianSplatting);
+    const auto error = graph.connect(out(scene), in(splatting, 0));
+    ASSERT_TRUE(error.has_value());
+    EXPECT_NE(error->find("Upload Gaussians"), std::string::npos) << *error;
+    EXPECT_FALSE(graph.connect(out(scene), in(upload, 0)).has_value());
+    EXPECT_FALSE(graph.connect(out(upload), in(splatting, 0)).has_value());
+    // GPU Gaussians cannot go back into CPU nodes.
+    const int transform = graph.addNode(NodeKind::TransformGaussians);
+    EXPECT_TRUE(graph.connect(out(upload), in(transform, 0)).has_value());
+}
+
+TEST(GraphModel, everyKindSaysWhereItRuns) {
+    for (const auto& info : allKinds()) {
+        SCOPED_TRACE(std::string(info.name));
+        EXPECT_FALSE(info.implementedBy.empty());
+        EXPECT_FALSE(info.timing.empty());
+        // Only nodes that become klartraum graph elements run on the GPU.
+        if (info.site == ExecutionSite::Gpu) {
+            EXPECT_EQ(info.implementation, Implementation::ComputeGraph);
+        }
+        if (info.implementation != Implementation::ComputeGraph) {
+            EXPECT_NE(info.site, ExecutionSite::Gpu);
+        }
+    }
+    EXPECT_EQ(kindInfo(NodeKind::TransformGaussians).site, ExecutionSite::Cpu);
+    EXPECT_EQ(kindInfo(NodeKind::UploadGaussians).site, ExecutionSite::Upload);
+    EXPECT_EQ(kindInfo(NodeKind::Preview).implementation, Implementation::Studio);
 }
 
 TEST(GraphModel, connectRejectsCycles) {
@@ -138,8 +175,8 @@ TEST(GraphModel, revisionTracksChanges) {
     const int scene = graph.addNode(NodeKind::Scene);
     EXPECT_GT(graph.revision(), revision);
     revision = graph.revision();
-    const int splatting = graph.addNode(NodeKind::GaussianSplatting);
-    graph.connect(out(scene), in(splatting, 0));
+    const int upload = graph.addNode(NodeKind::UploadGaussians);
+    graph.connect(out(scene), in(upload, 0));
     EXPECT_GT(graph.revision(), revision);
     revision = graph.revision();
     graph.removeLink(graph.links().front().id);
@@ -151,8 +188,8 @@ TEST(GraphModel, revisionTracksChanges) {
 
 TEST(GraphModel, defaultGraphIsValid) {
     const Graph graph = makeGaussianSplattingGraph("scene.spz");
-    EXPECT_EQ(graph.nodes().size(), 5u);
-    EXPECT_EQ(graph.links().size(), 4u);
+    EXPECT_EQ(graph.nodes().size(), 6u);
+    EXPECT_EQ(graph.links().size(), 5u);
     for (const auto& d : graph.validate()) {
         EXPECT_NE(d.severity, Severity::Error) << d.message;
     }

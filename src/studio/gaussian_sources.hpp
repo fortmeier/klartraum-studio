@@ -35,7 +35,8 @@ struct GaussianPart {
 
 // The scenes a Gaussians output carries, in merge order: Scene nodes are
 // parts, Transform nodes place their input's parts, Merge nodes concatenate
-// their inputs'. Expects the node's inputs to be connected.
+// their inputs' and Upload Gaussians nodes pass their input's on. Expects the
+// node's inputs to be connected.
 std::vector<GaussianPart> gaussianParts(const Graph& graph, int node);
 
 // Identifies the Gaussians the parts assemble into, e.g. for caching.

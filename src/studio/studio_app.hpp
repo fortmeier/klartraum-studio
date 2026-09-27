@@ -142,6 +142,13 @@ private:
     void deleteSelection();
     void drawEditorToolbar(bool compiled);
     void drawNodeHeader(ax::NodeEditor::NodeId node, ImVec2 headerMin, ImVec2 headerMax, ImU32 color);
+    // Rings around a node that becomes elements of the live and/or run graph.
+    void drawGraphRings(ax::NodeEditor::NodeId node, bool live, bool run);
+    void drawLegend();
+    // Inspector section: where and when a node runs, and what it is made of.
+    void drawExecutionInfo(const Node& node);
+    // The Gaussians an Upload Gaussians node of `graph` has uploaded, if any.
+    std::shared_ptr<klartraum::GaussianDataStandard> uploadedGaussians(const Graph& graph, int node) const;
     void handleFit(int& pendingFrames);
     void setStatus(std::string message, bool error = false);
     void updateWindowTitle();
@@ -168,6 +175,12 @@ private:
     bool applyRequested_ = false;
     std::map<std::string, std::shared_ptr<klartraum::GaussianDataStandard>> models_;  // by partsKey()
     std::map<std::pair<std::string, bool>, std::shared_ptr<const std::vector<klartraum::Gaussian3D>>> scenes_;
+    // CPU work of the last live build and the last run, with durations; the
+    // log being written while one of them builds.
+    std::vector<std::string> liveHostSteps_;
+    std::vector<std::string> runHostSteps_;
+    std::vector<std::string>* hostLog_ = nullptr;
+    void logHostStep(const std::string& step, double milliseconds);
 
     // Run
     OnnxInfoCache onnxInfo_;

@@ -2,6 +2,7 @@
 
 #include <chrono>
 #include <format>
+#include <set>
 #include <stdexcept>
 
 #include "klartraum/computegraph/computegraph.hpp"
@@ -79,6 +80,7 @@ public:
     ComputeGraphElementPtr runRoot(const RunPlan& plan) {
         auto root = std::make_shared<klartraum::NoOp>(vc_);
         root->setName("Run");
+        inserted_.insert(root.get());
         for (size_t i = 0; i < plan.sinks.size(); ++i) {
             const TensorRef& ref = sinkTensor(*graph_.findNode(plan.sinks[i]));
             root->setInput(ref.producer, static_cast<int>(i), ref.slot);
@@ -150,6 +152,7 @@ public:
     }
 
     const std::map<const klartraum::ComputeGraphElement*, int>& owners() const { return owners_; }
+    const std::set<const klartraum::ComputeGraphElement*>& inserted() const { return inserted_; }
 
 private:
     const TensorRef& inputTensor(const Node& node) {
@@ -179,6 +182,7 @@ private:
             transition->setName(graph_.findNode(link->fromNode)->title + " to general");
             transition->setInput(image.producer, 0, image.slot);
             owners_[transition.get()] = link->fromNode;
+            inserted_.insert(transition.get());
             image = ImageRef{transition, 0, image.extent, VK_IMAGE_LAYOUT_GENERAL};
         }
         return image;
@@ -207,6 +211,11 @@ private:
                                           VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
         owners_[tensor.get()] = node.id;
         owners_[convert.get()] = node.id;
+        if (node.kind != NodeKind::ImageToTensor) {
+            // A sink reading an image: the conversion is the studio's.
+            inserted_.insert(tensor.get());
+            inserted_.insert(convert.get());
+        }
         return TensorRef{convert, 1, tensor};
     }
 
@@ -254,6 +263,7 @@ private:
             transition->setName("Present");
             transition->setInput(image.producer, 0, image.slot);
             owners_[transition.get()] = present.id;
+            inserted_.insert(transition.get());
             return transition;
         }
 
@@ -266,6 +276,7 @@ private:
         resample->setInput(source.producer, 0, source.slot);
         resample->setInput(target, 1);
         owners_[resample.get()] = present.id;
+        inserted_.insert(resample.get());
         if (presentLayout() == VK_IMAGE_LAYOUT_GENERAL) {
             return resample;
         }
@@ -275,7 +286,15 @@ private:
         transition->setName(present.title);
         transition->setInput(resample, 0, 1);
         owners_[transition.get()] = present.id;
+        inserted_.insert(transition.get());
         return transition;
+    }
+
+    void hostStep(const std::string& step, std::chrono::steady_clock::time_point start) const {
+        if (context_.hostStep) {
+            context_.hostStep(step, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start)
+                                        .count());
+        }
     }
 
     template <typename T> std::shared_ptr<T> built(std::map<int, std::shared_ptr<T>>& map, const Node& node, int slot) {
@@ -292,8 +311,28 @@ private:
         case NodeKind::Scene:
         case NodeKind::TransformGaussians:
         case NodeKind::MergeGaussians:
-            // Assembled for the Gaussian Splatting node they feed.
+            // CPU work, done by the Upload Gaussians node they feed.
             break;
+        case NodeKind::UploadGaussians: {
+            const auto start = std::chrono::steady_clock::now();
+            auto model = context_.loadGaussians(gaussianParts(graph_, node.id));
+            hostStep(std::format("{}: {} Gaussians", node.title, model->count()), start);
+            const auto& buffers = model->buffers();
+            for (const klartraum::ComputeGraphElement* element :
+                 {static_cast<klartraum::ComputeGraphElement*>(buffers.pos.get()),
+                  static_cast<klartraum::ComputeGraphElement*>(buffers.rot.get()),
+                  static_cast<klartraum::ComputeGraphElement*>(buffers.scale.get()),
+                  static_cast<klartraum::ComputeGraphElement*>(buffers.colAlpha.get()),
+                  static_cast<klartraum::ComputeGraphElement*>(buffers.shR.get()),
+                  static_cast<klartraum::ComputeGraphElement*>(buffers.shG.get()),
+                  static_cast<klartraum::ComputeGraphElement*>(buffers.shB.get())}) {
+                if (element) {
+                    owners_[element] = node.id;
+                }
+            }
+            gaussians_[node.id] = model;
+            break;
+        }
         case NodeKind::Camera:
             if (live_) {
                 // Updated every frame from the window's orbit camera.
@@ -336,21 +375,7 @@ private:
                                                       static_cast<float>(size.width) / static_cast<float>(size.height)});
             }
 
-            const int source = graph_.inputLink(node.id, 0)->fromNode;
-            auto model = context_.loadGaussians(gaussianParts(graph_, source));
-            const auto& buffers = model->buffers();
-            for (const klartraum::ComputeGraphElement* element :
-                 {static_cast<klartraum::ComputeGraphElement*>(buffers.pos.get()),
-                  static_cast<klartraum::ComputeGraphElement*>(buffers.rot.get()),
-                  static_cast<klartraum::ComputeGraphElement*>(buffers.scale.get()),
-                  static_cast<klartraum::ComputeGraphElement*>(buffers.colAlpha.get()),
-                  static_cast<klartraum::ComputeGraphElement*>(buffers.shR.get()),
-                  static_cast<klartraum::ComputeGraphElement*>(buffers.shG.get()),
-                  static_cast<klartraum::ComputeGraphElement*>(buffers.shB.get())}) {
-                if (element) {
-                    owners_[element] = source;
-                }
-            }
+            auto model = built(gaussians_, node, 0);
 
             auto splatting = klartraum::createGaussianSplatting(vc_, toGsplatBackend(p.backend), target, ubo, model,
                                                                 toGsplatConfig(p));
@@ -405,7 +430,9 @@ private:
         }
         case NodeKind::ImageFile: {
             const auto& p = node.as<ImageFileParams>();
+            const auto start = std::chrono::steady_clock::now();
             const ImageRGBA8 image = resizeImage(loadImage(context_.resolveInput(p.path)), p.width, p.height);
+            hostStep(std::format("{}: decoded and resized to {} x {}", node.title, p.width, p.height), start);
             auto tensor = vc_.create<FloatTensor>(std::vector<uint32_t>{1, 3, p.height, p.width});
             tensor->setName(node.title);
             uploads_.emplace_back(tensor, imageToTensor(image));
@@ -469,7 +496,9 @@ private:
     std::map<int, TensorRef> tensors_;
     std::vector<std::pair<std::shared_ptr<FloatTensor>, std::vector<float>>> uploads_;
     std::vector<CameraUpdate> cameraUpdates_;
+    std::map<int, std::shared_ptr<klartraum::GaussianDataStandard>> gaussians_;
     std::map<const klartraum::ComputeGraphElement*, int> owners_;
+    std::set<const klartraum::ComputeGraphElement*> inserted_;
 };
 
 } // namespace
@@ -493,7 +522,7 @@ RunResult runGraph(klartraum::VulkanContext& vulkanContext, const Graph& graph, 
     for (const auto& [label, ms] : computeGraph.getProfilingResults()) {
         result.timings.emplace(label, ms);
     }
-    result.compiled = introspect(root, builder.owners());
+    result.compiled = introspect(root, builder.owners(), -1, builder.inserted());
     result.milliseconds =
         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
     return result;
@@ -510,6 +539,7 @@ BuiltGraph buildLiveGraph(klartraum::KlartraumEngine& engine, const Graph& graph
     BuiltGraph built;
     built.root = builder.presentRoot(*graph.findNode(plan.presentNode));
     built.owners = builder.owners();
+    built.inserted = builder.inserted();
 
     engine.add(built.root);
     builder.upload();

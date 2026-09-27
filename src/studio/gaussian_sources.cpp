@@ -67,6 +67,8 @@ std::vector<GaussianPart> gaussianParts(const Graph& graph, int nodeId) {
         }
         return parts;
     }
+    case NodeKind::UploadGaussians:
+        return input(0);
     case NodeKind::MergeGaussians: {
         std::vector<GaussianPart> parts = input(0);
         std::vector<GaussianPart> more = input(1);
