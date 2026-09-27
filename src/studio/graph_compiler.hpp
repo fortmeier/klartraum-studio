@@ -24,8 +24,8 @@ struct LivePlan {
     // signature list corresponding nodes at the same positions.
     std::vector<int> nodes;
     int cameraNode = 0;  // the camera the window's orbit camera drives; 0: none
-    // The nodes' kinds, parameters and links, without node ids and camera
-    // parameters: those are applied live.
+    // The nodes' kinds, parameters and links, without node ids and live
+    // parameters (NodeKindInfo::liveParams): those apply while it runs.
     std::string signature;
 
     // Whether switching from `other` to this plan needs new pipelines.

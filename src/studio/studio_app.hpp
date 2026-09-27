@@ -1,5 +1,6 @@
 #pragma once
 
+#include <chrono>
 #include <filesystem>
 #include <map>
 #include <memory>
@@ -28,7 +29,7 @@ class GaussianDataStandard;
 namespace kstudio {
 
 // The example graphs offered in File > Examples.
-enum class Example { GaussianSplatting, Autoencoder, SplatAutoencoder, CombinedScenes };
+enum class Example { GaussianSplatting, Autoencoder, SplatAutoencoder, CombinedScenes, AnimatedScenes };
 std::optional<Example> exampleFromName(std::string_view name);
 
 struct StudioOptions {
@@ -171,6 +172,11 @@ private:
     std::optional<LivePlan> failedPlan_;
     std::string applyError_;
     std::string builderError_;
+    // GPU values the live graph reads, set from the graph before every frame.
+    std::vector<HostBinding> liveBindings_;
+    std::chrono::steady_clock::time_point start_ = std::chrono::steady_clock::now();
+    void updateLiveValues();
+    double secondsSinceStart() const;
     bool autoApply_ = true;
     bool applyRequested_ = false;
     std::map<std::string, std::shared_ptr<klartraum::GaussianDataStandard>> models_;  // by partsKey()

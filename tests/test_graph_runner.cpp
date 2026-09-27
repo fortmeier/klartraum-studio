@@ -19,6 +19,10 @@
  *   with the model's title (GPU)
  * - liveCombinedScenes: two scenes, one of them transformed, merge into one Gaussian
  *   Splatting that holds the Gaussians of both and renders frames (GPU)
+ * - runAnimatedScenes: the lantern swung by Time -> Sine -> Upload Number -> Make Transform on
+ *   the GPU looks different after 1 s and the same after a full swing of 4 s (GPU)
+ * - liveAnimatedScenes: the animated graph builds live with one binding per uploaded number and
+ *   unconnected transform input, the yaw binding follows the sine, and frames render (GPU)
  * - runReportsFailingNode: a missing input file fails the run with the node's title (GPU)
  **/
 
@@ -32,6 +36,7 @@
 
 #include "klartraum/gaussian_data_standard.hpp"
 #include "klartraum/headless_frontend.hpp"
+#include "klartraum/computegraph/hostvalues.hpp"
 #include "klartraum/klartraum_core.hpp"
 #include "klartraum/vulkan_helpers.hpp"
 
@@ -417,6 +422,91 @@ TEST_F(GraphRunnerTest, liveCombinedScenes) {
     EXPECT_EQ(owned(NodeKind::MergeGaussians), 0);
     EXPECT_EQ(owned(NodeKind::TransformGaussians), 0);
     EXPECT_EQ(owned(NodeKind::Scene), 0);
+    engine.clearComputeGraphs();
+}
+
+namespace {
+
+// The animated example, rendered offscreen into a Preview for Run.
+Graph animatedRunGraph(const std::string& lantern) {
+    MakeTransformParams placement;
+    placement.translation = {0.68f, -1.0f, -0.68f};
+    placement.scale = 1.6f;
+    CameraParams camera;
+    camera.azimuth = 1.57f;
+    camera.elevation = -0.35f;
+    camera.distance = 1.6f;
+    camera.target = {0.6f, -0.9f, -0.7f};
+    Graph graph = makeAnimatedScenesGraph(kScene, SceneParams{lantern, true}, placement,
+                                          SineParams{30.0f, 0.25f, 0.0f, 20.0f}, camera);
+    graph.removeNode(findKind(graph, NodeKind::Present));
+    graph.removeNode(findKind(graph, NodeKind::SwapchainTarget));
+    const int target = graph.addNode(NodeKind::OffscreenTarget);
+    graph.findNode(target)->as<OffscreenTargetParams>() = {160, 120};
+    const int preview = graph.addNode(NodeKind::Preview);
+    const int splatting = findKind(graph, NodeKind::GaussianSplatting);
+    graph.connect({target, PinDirection::Output, 0}, {splatting, PinDirection::Input, 2});
+    graph.connect({splatting, PinDirection::Output, 0}, {preview, PinDirection::Input, 0});
+    return graph;
+}
+
+int maxDifference(const ImageRGBA8& a, const ImageRGBA8& b) {
+    int result = 0;
+    for (size_t i = 0; i < a.pixels.size(); ++i) {
+        result = std::max(result, std::abs(int(a.pixels[i]) - int(b.pixels[i])));
+    }
+    return result;
+}
+
+} // namespace
+
+TEST_F(GraphRunnerTest, runAnimatedScenes) {
+    const std::string lantern = (kRoot / "data/lantern.spz").string();
+    if (!std::filesystem::exists(lantern)) {
+        GTEST_SKIP() << "sample not found: " << lantern;
+    }
+    const Graph graph = animatedRunGraph(lantern);
+    const RunPlan runPlan = plan(graph);
+    const int preview = findKind(graph, NodeKind::Preview);
+    auto renderAt = [&](double time) {
+        RunContext timed = context;
+        timed.time = time;
+        return runGraph(vc(), graph, runPlan, timed).images.at(preview);
+    };
+    const ImageRGBA8 start = renderAt(0.0);
+    EXPECT_GT(meanValue(start), 5.0) << "the rendering is black";
+    EXPECT_GT(maxDifference(renderAt(1.0), start), 40) << "the lantern did not turn";
+    EXPECT_LE(maxDifference(renderAt(4.0), start), 3) << "a full swing should end where it started";
+}
+
+TEST_F(GraphRunnerTest, liveAnimatedScenes) {
+    const std::string lantern = (kRoot / "data/lantern.spz").string();
+    if (!std::filesystem::exists(lantern)) {
+        GTEST_SKIP() << "sample not found: " << lantern;
+    }
+    const Graph graph = makeAnimatedScenesGraph(kScene, SceneParams{lantern, true}, MakeTransformParams{},
+                                                SineParams{30.0f, 0.25f, 0.0f, 20.0f});
+    const CompilePlan compiled = planGraph(graph);
+    for (const auto& d : compiled.diagnostics) {
+        EXPECT_NE(d.severity, Severity::Error) << d.message;
+    }
+    ASSERT_TRUE(compiled.live.has_value());
+    auto& engine = frontend->getKlartraumEngine();
+    const BuiltGraph built = buildLiveGraph(engine, graph, *compiled.live, context);
+
+    // The uploaded yaw, and the six Make Transform inputs taking the node's values.
+    ASSERT_EQ(built.bindings.size(), 7u);
+    const int upload = findKind(graph, NodeKind::UploadNumber);
+    const auto yaw = std::find_if(built.bindings.begin(), built.bindings.end(),
+                                  [&](const HostBinding& b) { return b.node == upload; });
+    ASSERT_NE(yaw, built.bindings.end());
+    applyBindings(graph, built.bindings, 1.0);
+    EXPECT_NEAR(yaw->values->values()[0], 50.0f, 1e-3f);
+    for (int i = 0; i < 3; ++i) {
+        applyBindings(graph, built.bindings, i * 0.5);
+        engine.step();
+    }
+    vkDeviceWaitIdle(vc().getDevice());
     engine.clearComputeGraphs();
 }
 

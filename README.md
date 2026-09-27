@@ -22,6 +22,8 @@ Nodes stand for klartraum's public building blocks:
 |---|---|
 | Sources | *Scene* (`.spz` Gaussians into CPU memory, optionally mirrored across Y for Nerfstudio exports), *Image File* (PNG, JPEG, … resized to W×H, as a 1×3×H×W tensor) |
 | Gaussians (CPU) | *Transform* (scale, rotate about X/Y/Z, translate; `klartraum::transformGaussians`, which turns orientations and view-dependent colour along), *Merge* (two sets of Gaussians into one, rendered and sorted together), *Upload Gaussians* (into the GPU buffers of a `klartraum::GaussianDataStandard`) |
+| Gaussians (GPU) | *Make Transform* (a transform buffer from x, y, z, pitch, yaw, roll and scale; unconnected inputs take the node's values, which apply without rebuilding; `klartraum::TransformBufferPass`), *Transform (GPU)* (`klartraum::GaussianTransformPass`), *Merge (GPU)* (`klartraum::GaussianMergePass`), all running every frame |
+| Numbers (CPU) | *Number*, *Time* (seconds since start), *Sine* (amplitude · sin(frequency · 2π · x + phase) + offset), evaluated by the studio every frame; *Upload Number* (`klartraum::HostValues`, copied into a GPU buffer before every frame) |
 | Rendering | *Orbit Camera*, *Swapchain Target*, *Offscreen Target* (W×H), *Gaussian Splatting* (compute or raster backend, all `GsplatConfig` settings) |
 | Compute | *Image to Tensor* (image → 1×3×H×W tensor), *Tensor to Image* (1×3×H×W tensor → H×W image), *Resample* (image → W×H image, nearest or bilinear; `klartraum::ImageResample`), *ONNX Model* (`klartraum::OnnxNetwork`; Conv, ConvTranspose, Relu, Reshape, Transpose) |
 | Outputs | *Present* (live; images other than a swapchain rendering are stretched to the window), *Preview* and *Image File Writer* (run; they take an image tensor or an image) |
@@ -102,6 +104,7 @@ support.
 ./build/klartraum_studio --example autoencoder          # image file -> encoder -> decoder -> preview + PNG
 ./build/klartraum_studio --example splat-autoencoder    # offscreen splatting -> encoder -> decoder -> preview
 ./build/klartraum_studio --example combined-scenes      # raccoon scene + transformed lantern, merged and rendered live
+./build/klartraum_studio --example animated-scenes      # the same on the GPU, the lantern swinging over time
 ./build/klartraum_studio my.ktgraph.json                # open a saved graph
 ./build/klartraum_studio --backend compute --spz path/to/scene.spz --profile
 ```
@@ -119,6 +122,15 @@ stump by a *Transform* node. Transform and Merge work on the Gaussians before
 they are uploaded: each Gaussian Splatting input is assembled on the CPU from
 its scene files and uploaded once. Scene files stay loaded while the live
 graph uses them, so moving a scene only re-assembles and re-uploads.
+
+The animated-scenes example does the placing on the GPU instead: both scenes
+are uploaded as they are, a *Make Transform* holds the lantern's placement,
+and its yaw comes from *Time* → *Sine* → *Upload Number*. Every frame the
+studio evaluates the CPU numbers and sets the uploaded values; klartraum
+copies them into the frame's buffers right before submitting it, and the
+*Transform (GPU)* and *Merge (GPU)* passes write the Gaussians the splatting
+renders. Numbers, Time, Sine and Make Transform values apply without
+rebuilding the graph.
 
 The default graph uses the raster backend. The compute (tile-binned) backend
 shows the classic projection → binning → sort → gather → bounds → splat

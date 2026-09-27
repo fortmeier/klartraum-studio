@@ -89,13 +89,21 @@ CompilePlan planGraph(const Graph& graph, const OnnxInfoProvider& onnxInfo, cons
         live.signature += kindInfo(node.kind).name;
         if (node.kind == NodeKind::Camera) {
             live.cameraNode = id;
-        } else {
+        }
+        // Live parameters apply without rebuilding (camera, CPU numbers,
+        // Make Transform values).
+        if (!kindInfo(node.kind).liveParams) {
             live.signature += paramsToString(node.params);
         }
         live.signature += "(";
         const auto& inputs = kindInfo(node.kind).inputs;
         for (int slot = 0; slot < static_cast<int>(inputs.size()); ++slot) {
             const Link* link = graph.inputLink(id, slot);
+            if (!link) {
+                // An optional input left unconnected.
+                live.signature += std::format("{}-", slot == 0 ? "" : ",");
+                continue;
+            }
             live.signature += std::format("{}{}:", slot == 0 ? "" : ",", link->fromSlot);
             visit(link->fromNode);
         }

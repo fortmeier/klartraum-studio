@@ -20,8 +20,14 @@ json paramsToJson(const NodeParams& params) {
             using T = std::decay_t<decltype(p)>;
             if constexpr (std::is_same_v<T, SceneParams>) {
                 return {{"path", p.path}, {"flipY", p.flipY}};
-            } else if constexpr (std::is_same_v<T, TransformGaussiansParams>) {
+            } else if constexpr (std::is_same_v<T, TransformGaussiansParams> || std::is_same_v<T, MakeTransformParams>) {
                 return {{"translation", p.translation}, {"rotation", p.rotation}, {"scale", p.scale}};
+            } else if constexpr (std::is_same_v<T, NumberParams>) {
+                return {{"value", p.value}};
+            } else if constexpr (std::is_same_v<T, TimeParams>) {
+                return {{"speed", p.speed}};
+            } else if constexpr (std::is_same_v<T, SineParams>) {
+                return {{"amplitude", p.amplitude}, {"frequency", p.frequency}, {"phase", p.phase}, {"offset", p.offset}};
             } else if constexpr (std::is_same_v<T, CameraParams>) {
                 return {{"azimuth", p.azimuth},
                         {"elevation", p.elevation},
@@ -68,10 +74,19 @@ NodeParams paramsFromJson(NodeKind kind, const json& j) {
             if constexpr (std::is_same_v<T, SceneParams>) {
                 read(j, "path", p.path);
                 read(j, "flipY", p.flipY);
-            } else if constexpr (std::is_same_v<T, TransformGaussiansParams>) {
+            } else if constexpr (std::is_same_v<T, TransformGaussiansParams> || std::is_same_v<T, MakeTransformParams>) {
                 read(j, "translation", p.translation);
                 read(j, "rotation", p.rotation);
                 read(j, "scale", p.scale);
+            } else if constexpr (std::is_same_v<T, NumberParams>) {
+                read(j, "value", p.value);
+            } else if constexpr (std::is_same_v<T, TimeParams>) {
+                read(j, "speed", p.speed);
+            } else if constexpr (std::is_same_v<T, SineParams>) {
+                read(j, "amplitude", p.amplitude);
+                read(j, "frequency", p.frequency);
+                read(j, "phase", p.phase);
+                read(j, "offset", p.offset);
             } else if constexpr (std::is_same_v<T, CameraParams>) {
                 read(j, "azimuth", p.azimuth);
                 read(j, "elevation", p.elevation);

@@ -17,6 +17,7 @@
 namespace klartraum {
 class ComputeGraphElement;
 class GaussianDataStandard;
+class HostValues;
 class KlartraumEngine;
 class VulkanContext;
 } // namespace klartraum
@@ -35,6 +36,8 @@ struct RunContext {
     std::function<std::shared_ptr<klartraum::GaussianDataStandard>(const std::vector<GaussianPart>&)> loadGaussians;
     // Optional: told about CPU work done while building, with its duration.
     std::function<void(const std::string& step, double milliseconds)> hostStep;
+    // Seconds since the studio started, for Time nodes when running once.
+    double time = 0.0;
     OnnxInfoProvider onnxInfo;
 };
 
@@ -52,6 +55,19 @@ struct RunResult {
 RunResult runGraph(klartraum::VulkanContext& vulkanContext, const Graph& graph, const RunPlan& plan,
                    const RunContext& context);
 
+// A GPU value the CPU sets before every frame: a CPU number fed into an
+// Upload Number node (`component` -1), or input `component` of a Make
+// Transform node that is not connected, which takes the node's value.
+struct HostBinding {
+    std::shared_ptr<klartraum::HostValues> values;
+    int node = 0;
+    int component = -1;
+};
+
+// Sets the bindings' values from `graph` at `time` seconds (see
+// evaluateNumber).
+void applyBindings(const Graph& graph, const std::vector<HostBinding>& bindings, double time);
+
 // The klartraum elements built for the live plan.
 struct BuiltGraph {
     std::shared_ptr<klartraum::ComputeGraphElement> root;
@@ -61,6 +77,8 @@ struct BuiltGraph {
     // Elements the studio added on its own, e.g. layout transitions and
     // Present's resample into the swapchain.
     std::set<const klartraum::ComputeGraphElement*> inserted;
+    // Values to set before every frame.
+    std::vector<HostBinding> bindings;
 };
 
 // Builds the live plan's nodes for the engine's current swapchain, one path

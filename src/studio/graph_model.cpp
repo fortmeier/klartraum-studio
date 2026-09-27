@@ -15,6 +15,20 @@ constexpr PinDesc kTransformOutputs[] = {{"Out", PinType::GaussiansCpu}};
 constexpr PinDesc kUploadInputs[] = {{"CPU", PinType::GaussiansCpu}};
 constexpr PinDesc kMergeInputs[] = {{"A", PinType::GaussiansCpu}, {"B", PinType::GaussiansCpu}};
 constexpr PinDesc kUploadOutputs[] = {{"GPU", PinType::GaussiansGpu}};
+constexpr PinDesc kGpuMergeInputs[] = {{"A", PinType::GaussiansGpu}, {"B", PinType::GaussiansGpu}};
+constexpr PinDesc kGpuTransformInputs[] = {{"Gaussians", PinType::GaussiansGpu}, {"Transform", PinType::TransformGpu}};
+constexpr PinDesc kGpuGaussiansOutputs[] = {{"Gaussians", PinType::GaussiansGpu}};
+constexpr PinDesc kNumberOutputs[] = {{"Value", PinType::NumberCpu}};
+constexpr PinDesc kSineInputs[] = {{"X", PinType::NumberCpu}};
+constexpr PinDesc kUploadNumberInputs[] = {{"CPU", PinType::NumberCpu}};
+constexpr PinDesc kUploadNumberOutputs[] = {{"GPU", PinType::NumberGpu}};
+constexpr PinDesc kMakeTransformInputs[] = {
+    {"X", PinType::NumberGpu, std::nullopt, true},     {"Y", PinType::NumberGpu, std::nullopt, true},
+    {"Z", PinType::NumberGpu, std::nullopt, true},     {"Pitch", PinType::NumberGpu, std::nullopt, true},
+    {"Yaw", PinType::NumberGpu, std::nullopt, true},   {"Roll", PinType::NumberGpu, std::nullopt, true},
+    {"Scale", PinType::NumberGpu, std::nullopt, true},
+};
+constexpr PinDesc kMakeTransformOutputs[] = {{"Transform", PinType::TransformGpu}};
 constexpr PinDesc kCameraOutputs[] = {{"Camera", PinType::Camera}};
 constexpr PinDesc kImageOutputs[] = {{"Image", PinType::Image}};
 constexpr PinDesc kSplattingInputs[] = {
@@ -39,18 +53,41 @@ const NodeKindInfo kKinds[] = {
     {NodeKind::ImageFile, "image_file", "Image File", "Sources",
      "Loads an image file (PNG, JPEG, ...) as a 1x3xHxW tensor with values in [0, 1].", {}, kTensorOutputs, Upload,
      ComputeGraph, "decoded by the studio (stb_image), uploaded into a klartraum::TensorElement", kOnBuild},
-    {NodeKind::TransformGaussians, "transform_gaussians", "Transform", "Gaussians (CPU)",
+    {NodeKind::Number, "number", "Number", "Numbers (CPU)", "A constant number.", {}, kNumberOutputs, Cpu, Studio,
+     "evaluated by the studio (kstudio::evaluateNumber)", "every frame (live), once per run", true},
+    {NodeKind::Time, "time", "Time", "Numbers (CPU)", "Seconds since the studio started, times a speed.", {},
+     kNumberOutputs, Cpu, Studio, "evaluated by the studio (kstudio::evaluateNumber)",
+     "every frame (live), once per run", true},
+    {NodeKind::Sine, "sine", "Sine", "Numbers (CPU)",
+     "amplitude * sin(frequency * 2 pi * x + phase) + offset, e.g. to swing something back and forth over time.",
+     kSineInputs, kNumberOutputs, Cpu, Studio, "evaluated by the studio (kstudio::evaluateNumber)",
+     "every frame (live), once per run", true},
+    {NodeKind::UploadNumber, "upload_number", "Upload Number", "Numbers (CPU)",
+     "Copies a CPU number into a GPU buffer before every frame, without rebuilding the graph.", kUploadNumberInputs,
+     kUploadNumberOutputs, Upload, ComputeGraph, "klartraum::HostValues", "every frame (live), once per run"},
+    {NodeKind::TransformGaussians, "transform_gaussians", "Transform (CPU)", "Gaussians (CPU)",
      "Scales, rotates and moves Gaussians in CPU memory.", kTransformInputs, kTransformOutputs, Cpu,
      KlartraumFunction, "klartraum::transformGaussians", kOnBuild},
-    {NodeKind::MergeGaussians, "merge_gaussians", "Merge", "Gaussians (CPU)",
+    {NodeKind::MergeGaussians, "merge_gaussians", "Merge (CPU)", "Gaussians (CPU)",
      "Combines two sets of Gaussians in CPU memory into one.", kMergeInputs, kCpuGaussiansOutputs, Cpu, Studio,
      "kstudio::assembleGaussians", kOnBuild},
     {NodeKind::UploadGaussians, "upload_gaussians", "Upload Gaussians", "Gaussians (CPU)",
      "Uploads Gaussians into the GPU buffers a Gaussian Splatting reads.", kUploadInputs, kUploadOutputs,
      Upload, ComputeGraph, "klartraum::GaussianDataStandard (7 buffer elements)", kOnBuild},
+    {NodeKind::MakeTransform, "make_transform", "Make Transform", "Gaussians (GPU)",
+     "A GPU transform from translation, rotation (degrees about X, then Y, then Z) and scale. Inputs that are "
+     "not connected take the node's values, which apply without rebuilding.",
+     kMakeTransformInputs, kMakeTransformOutputs, Gpu, ComputeGraph, "klartraum::TransformBufferPass",
+     kEveryExecution, true},
+    {NodeKind::TransformGaussiansGpu, "transform_gaussians_gpu", "Transform (GPU)", "Gaussians (GPU)",
+     "Moves Gaussians on the GPU by a transform, every frame.", kGpuTransformInputs, kGpuGaussiansOutputs, Gpu,
+     ComputeGraph, "klartraum::GaussianTransformPass", kEveryExecution},
+    {NodeKind::MergeGaussiansGpu, "merge_gaussians_gpu", "Merge (GPU)", "Gaussians (GPU)",
+     "Combines two sets of Gaussians on the GPU, every frame.", kGpuMergeInputs, kGpuGaussiansOutputs, Gpu,
+     ComputeGraph, "klartraum::GaussianMergePass", kEveryExecution},
     {NodeKind::Camera, "camera", "Orbit Camera", "Rendering", "Camera uniform buffer driven by an orbit camera.", {},
      kCameraOutputs, Upload, ComputeGraph, "klartraum::InterfaceCameraOrbit writing a klartraum::CameraUboType",
-     "every frame (live), once per run"},
+     "every frame (live), once per run", true},
     {NodeKind::SwapchainTarget, "swapchain_target", "Swapchain Target", "Rendering",
      "The window's swapchain images, rendered into directly.", {}, kImageOutputs, Gpu, ComputeGraph,
      "klartraum::ImageViewSrc over the swapchain", "every frame (live only)"},
@@ -110,6 +147,9 @@ std::string_view pinTypeName(PinType type) {
     switch (type) {
     case PinType::GaussiansCpu: return "Gaussians (CPU)";
     case PinType::GaussiansGpu: return "Gaussians (GPU)";
+    case PinType::NumberCpu: return "Number (CPU)";
+    case PinType::NumberGpu: return "Number (GPU)";
+    case PinType::TransformGpu: return "Transform (GPU)";
     case PinType::Camera: return "Camera";
     case PinType::Image: return "Image";
     case PinType::Tensor: return "Tensor";
@@ -131,6 +171,13 @@ NodeParams defaultParams(NodeKind kind) {
     case NodeKind::TransformGaussians: return TransformGaussiansParams{};
     case NodeKind::MergeGaussians: return MergeGaussiansParams{};
     case NodeKind::UploadGaussians: return UploadGaussiansParams{};
+    case NodeKind::Number: return NumberParams{};
+    case NodeKind::Time: return TimeParams{};
+    case NodeKind::Sine: return SineParams{};
+    case NodeKind::UploadNumber: return UploadNumberParams{};
+    case NodeKind::MakeTransform: return MakeTransformParams{};
+    case NodeKind::TransformGaussiansGpu: return TransformGaussiansGpuParams{};
+    case NodeKind::MergeGaussiansGpu: return MergeGaussiansGpuParams{};
     case NodeKind::Camera: return CameraParams{};
     case NodeKind::SwapchainTarget: return SwapchainTargetParams{};
     case NodeKind::GaussianSplatting: return SplattingParams{};
@@ -259,6 +306,8 @@ std::optional<std::string> Graph::checkConnection(PinRef from, PinRef to) const 
                                           pinTypeName(inputs[to.slot].type));
         if (outputs[from.slot].type == PinType::GaussiansCpu && inputs[to.slot].type == PinType::GaussiansGpu) {
             message += " Put an Upload Gaussians node in between.";
+        } else if (outputs[from.slot].type == PinType::NumberCpu && inputs[to.slot].type == PinType::NumberGpu) {
+            message += " Put an Upload Number node in between.";
         }
         return message;
     }
@@ -413,7 +462,7 @@ std::vector<Diagnostic> Graph::validate() const {
     for (const auto& node : nodes_) {
         const auto& inputs = kindInfo(node.kind).inputs;
         for (int slot = 0; slot < static_cast<int>(inputs.size()); ++slot) {
-            if (!inputLink(node.id, slot)) {
+            if (!inputs[slot].optional && !inputLink(node.id, slot)) {
                 report(Severity::Error, node.id, std::format("Input '{}' is not connected.", inputs[slot].name));
             }
         }
@@ -426,6 +475,11 @@ std::vector<Diagnostic> Graph::validate() const {
             break;
         case NodeKind::TransformGaussians:
             if (!(node.as<TransformGaussiansParams>().scale > 0.0f)) {
+                report(Severity::Error, node.id, "Scale must be greater than zero.");
+            }
+            break;
+        case NodeKind::MakeTransform:
+            if (!inputLink(node.id, 6) && !(node.as<MakeTransformParams>().scale > 0.0f)) {
                 report(Severity::Error, node.id, "Scale must be greater than zero.");
             }
             break;
@@ -611,6 +665,48 @@ Graph makeCombinedScenesGraph(const std::string& scenePath, const SceneParams& m
     graph.connect(out(move), in(merge, 1));
     graph.connect(out(merge), in(upload));
     graph.connect(out(upload), in(splatting, 0));
+    graph.connect(out(camera), in(splatting, 1));
+    graph.connect(out(target), in(splatting, 2));
+    graph.connect(out(splatting), in(present));
+    return graph;
+}
+
+Graph makeAnimatedScenesGraph(const std::string& scenePath, const SceneParams& movedScene,
+                              const MakeTransformParams& placement, const SineParams& swing,
+                              const CameraParams& cameraParams) {
+    Graph graph;
+    const int scene = graph.addNode(NodeKind::Scene, {0.0f, 0.0f});
+    const int moved = graph.addNode(NodeKind::Scene, {0.0f, 200.0f});
+    const int time = graph.addNode(NodeKind::Time, {0.0f, 420.0f});
+    const int upload = graph.addNode(NodeKind::UploadGaussians, {300.0f, 0.0f});
+    const int uploadMoved = graph.addNode(NodeKind::UploadGaussians, {300.0f, 200.0f});
+    const int sine = graph.addNode(NodeKind::Sine, {300.0f, 420.0f});
+    const int uploadYaw = graph.addNode(NodeKind::UploadNumber, {600.0f, 420.0f});
+    const int transform = graph.addNode(NodeKind::MakeTransform, {900.0f, 300.0f});
+    const int move = graph.addNode(NodeKind::TransformGaussiansGpu, {1200.0f, 200.0f});
+    const int merge = graph.addNode(NodeKind::MergeGaussiansGpu, {1500.0f, 60.0f});
+    const int camera = graph.addNode(NodeKind::Camera, {1500.0f, 260.0f});
+    const int target = graph.addNode(NodeKind::SwapchainTarget, {1500.0f, 440.0f});
+    const int splatting = graph.addNode(NodeKind::GaussianSplatting, {1800.0f, 200.0f});
+    const int present = graph.addNode(NodeKind::Present, {2100.0f, 240.0f});
+
+    graph.findNode(scene)->as<SceneParams>().path = scenePath;
+    graph.findNode(moved)->as<SceneParams>() = movedScene;
+    graph.findNode(sine)->as<SineParams>() = swing;
+    graph.findNode(sine)->title = "Swing";
+    graph.findNode(transform)->as<MakeTransformParams>() = placement;
+    graph.findNode(camera)->as<CameraParams>() = cameraParams;
+
+    graph.connect(out(scene), in(upload));
+    graph.connect(out(moved), in(uploadMoved));
+    graph.connect(out(time), in(sine));
+    graph.connect(out(sine), in(uploadYaw));
+    graph.connect(out(uploadYaw), in(transform, 4));  // yaw
+    graph.connect(out(uploadMoved), in(move, 0));
+    graph.connect(out(transform), in(move, 1));
+    graph.connect(out(upload), in(merge, 0));
+    graph.connect(out(move), in(merge, 1));
+    graph.connect(out(merge), in(splatting, 0));
     graph.connect(out(camera), in(splatting, 1));
     graph.connect(out(target), in(splatting, 2));
     graph.connect(out(splatting), in(present));

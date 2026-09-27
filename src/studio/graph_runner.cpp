@@ -7,17 +7,21 @@
 
 #include "klartraum/computegraph/computegraph.hpp"
 #include "klartraum/computegraph/generalcomputation.hpp"
+#include "klartraum/computegraph/hostvalues.hpp"
 #include "klartraum/computegraph/imageresample.hpp"
 #include "klartraum/computegraph/imageviewsrc.hpp"
 #include "klartraum/computegraph/noop.hpp"
 #include "klartraum/computegraph/tensorelement.hpp"
 #include "klartraum/draw_component.hpp"
 #include "klartraum/gaussian_data_standard.hpp"
+#include "klartraum/gaussian_passes.hpp"
 #include "klartraum/gaussian_splatting_factory.hpp"
 #include "klartraum/interface_camera_orbit.hpp"
 #include "klartraum/klartraum_core.hpp"
 #include "klartraum/offscreen_target.hpp"
 #include "klartraum/onnx/onnx_network.hpp"
+
+#include "studio/cpu_numbers.hpp"
 
 namespace kstudio {
 
@@ -153,6 +157,7 @@ public:
 
     const std::map<const klartraum::ComputeGraphElement*, int>& owners() const { return owners_; }
     const std::set<const klartraum::ComputeGraphElement*>& inserted() const { return inserted_; }
+    const std::vector<HostBinding>& bindings() const { return bindings_; }
 
 private:
     const TensorRef& inputTensor(const Node& node) {
@@ -297,6 +302,27 @@ private:
         }
     }
 
+    // A value built for the node feeding input `slot`.
+    template <typename T> const T& builtValue(const std::map<int, T>& map, const Node& node, int slot) {
+        const Link* link = graph_.inputLink(node.id, slot);
+        auto it = link ? map.find(link->fromNode) : map.end();
+        if (it == map.end()) {
+            throw std::runtime_error("an input was not built");
+        }
+        return it->second;
+    }
+
+    // Owns the elements of a pass building Gaussians: the pass and the
+    // buffers it writes.
+    void ownGaussianPass(const klartraum::ComputeGraphElementPtr& pass, const klartraum::GaussianSoABuffers& output,
+                         const Node& node) {
+        pass->setName(node.title);
+        owners_[pass.get()] = node.id;
+        for (const auto* ref : output.all()) {
+            owners_[ref->buffer().get()] = node.id;
+        }
+    }
+
     template <typename T> std::shared_ptr<T> built(std::map<int, std::shared_ptr<T>>& map, const Node& node, int slot) {
         const Link* link = graph_.inputLink(node.id, slot);
         auto it = link ? map.find(link->fromNode) : map.end();
@@ -313,24 +339,63 @@ private:
         case NodeKind::MergeGaussians:
             // CPU work, done by the Upload Gaussians node they feed.
             break;
+        case NodeKind::Number:
+        case NodeKind::Time:
+        case NodeKind::Sine:
+            // Evaluated on the CPU for the bindings of the nodes they feed.
+            break;
+        case NodeKind::UploadNumber: {
+            auto values = std::make_shared<klartraum::HostValues>(vc_, 1u);
+            values->setName(node.title);
+            owners_[values.get()] = node.id;
+            bindings_.push_back(HostBinding{values, node.id, -1});
+            numbers_[node.id] = klartraum::BufferRef{values};
+            break;
+        }
+        case NodeKind::MakeTransform: {
+            std::array<klartraum::BufferRef, 7> parameters;
+            for (int i = 0; i < 7; ++i) {
+                if (graph_.inputLink(node.id, i)) {
+                    parameters[i] = builtValue(numbers_, node, i);
+                    continue;
+                }
+                // An unconnected input takes the node's value, set every frame.
+                auto values = std::make_shared<klartraum::HostValues>(vc_, 1u);
+                values->setName(node.title + " " + std::string(kindInfo(node.kind).inputs[i].name));
+                owners_[values.get()] = node.id;
+                inserted_.insert(values.get());
+                bindings_.push_back(HostBinding{values, node.id, i});
+                parameters[i] = klartraum::BufferRef{values};
+            }
+            const auto transform = klartraum::makeTransformBuffer(vc_, parameters);
+            transform.pass->setName(node.title);
+            owners_[transform.pass.get()] = node.id;
+            owners_[transform.transform.buffer().get()] = node.id;
+            transforms_[node.id] = transform.transform;
+            break;
+        }
+        case NodeKind::TransformGaussiansGpu: {
+            const auto moved = klartraum::transformGaussiansPass(vc_, builtValue(gaussians_, node, 0),
+                                                                 builtValue(transforms_, node, 1));
+            ownGaussianPass(moved.pass, moved.output, node);
+            gaussians_[node.id] = moved.output;
+            break;
+        }
+        case NodeKind::MergeGaussiansGpu: {
+            const auto merged =
+                klartraum::mergeGaussiansPass(vc_, builtValue(gaussians_, node, 0), builtValue(gaussians_, node, 1));
+            ownGaussianPass(merged.pass, merged.output, node);
+            gaussians_[node.id] = merged.output;
+            break;
+        }
         case NodeKind::UploadGaussians: {
             const auto start = std::chrono::steady_clock::now();
             auto model = context_.loadGaussians(gaussianParts(graph_, node.id));
             hostStep(std::format("{}: {} Gaussians", node.title, model->count()), start);
-            const auto& buffers = model->buffers();
-            for (const klartraum::ComputeGraphElement* element :
-                 {static_cast<klartraum::ComputeGraphElement*>(buffers.pos.get()),
-                  static_cast<klartraum::ComputeGraphElement*>(buffers.rot.get()),
-                  static_cast<klartraum::ComputeGraphElement*>(buffers.scale.get()),
-                  static_cast<klartraum::ComputeGraphElement*>(buffers.colAlpha.get()),
-                  static_cast<klartraum::ComputeGraphElement*>(buffers.shR.get()),
-                  static_cast<klartraum::ComputeGraphElement*>(buffers.shG.get()),
-                  static_cast<klartraum::ComputeGraphElement*>(buffers.shB.get())}) {
-                if (element) {
-                    owners_[element] = node.id;
-                }
+            for (const auto* ref : model->buffers().all()) {
+                owners_[ref->buffer().get()] = node.id;
             }
-            gaussians_[node.id] = model;
+            gaussians_[node.id] = model->buffers();
             break;
         }
         case NodeKind::Camera:
@@ -375,10 +440,10 @@ private:
                                                       static_cast<float>(size.width) / static_cast<float>(size.height)});
             }
 
-            auto model = built(gaussians_, node, 0);
+            const klartraum::GaussianSoABuffers& gaussians = builtValue(gaussians_, node, 0);
 
-            auto splatting = klartraum::createGaussianSplatting(vc_, toGsplatBackend(p.backend), target, ubo, model,
-                                                                toGsplatConfig(p));
+            auto splatting = klartraum::createGaussianSplatting(vc_, toGsplatBackend(p.backend), target, ubo,
+                                                                gaussians, toGsplatConfig(p));
             owners_[splatting.get()] = node.id;
             // Slot 0 of a splatting backend is its target image, left for a
             // transfer (offscreen) or for presenting (swapchain).
@@ -496,12 +561,31 @@ private:
     std::map<int, TensorRef> tensors_;
     std::vector<std::pair<std::shared_ptr<FloatTensor>, std::vector<float>>> uploads_;
     std::vector<CameraUpdate> cameraUpdates_;
-    std::map<int, std::shared_ptr<klartraum::GaussianDataStandard>> gaussians_;
+    std::map<int, klartraum::GaussianSoABuffers> gaussians_;
+    std::map<int, klartraum::BufferRef> numbers_;
+    std::map<int, klartraum::BufferRef> transforms_;
+    std::vector<HostBinding> bindings_;
     std::map<const klartraum::ComputeGraphElement*, int> owners_;
     std::set<const klartraum::ComputeGraphElement*> inserted_;
 };
 
 } // namespace
+
+void applyBindings(const Graph& graph, const std::vector<HostBinding>& bindings, double time) {
+    for (const auto& binding : bindings) {
+        const Node* node = graph.findNode(binding.node);
+        if (!node) {
+            continue;
+        }
+        if (node->kind == NodeKind::UploadNumber) {
+            if (const Link* link = graph.inputLink(node->id, 0)) {
+                binding.values->set(0, evaluateNumber(graph, link->fromNode, time));
+            }
+        } else if (node->kind == NodeKind::MakeTransform) {
+            binding.values->set(0, node->as<MakeTransformParams>().component(binding.component));
+        }
+    }
+}
 
 RunResult runGraph(klartraum::VulkanContext& vulkanContext, const Graph& graph, const RunPlan& plan,
                    const RunContext& context) {
@@ -516,6 +600,7 @@ RunResult runGraph(klartraum::VulkanContext& vulkanContext, const Graph& graph, 
     computeGraph.enableProfiling();
     computeGraph.compileFrom(root);
     builder.upload();
+    applyBindings(graph, builder.bindings(), context.time);
     computeGraph.submitAndWait(vulkanContext.getGraphicsQueue(), 0);
 
     RunResult result = builder.readSinks(plan);
@@ -540,6 +625,7 @@ BuiltGraph buildLiveGraph(klartraum::KlartraumEngine& engine, const Graph& graph
     built.root = builder.presentRoot(*graph.findNode(plan.presentNode));
     built.owners = builder.owners();
     built.inserted = builder.inserted();
+    built.bindings = builder.bindings();
 
     engine.add(built.root);
     builder.upload();

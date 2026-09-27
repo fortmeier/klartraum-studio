@@ -15,6 +15,7 @@
 #include "klartraum/klartraum_core.hpp"
 #include "klartraum/interface_camera_orbit.hpp"
 
+#include "studio/cpu_numbers.hpp"
 #include "studio/graph_layout.hpp"
 #include "studio/graph_serialization.hpp"
 
@@ -59,6 +60,9 @@ ImU32 pinColor(PinType type) {
     switch (type) {
     case PinType::GaussiansCpu: return rgb(176, 164, 140);
     case PinType::GaussiansGpu: return rgb(236, 178, 72);
+    case PinType::NumberCpu: return rgb(176, 176, 132);
+    case PinType::NumberGpu: return rgb(238, 218, 96);
+    case PinType::TransformGpu: return rgb(110, 214, 214);
     case PinType::Camera: return rgb(110, 196, 140);
     case PinType::Image: return rgb(96, 160, 240);
     case PinType::Tensor: return rgb(206, 120, 226);
@@ -109,6 +113,13 @@ ImU32 kindColor(NodeKind kind) {
     case NodeKind::TensorToImage: return rgb(70, 90, 150);
     case NodeKind::Resample: return rgb(50, 110, 130);
     case NodeKind::UploadGaussians: return rgb(110, 80, 150);
+    case NodeKind::Number:
+    case NodeKind::Time:
+    case NodeKind::Sine: return rgb(110, 110, 70);
+    case NodeKind::UploadNumber: return rgb(120, 100, 40);
+    case NodeKind::MakeTransform: return rgb(40, 120, 120);
+    case NodeKind::TransformGaussiansGpu:
+    case NodeKind::MergeGaussiansGpu: return rgb(150, 100, 40);
     case NodeKind::OnnxModel: return rgb(150, 60, 110);
     case NodeKind::Preview: return rgb(60, 110, 100);
     case NodeKind::ImageFileWriter: return rgb(60, 100, 70);
@@ -189,6 +200,21 @@ void pinIcon(PinType type, bool connected, float size) {
             drawList->AddCircleFilled(c, r, color);
         } else {
             drawList->AddCircle(c, r, color, 0, 1.5f);
+        }
+        break;
+    case PinType::NumberCpu:
+    case PinType::NumberGpu:
+        if (connected) {
+            drawList->AddCircleFilled(c, r * 0.7f, color);
+        } else {
+            drawList->AddCircle(c, r * 0.7f, color, 0, 1.5f);
+        }
+        break;
+    case PinType::TransformGpu:
+        if (connected) {
+            drawList->AddRectFilled(ImVec2(c.x - r, c.y - r), ImVec2(c.x + r, c.y + r), color, r * 0.5f);
+        } else {
+            drawList->AddRect(ImVec2(c.x - r, c.y - r), ImVec2(c.x + r, c.y + r), color, r * 0.5f, 0, 1.5f);
         }
         break;
     case PinType::Tensor: {
@@ -296,6 +322,7 @@ std::optional<Example> exampleFromName(std::string_view name) {
     if (name == "autoencoder") return Example::Autoencoder;
     if (name == "splat-autoencoder") return Example::SplatAutoencoder;
     if (name == "combined-scenes") return Example::CombinedScenes;
+    if (name == "animated-scenes") return Example::AnimatedScenes;
     return std::nullopt;
 }
 
@@ -356,6 +383,16 @@ void StudioApp::loadExample(Example example) {
     case Example::CombinedScenes: {
         const std::string scene = options_.scenePath.empty() ? defaultScenePath() : options_.scenePath;
         setGraph(makeCombinedScenesGraph(scene, SceneParams{kSampleLantern, true}, kLanternPlacement, kLanternView), {});
+        break;
+    }
+    case Example::AnimatedScenes: {
+        const std::string scene = options_.scenePath.empty() ? defaultScenePath() : options_.scenePath;
+        MakeTransformParams placement;
+        placement.translation = kLanternPlacement.translation;
+        placement.scale = kLanternPlacement.scale;
+        // Swings 30 degrees either way around the combined example's 20, once every 4 seconds.
+        const SineParams swing{30.0f, 0.25f, 0.0f, kLanternPlacement.rotation[1]};
+        setGraph(makeAnimatedScenesGraph(scene, SceneParams{kSampleLantern, true}, placement, swing, kLanternView), {});
         break;
     }
     case Example::SplatAutoencoder: {
@@ -517,6 +554,13 @@ void StudioApp::updatePlan() {
                 element.owner = it->second;
             }
         }
+        for (auto& binding : liveBindings_) {
+            if (auto it = renamed.find(binding.node); it != renamed.end()) {
+                binding.node = it->second;
+            }
+        }
+        // The running graph now stands for the current one.
+        appliedGraph_ = graph_;
     }
     appliedPlan_ = pending;
 }
@@ -646,6 +690,7 @@ RunContext StudioApp::runContext() {
     context.resolveOutput = [this](const std::string& path) { return resolveOutputPath(path); };
     context.loadGaussians = [this](const std::vector<GaussianPart>& parts) { return loadGaussians(parts); };
     context.hostStep = [this](const std::string& step, double milliseconds) { logHostStep(step, milliseconds); };
+    context.time = secondsSinceStart();
     context.onnxInfo = [this](const std::string& path, std::string& error) { return onnxInfo(path, error); };
     return context;
 }
@@ -654,6 +699,7 @@ void StudioApp::installBuilder(const std::optional<LivePlan>& plan, const Graph&
     if (!plan) {
         compiled_ = {};
         compiledSignature_.clear();
+        liveBindings_.clear();
         // Without a live graph the window is only cleared; the builder keeps
         // it resizable.
         engine_.setGraphBuilder([](klartraum::KlartraumEngine& e) { e.add(e.createRenderPass()); });
@@ -668,8 +714,11 @@ void StudioApp::installBuilder(const std::optional<LivePlan>& plan, const Graph&
         try {
             BuiltGraph built = buildLiveGraph(e, graph, plan, runContext());
             compiled_ = introspect(built.root, built.owners, plan.presentNode, built.inserted);
+            liveBindings_ = std::move(built.bindings);
+            applyBindings(graph, liveBindings_, secondsSinceStart());
             builderError_.clear();
         } catch (const std::exception& ex) {
+            liveBindings_.clear();
             e.clearComputeGraphs();
             e.setCameraUBO(nullptr);
             compiled_ = {};
@@ -733,8 +782,8 @@ bool StudioApp::apply(const LivePlan& plan, const Graph& graph) {
     std::set<std::pair<std::string, bool>> keepScenes;
     for (int id : plan.nodes) {
         const Node* node = graph.findNode(id);
-        if (node->kind == NodeKind::GaussianSplatting) {
-            const auto parts = gaussianParts(graph, graph.inputLink(id, 0)->fromNode);
+        if (node->kind == NodeKind::UploadGaussians) {
+            const auto parts = gaussianParts(graph, id);
             keepModels.insert(partsKey(parts));
             for (const auto& part : parts) {
                 if (auto resolved = resolveInputPath(part.path)) {
@@ -878,8 +927,27 @@ void StudioApp::run() {
     }
 }
 
+void StudioApp::updateLiveValues() {
+    if (liveBindings_.empty() || !appliedPlan_) {
+        return;
+    }
+    // Live parameters are edited in the current graph; while it still
+    // compiles to the running pipelines, its values apply.
+    const bool current = plan_.live && !plan_.live->needsRebuildFrom(*appliedPlan_);
+    try {
+        applyBindings(current ? graph_ : appliedGraph_, liveBindings_, secondsSinceStart());
+    } catch (const std::exception&) {
+        // An input was disconnected; the plan reports it, and the values stay.
+    }
+}
+
+double StudioApp::secondsSinceStart() const {
+    return std::chrono::duration<double>(std::chrono::steady_clock::now() - start_).count();
+}
+
 void StudioApp::drawGui() {
     syncCamera();
+    updateLiveValues();
     if (runRequested_) {
         run();
     }
@@ -926,6 +994,9 @@ void StudioApp::drawMenuBar() {
             }
             if (ImGui::MenuItem("Raccoons and lantern (live)")) {
                 loadExample(Example::CombinedScenes);
+            }
+            if (ImGui::MenuItem("Raccoons and swinging lantern (live, GPU)")) {
+                loadExample(Example::AnimatedScenes);
             }
             ImGui::EndMenu();
         }
@@ -1010,9 +1081,9 @@ void StudioApp::drawOverview() {
             const Node& node = *appliedGraph_.findNode(id);
             if (node.kind == NodeKind::GaussianSplatting) {
                 ImGui::Text("Backend: %s", std::string(backendName(node.as<SplattingParams>().backend)).c_str());
-                const auto parts = gaussianParts(appliedGraph_, appliedGraph_.inputLink(id, 0)->fromNode);
-                if (auto it = models_.find(partsKey(parts)); it != models_.end()) {
-                    ImGui::Text("Gaussians: %u", it->second->count());
+            } else if (node.kind == NodeKind::UploadGaussians) {
+                if (auto model = uploadedGaussians(appliedGraph_, id)) {
+                    ImGui::Text("%s: %u Gaussians", node.title.c_str(), model->count());
                 }
             }
         }
@@ -1317,7 +1388,31 @@ void StudioApp::drawAuthoringEditor() {
             break;
         }
         case NodeKind::MergeGaussians:
+        case NodeKind::TransformGaussiansGpu:
+        case NodeKind::MergeGaussiansGpu:
             break;
+        case NodeKind::Number:
+        case NodeKind::Time:
+        case NodeKind::Sine:
+        case NodeKind::UploadNumber:
+            try {
+                const int source = node.kind == NodeKind::UploadNumber
+                                       ? (graph_.inputLink(node.id, 0) ? graph_.inputLink(node.id, 0)->fromNode : -1)
+                                       : node.id;
+                if (source >= 0) {
+                    ImGui::Text("= %.3f", evaluateNumber(graph_, source, secondsSinceStart()));
+                }
+            } catch (const std::exception&) {
+                ImGui::TextDisabled("(input missing)");
+            }
+            break;
+        case NodeKind::MakeTransform: {
+            const auto& p = node.as<MakeTransformParams>();
+            ImGui::Text("move %.2f %.2f %.2f", p.translation[0], p.translation[1], p.translation[2]);
+            ImGui::Text("turn %.0f %.0f %.0f", p.rotation[0], p.rotation[1], p.rotation[2]);
+            ImGui::Text("scale %.2f", p.scale);
+            break;
+        }
         case NodeKind::UploadGaussians:
             if (auto model = uploadedGaussians(graph_, node.id)) {
                 ImGui::Text("%u Gaussians, %.0f MB", model->count(), gaussianBytes(model->count()) / 1e6);
@@ -1954,6 +2049,63 @@ void StudioApp::drawNodeInspector(Node& node) {
                            "view-dependent colours turn along. Changes rebuild the Gaussians once you let go.");
         break;
     }
+    case NodeKind::Number: {
+        auto& p = node.as<NumberParams>();
+        ImGui::SeparatorText("Number");
+        changed |= ImGui::DragFloat("Value", &p.value, 0.01f);
+        break;
+    }
+    case NodeKind::Time: {
+        auto& p = node.as<TimeParams>();
+        ImGui::SeparatorText("Time");
+        changed |= ImGui::DragFloat("Speed", &p.speed, 0.01f);
+        ImGui::Text("t = %.2f s", secondsSinceStart() * p.speed);
+        ImGui::TextDisabled("Seconds since the studio started, times the speed.");
+        break;
+    }
+    case NodeKind::Sine: {
+        auto& p = node.as<SineParams>();
+        ImGui::SeparatorText("amplitude * sin(frequency * 2 pi * x + phase) + offset");
+        changed |= ImGui::DragFloat("Amplitude", &p.amplitude, 0.1f);
+        changed |= ImGui::DragFloat("Frequency", &p.frequency, 0.01f);
+        changed |= ImGui::DragFloat("Phase (deg)", &p.phase, 1.0f);
+        changed |= ImGui::DragFloat("Offset", &p.offset, 0.1f);
+        break;
+    }
+    case NodeKind::UploadNumber:
+        ImGui::SeparatorText("Upload");
+        ImGui::TextWrapped("Copies the CPU number into a klartraum::HostValues buffer before every frame, so "
+                           "GPU nodes read the current value without the graph being rebuilt.");
+        break;
+    case NodeKind::MakeTransform: {
+        auto& p = node.as<MakeTransformParams>();
+        ImGui::SeparatorText("Transform (GPU)");
+        changed |= ImGui::DragFloat3("Translation", p.translation.data(), 0.01f);
+        changed |= ImGui::DragFloat3("Pitch Yaw Roll", p.rotation.data(), 0.5f, -360.0f, 360.0f, "%.1f");
+        changed |= ImGui::DragFloat("Scale", &p.scale, 0.005f, 0.001f, 1000.0f, "%.3f", ImGuiSliderFlags_Logarithmic);
+        std::string connected;
+        for (int i = 0; i < 7; ++i) {
+            if (graph_.inputLink(node.id, i)) {
+                connected += (connected.empty() ? "" : ", ") + std::string(kindInfo(node.kind).inputs[i].name);
+            }
+        }
+        if (!connected.empty()) {
+            ImGui::TextWrapped("Taken from the inputs instead: %s.", connected.c_str());
+        }
+        ImGui::TextWrapped("Values apply while the graph runs, without rebuilding it. Rotates about X (pitch), "
+                           "then Y (yaw), then Z (roll); scales and rotates about the origin, then moves.");
+        break;
+    }
+    case NodeKind::TransformGaussiansGpu:
+        ImGui::SeparatorText("Transform (GPU)");
+        ImGui::TextWrapped("Writes moved copies of the Gaussians every frame: positions, orientations, sizes and "
+                           "view-dependent colour follow the transform.");
+        break;
+    case NodeKind::MergeGaussiansGpu:
+        ImGui::SeparatorText("Merge (GPU)");
+        ImGui::TextWrapped("Writes A's and B's Gaussians into one set every frame, so one Gaussian Splatting "
+                           "renders and depth-sorts them together.");
+        break;
     case NodeKind::MergeGaussians:
         ImGui::SeparatorText("Merge");
         ImGui::TextWrapped("Combines the Gaussians of A and B into one set that a single Gaussian Splatting "

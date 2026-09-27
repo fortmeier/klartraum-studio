@@ -16,7 +16,7 @@ ElementCategory categorize(std::string_view type) {
     if (starts("BufferElement") || starts("TensorElement")) {
         return ElementCategory::Buffer;
     }
-    if (starts("UniformBufferObject")) {
+    if (starts("UniformBufferObject") || starts("HostValues")) {
         return ElementCategory::Uniform;
     }
     if (starts("ImageViewSrcTransition")) {
@@ -26,7 +26,8 @@ ElementCategory categorize(std::string_view type) {
         return ElementCategory::Image;
     }
     if (starts("GeneralComputation") || starts("BufferTransformation") || starts("CopyBuffer") ||
-        starts("OnnxNetwork") || starts("ImageResample")) {
+        starts("OnnxNetwork") || starts("ImageResample") || starts("TransformBufferPass") ||
+        starts("GaussianTransformPass") || starts("GaussianMergePass")) {
         return ElementCategory::Compute;
     }
     if (starts("RenderPass")) {
