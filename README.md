@@ -221,3 +221,7 @@ tests run headlessly:
 - *Transform* scales uniformly; Gaussians cannot be stretched along one axis.
   Changing a transform rebuilds the live graph (on the CPU, once you let go of
   the control), so it is not an animation tool.
+
+## License
+
+MIT, see [LICENSE](LICENSE).
