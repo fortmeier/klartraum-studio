@@ -3,7 +3,9 @@
 #include <exception>
 #include <filesystem>
 #include <iostream>
+#include <optional>
 #include <string>
+#include <utility>
 
 #include <vulkan/vulkan.h>
 
@@ -26,6 +28,7 @@ void printUsage(const char* program) {
               << "  --backend compute|raster   backend of the default graph (default: raster)\n"
               << "  --profile                  start with per-element GPU timings enabled\n"
               << "  --frames N                 exit after N frames (smoke testing)\n"
+              << "  --window-position X Y      place the window's top-left corner at X, Y (screen points)\n"
               << "  --help                     show this help\n";
 }
 
@@ -34,6 +37,7 @@ void printUsage(const char* program) {
 int main(int argc, char** argv) {
     kstudio::StudioOptions options;
     int maxFrames = -1;
+    std::optional<std::pair<int, int>> windowPosition;
 
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
@@ -63,6 +67,10 @@ int main(int argc, char** argv) {
             options.profiling = true;
         } else if (arg == "--frames" && i + 1 < argc) {
             maxFrames = std::stoi(argv[++i]);
+        } else if (arg == "--window-position" && i + 2 < argc) {
+            const int x = std::stoi(argv[++i]);
+            const int y = std::stoi(argv[++i]);
+            windowPosition = std::make_pair(x, y);
         } else if (!arg.empty() && arg[0] != '-') {
             options.graphFile = arg;
         } else {
@@ -85,6 +93,9 @@ int main(int argc, char** argv) {
             // The resize is picked up by the first frame's event processing,
             // which rebuilds the graph for the larger swapchain.
             glfwSetWindowSize(frontend.getGlfwWindow(), kWindowWidth, kWindowHeight);
+            if (windowPosition) {
+                glfwSetWindowPos(frontend.getGlfwWindow(), windowPosition->first, windowPosition->second);
+            }
 
             frontend.loop(maxFrames);
 
