@@ -4,6 +4,8 @@ An application for building, inspecting and tuning
 [klartraum](https://github.com/fortmeier/klartraum) compute graphs. It opens
 with the Gaussian-splatting graph and renders it live.
 
+**Documentation:** [fortmeier.github.io/klartraum-studio](https://fortmeier.github.io/klartraum-studio/) · **Website:** [klartraum.ai](https://klartraum.ai)
+
 A graph has two kinds of output, and one graph can use both:
 
 - **Live:** everything feeding the *Present* node runs every frame and shows

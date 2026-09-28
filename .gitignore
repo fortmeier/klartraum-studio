@@ -4,3 +4,8 @@ build*.log
 !examples/*.ktgraph.json
 .vscode/
 .DS_Store
+
+# Documentation build
+docs/.venv/
+docs/_build/
+_site/

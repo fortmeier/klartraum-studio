@@ -1,0 +1,32 @@
+{
+  "format": "klartraum-studio-graph",
+  "version": 1,
+  "nodes": [
+    {"id": 1, "kind": "scene", "title": "Lantern", "position": [0.0, 0.0],
+     "params": {"path": "data/lantern.spz", "flipY": true}},
+    {"id": 2, "kind": "upload_gaussians", "title": "Upload Gaussians", "position": [300.0, 0.0], "params": {}},
+    {"id": 3, "kind": "time", "title": "Time (degrees)", "position": [0.0, 220.0],
+     "params": {"speed": 120.0}},
+    {"id": 4, "kind": "upload_number", "title": "Upload Yaw", "position": [300.0, 220.0], "params": {}},
+    {"id": 5, "kind": "make_transform", "title": "Make Transform", "position": [600.0, 160.0],
+     "params": {"translation": [0.0, 0.0, 0.0], "rotation": [0.0, 0.0, 0.0], "scale": 1.0}},
+    {"id": 6, "kind": "transform_gaussians_gpu", "title": "Transform (GPU)", "position": [900.0, 40.0], "params": {}},
+    {"id": 7, "kind": "camera", "title": "Orbit Camera", "position": [900.0, 220.0],
+     "params": {"azimuth": 0.898, "elevation": -0.498, "distance": 1.4, "target": [0.0, 0.04, 0.0], "up": "y"}},
+    {"id": 8, "kind": "swapchain_target", "title": "Swapchain Target", "position": [900.0, 380.0], "params": {}},
+    {"id": 9, "kind": "gaussian_splatting", "title": "Gaussian Splatting", "position": [1200.0, 160.0],
+     "params": {"backend": "raster"}},
+    {"id": 10, "kind": "present", "title": "Present", "position": [1500.0, 200.0], "params": {}}
+  ],
+  "links": [
+    {"from": [1, 0], "to": [2, 0]},
+    {"from": [3, 0], "to": [4, 0]},
+    {"from": [4, 0], "to": [5, 4]},
+    {"from": [2, 0], "to": [6, 0]},
+    {"from": [5, 0], "to": [6, 1]},
+    {"from": [6, 0], "to": [9, 0]},
+    {"from": [7, 0], "to": [9, 1]},
+    {"from": [8, 0], "to": [9, 2]},
+    {"from": [9, 0], "to": [10, 0]}
+  ]
+}
