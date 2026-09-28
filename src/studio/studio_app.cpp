@@ -423,6 +423,11 @@ void StudioApp::setGraph(Graph graph, std::filesystem::path file) {
     if (appliedPlan_) {
         appliedPlan_->cameraNode = -1;
     }
+    // The plan and the revisions refer to the previous graph; revisions are
+    // counted per graph, so the new one's may coincide with the old one's.
+    plan_ = {};
+    plannedRevision_ = ~uint64_t{0};
+    lastRunRevision_ = ~uint64_t{0};
     // Run results belong to the previous graph.
     lastRun_.reset();
     runError_.clear();
@@ -1317,7 +1322,8 @@ void StudioApp::drawAuthoringEditor() {
     std::set<int> liveGraphNodes;
     std::set<int> runGraphNodes;
     auto inGraph = [&](int id) {
-        return kindInfo(graph_.findNode(id)->kind).implementation == Implementation::ComputeGraph;
+        const Node* node = graph_.findNode(id);
+        return node && kindInfo(node->kind).implementation == Implementation::ComputeGraph;
     };
     if (plan_.live) {
         std::copy_if(plan_.live->nodes.begin(), plan_.live->nodes.end(),
