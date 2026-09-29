@@ -50,9 +50,13 @@ json paramsToJson(const NodeParams& params) {
                 return {{"path", p.path}, {"width", p.width}, {"height", p.height}};
             } else if constexpr (std::is_same_v<T, ResampleParams>) {
                 return {{"width", p.width}, {"height", p.height}, {"filter", filterName(p.filter)}};
-            } else if constexpr (std::is_same_v<T, OnnxModelParams> || std::is_same_v<T, ImageFileWriterParams> ||
-                                 std::is_same_v<T, TextEncoderParams> || std::is_same_v<T, VaeDecoderParams>) {
+            } else if constexpr (std::is_same_v<T, OnnxModelParams>) {
+                return {{"path", p.path}, {"inputs", p.inputs}, {"outputs", p.outputs}};
+            } else if constexpr (std::is_same_v<T, ImageFileWriterParams> || std::is_same_v<T, TextEncoderParams> ||
+                                 std::is_same_v<T, VaeDecoderParams>) {
                 return {{"path", p.path}};
+            } else if constexpr (std::is_same_v<T, BinaryLayerParams>) {
+                return {{"b", p.b}};
             } else if constexpr (std::is_same_v<T, PromptParams>) {
                 return {{"prompt", p.prompt}, {"negativePrompt", p.negativePrompt}, {"vocabulary", p.vocabulary}};
             } else if constexpr (std::is_same_v<T, LatentNoiseParams>) {
@@ -137,9 +141,15 @@ NodeParams paramsFromJson(NodeKind kind, const json& j) {
                 if (filter == filterName(ResampleFilter::Nearest)) {
                     p.filter = ResampleFilter::Nearest;
                 }
-            } else if constexpr (std::is_same_v<T, OnnxModelParams> || std::is_same_v<T, ImageFileWriterParams> ||
-                                 std::is_same_v<T, TextEncoderParams> || std::is_same_v<T, VaeDecoderParams>) {
+            } else if constexpr (std::is_same_v<T, OnnxModelParams>) {
                 read(j, "path", p.path);
+                read(j, "inputs", p.inputs);
+                read(j, "outputs", p.outputs);
+            } else if constexpr (std::is_same_v<T, ImageFileWriterParams> || std::is_same_v<T, TextEncoderParams> ||
+                                 std::is_same_v<T, VaeDecoderParams>) {
+                read(j, "path", p.path);
+            } else if constexpr (std::is_same_v<T, BinaryLayerParams>) {
+                read(j, "b", p.b);
             } else if constexpr (std::is_same_v<T, PromptParams>) {
                 read(j, "prompt", p.prompt);
                 read(j, "negativePrompt", p.negativePrompt);

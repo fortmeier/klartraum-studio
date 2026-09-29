@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <optional>
 #include <span>
+#include <utility>
 #include <string>
 #include <string_view>
 #include <variant>
@@ -20,8 +21,9 @@ namespace kstudio {
 
 // Gaussians and numbers are CPU data until an upload node puts them into GPU
 // buffers; images, tensors, transforms and camera buffers live on the GPU.
-// Tokens are a Stable Diffusion prompt's CLIP token ids and attention mask.
-enum class PinType { GaussiansCpu, GaussiansGpu, Camera, Image, Tensor, NumberCpu, NumberGpu, TransformGpu, Tokens };
+// A tensor's shape and element type are not part of the pin type; shape
+// inference checks them (see tensor_shapes.hpp).
+enum class PinType { GaussiansCpu, GaussiansGpu, Camera, Image, Tensor, NumberCpu, NumberGpu, TransformGpu };
 
 // Where a node's work happens: on the GPU, on the CPU, or moving data between
 // them.
@@ -53,6 +55,14 @@ enum class NodeKind {
     TensorToImage,
     Resample,
     OnnxModel,
+    Add,
+    Subtract,
+    Multiply,
+    Divide,
+    Relu,
+    Sigmoid,
+    Sqrt,
+    Softmax,
     Prompt,
     TextEncoder,
     LatentNoise,
@@ -205,16 +215,36 @@ struct ResampleParams {
     bool operator==(const ResampleParams&) const = default;
 };
 
+// An ONNX model with one tensor pin per model input and output. The pin
+// names are the model's input and output names; the studio updates them when
+// it reads the model (Graph::setOnnxPins), so links stay attached by slot.
 struct OnnxModelParams {
     std::string path;
+    std::vector<std::string> inputs{"input"};
+    std::vector<std::string> outputs{"output"};
     bool operator==(const OnnxModelParams&) const = default;
+};
+
+// Layers (klartraum::layers) on float tensors.
+
+// Add, Subtract, Multiply, Divide: A op B, broadcasting both. If B is not
+// connected, it is the one-element tensor `b`.
+struct BinaryLayerParams {
+    float b = 1.0f;
+    bool operator==(const BinaryLayerParams&) const = default;
+};
+
+// ReLU, Sigmoid, Sqrt, Softmax (over the last axis).
+struct UnaryLayerParams {
+    bool operator==(const UnaryLayerParams&) const = default;
 };
 
 // Stable Diffusion 1.5, as exported by klartraum's scripts/sd15_onnx.
 
 // A prompt and a negative prompt, tokenized with CLIP's byte-pair encoding
-// (klartraum::ClipTokenizer). `vocabulary` is CLIP's vocab.json; merges.txt
-// must be next to it.
+// (klartraum::ClipTokenizer) into two 2x77 int64 tensors: token ids and
+// attention mask. `vocabulary` is CLIP's vocab.json; merges.txt must be next
+// to it.
 struct PromptParams {
     std::string prompt;
     std::string negativePrompt;
@@ -268,9 +298,10 @@ using NodeParams = std::variant<SceneParams, TransformGaussiansParams, MergeGaus
                                 NumberParams, TimeParams, SineParams, UploadNumberParams, MakeTransformParams,
                                 TransformGaussiansGpuParams, MergeGaussiansGpuParams, CameraParams, SwapchainTargetParams, SplattingParams, PresentParams,
                                 OffscreenTargetParams, ImageFileParams, ImageToTensorParams, TensorToImageParams,
-                                ResampleParams, OnnxModelParams, PromptParams, TextEncoderParams, LatentNoiseParams,
+                                ResampleParams, OnnxModelParams, BinaryLayerParams, UnaryLayerParams, PromptParams, TextEncoderParams, LatentNoiseParams,
                                 DdimSamplerParams, VaeDecoderParams, PreviewParams, ImageFileWriterParams>;
 
+// A pin of a node kind, as listed in the kinds table.
 struct PinDesc {
     std::string_view name;
     PinType type;
@@ -278,6 +309,24 @@ struct PinDesc {
     std::optional<PinType> alsoAccepts = std::nullopt;
     // An optional input may stay unconnected; the node then uses a parameter.
     bool optional = false;
+
+    bool accepts(PinType other) const { return other == type || other == alsoAccepts; }
+};
+
+// A pin of a node in a graph: its kind's pin, or one that depends on the
+// node's parameters (an ONNX model's inputs and outputs). See
+// Graph::inputPins.
+struct Pin {
+    std::string name;
+    PinType type = PinType::Tensor;
+    std::optional<PinType> alsoAccepts = std::nullopt;
+    bool optional = false;
+
+    Pin() = default;
+    Pin(std::string name, PinType type, std::optional<PinType> alsoAccepts = std::nullopt, bool optional = false)
+        : name(std::move(name)), type(type), alsoAccepts(alsoAccepts), optional(optional) {}
+    explicit Pin(const PinDesc& desc)
+        : Pin(std::string(desc.name), desc.type, desc.alsoAccepts, desc.optional) {}
 
     bool accepts(PinType other) const { return other == type || other == alsoAccepts; }
 };
@@ -315,6 +364,10 @@ bool isSink(NodeKind kind);
 // and hand their result on as CPU data, which the nodes after them upload
 // again. They cannot run live.
 bool isStaged(NodeKind kind);
+// Add, Subtract, Multiply, Divide.
+bool isBinaryLayer(NodeKind kind);
+// ReLU, Sigmoid, Sqrt, Softmax.
+bool isUnaryLayer(NodeKind kind);
 // Nodes whose Image output holds a result (Gaussian Splatting, Tensor to
 // Image, Resample), as opposed to an empty target.
 bool producesImage(NodeKind kind);
@@ -392,6 +445,16 @@ public:
     const Node* inputNode(int node, int slot) const;
     // The type of the output feeding an input pin, if connected.
     std::optional<PinType> inputType(int node, int slot) const;
+
+    // A node's pins: its kind's, or, for an ONNX model, one tensor pin per
+    // model input and output.
+    std::vector<Pin> inputPins(const Node& node) const;
+    std::vector<Pin> outputPins(const Node& node) const;
+
+    // Sets an ONNX Model node's pins to the model's input and output names
+    // (at most kMaxPinsPerDirection each). Links to slots that no longer
+    // exist are removed; returns how many.
+    int setOnnxPins(int node, std::vector<std::string> inputs, std::vector<std::string> outputs);
 
     const std::vector<Node>& nodes() const { return nodes_; }
     std::vector<Node>& nodes() { return nodes_; }

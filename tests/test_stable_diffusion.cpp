@@ -14,7 +14,8 @@
  *   same nodes feeding a Preview are not
  * - validateStableDiffusionParams: missing files, latent sizes that are not multiples of 8 and step
  *   counts outside 1..1000 are errors
- * - tokensOnlyFeedTheTextEncoder: Tokens connect only to a Text Encoder
+ * - promptTokensAreInt64Tensors: the Prompt's ids and mask are 2x77 int64 tensor pins; they connect
+ *   like any tensor, and a layer that needs float32 reports them
  * - runStagesSplitAtStagedNodes: nodes before the sampler run in stage 0, the decoder in 1 and the
  *   sinks after it in 2
  * - roundTripStableDiffusionParams: prompt, noise, sampler and decoder parameters survive
@@ -42,6 +43,7 @@
 #include "studio/graph_runner.hpp"
 #include "studio/graph_serialization.hpp"
 #include "studio/stable_diffusion.hpp"
+#include "studio/tensor_shapes.hpp"
 
 using namespace kstudio;
 
@@ -252,16 +254,26 @@ TEST(StableDiffusion, validateStableDiffusionParams) {
     }
 }
 
-TEST(StableDiffusion, tokensOnlyFeedTheTextEncoder) {
+TEST(StableDiffusion, promptTokensAreInt64Tensors) {
     Graph graph;
     const int prompt = graph.addNode(NodeKind::Prompt);
     const int encoder = graph.addNode(NodeKind::TextEncoder);
-    const int model = graph.addNode(NodeKind::OnnxModel);
-    const int sampler = graph.addNode(NodeKind::DdimSampler);
-    EXPECT_FALSE(graph.connect(out(prompt), in(encoder)));
-    EXPECT_TRUE(graph.connect(out(prompt), in(model)));
-    EXPECT_TRUE(graph.connect(out(prompt), in(sampler, 1)));
-    EXPECT_FALSE(graph.connect(out(encoder), in(sampler, 1)));
+    const int multiply = graph.addNode(NodeKind::Multiply);
+    const auto outputs = graph.outputPins(*graph.findNode(prompt));
+    ASSERT_EQ(outputs.size(), 2u);
+    EXPECT_EQ(outputs[0].type, PinType::Tensor);
+    EXPECT_EQ(outputs[1].type, PinType::Tensor);
+    EXPECT_FALSE(graph.connect(out(prompt, 0), in(encoder, 0)));
+    EXPECT_FALSE(graph.connect(out(prompt, 1), in(encoder, 1)));
+    EXPECT_FALSE(graph.connect(out(prompt, 1), in(multiply, 0)));
+
+    const ShapeInference types = inferTensorShapes(graph, {});
+    EXPECT_EQ(types.types.at({prompt, 0}), (TensorType{{2, 77}, ElementType::Int64}));
+    EXPECT_EQ(types.types.at({prompt, 1}), (TensorType{{2, 77}, ElementType::Int64}));
+    EXPECT_TRUE(std::any_of(types.diagnostics.begin(), types.diagnostics.end(), [&](const Diagnostic& d) {
+        return d.node == multiply && d.message.find("float32") != std::string::npos;
+    }));
+    EXPECT_FALSE(types.types.contains({multiply, 0}));
 }
 
 TEST(StableDiffusion, runStagesSplitAtStagedNodes) {
@@ -310,9 +322,9 @@ TEST(StableDiffusion, planChecksModelShapes) {
         EXPECT_NE(d.severity, Severity::Error) << d.message;
     }
     ASSERT_TRUE(plan.run.has_value());
-    EXPECT_EQ(plan.run->shapes.at(findKind(graph, NodeKind::TextEncoder)), (TensorShape{2, 77, 768}));
-    EXPECT_EQ(plan.run->shapes.at(findKind(graph, NodeKind::DdimSampler)), (TensorShape{1, 4, 32, 32}));
-    EXPECT_EQ(plan.run->shapes.at(findKind(graph, NodeKind::VaeDecoder)), (TensorShape{1, 3, 256, 256}));
+    EXPECT_EQ(plan.run->types.at({findKind(graph, NodeKind::TextEncoder), 0}).shape, (TensorShape{2, 77, 768}));
+    EXPECT_EQ(plan.run->types.at({findKind(graph, NodeKind::DdimSampler), 0}).shape, (TensorShape{1, 4, 32, 32}));
+    EXPECT_EQ(plan.run->types.at({findKind(graph, NodeKind::VaeDecoder), 0}).shape, (TensorShape{1, 3, 256, 256}));
 
     const int noise = findKind(graph, NodeKind::LatentNoise);
     graph.findNode(noise)->as<LatentNoiseParams>().width = 512;

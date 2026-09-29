@@ -37,7 +37,7 @@ struct LivePlan {
 struct RunPlan {
     std::vector<int> nodes;
     std::vector<int> sinks;
-    std::map<int, TensorShape> shapes;  // tensor shapes, when ONNX info was available
+    std::map<OutputPin, TensorType> types;  // tensor types, where known (see inferTensorShapes)
 };
 
 struct CompilePlan {

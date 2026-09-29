@@ -376,7 +376,7 @@ TEST_F(GraphRunnerTest, liveReportsShapeMismatch) {
         buildLiveGraph(frontend->getKlartraumEngine(), graph, *compiled.live, context);
         FAIL() << "expected the build to fail";
     } catch (const std::runtime_error& e) {
-        EXPECT_TRUE(std::string(e.what()).starts_with("Encoder: the model expects a")) << e.what();
+        EXPECT_TRUE(std::string(e.what()).starts_with("Encoder: input 'input' expects a")) << e.what();
     }
 }
 

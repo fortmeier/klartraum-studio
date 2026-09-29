@@ -69,7 +69,7 @@ CompilePlan planGraph(const Graph& graph, const OnnxInfoProvider& onnxInfo, cons
             }
         }
         run.sinks = sinks;
-        run.shapes = std::move(shapes.shapes);
+        run.types = std::move(shapes.types);
         plan.run = std::move(run);
     }
 
@@ -100,7 +100,7 @@ CompilePlan planGraph(const Graph& graph, const OnnxInfoProvider& onnxInfo, cons
             live.signature += paramsToString(node.params);
         }
         live.signature += "(";
-        const auto& inputs = kindInfo(node.kind).inputs;
+        const auto inputs = graph.inputPins(node);
         for (int slot = 0; slot < static_cast<int>(inputs.size()); ++slot) {
             const Link* link = graph.inputLink(id, slot);
             if (!link) {

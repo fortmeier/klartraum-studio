@@ -122,6 +122,7 @@ if(KLARTRAUM_STUDIO_BUILD_TESTS)
     tests/test_gaussian_sources.cpp
     tests/test_cpu_numbers.cpp
     tests/test_stable_diffusion.cpp
+    tests/test_tensor_pins.cpp
   )
   target_link_libraries(klartraum_studio_tests PRIVATE klartraum_studio_core GTest::gtest_main)
   include(GoogleTest)

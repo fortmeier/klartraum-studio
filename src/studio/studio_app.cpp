@@ -67,7 +67,6 @@ ImU32 pinColor(PinType type) {
     case PinType::Camera: return rgb(110, 196, 140);
     case PinType::Image: return rgb(96, 160, 240);
     case PinType::Tensor: return rgb(206, 120, 226);
-    case PinType::Tokens: return rgb(240, 140, 150);
     }
     return rgb(200, 200, 200);
 }
@@ -123,6 +122,14 @@ ImU32 kindColor(NodeKind kind) {
     case NodeKind::TransformGaussiansGpu:
     case NodeKind::MergeGaussiansGpu: return rgb(150, 100, 40);
     case NodeKind::OnnxModel: return rgb(150, 60, 110);
+    case NodeKind::Add:
+    case NodeKind::Subtract:
+    case NodeKind::Multiply:
+    case NodeKind::Divide:
+    case NodeKind::Relu:
+    case NodeKind::Sigmoid:
+    case NodeKind::Sqrt:
+    case NodeKind::Softmax: return rgb(120, 70, 130);
     case NodeKind::Prompt:
     case NodeKind::TextEncoder: return rgb(130, 70, 150);
     case NodeKind::LatentNoise: return rgb(120, 110, 60);
@@ -224,9 +231,8 @@ void pinIcon(PinType type, bool connected, float size) {
             drawList->AddRect(ImVec2(c.x - r, c.y - r), ImVec2(c.x + r, c.y + r), color, r * 0.5f, 0, 1.5f);
         }
         break;
-    case PinType::Tensor:
-    case PinType::Tokens: {
-        const float d = type == PinType::Tokens ? r * 0.85f : r * 1.25f;
+    case PinType::Tensor: {
+        const float d = r * 1.25f;
         const ImVec2 top(c.x, c.y - d), right(c.x + d, c.y), bottom(c.x, c.y + d), left(c.x - d, c.y);
         if (connected) {
             drawList->AddQuadFilled(top, right, bottom, left, color);
@@ -543,8 +549,33 @@ std::shared_ptr<const OnnxModelInfo> StudioApp::onnxInfo(const std::string& path
 // ---------------------------------------------------------------------------
 // Compilation
 
+void StudioApp::syncOnnxPins() {
+    for (auto& node : graph_.nodes()) {
+        if (node.kind != NodeKind::OnnxModel || node.as<OnnxModelParams>().path.empty()) {
+            continue;
+        }
+        std::string error;
+        const auto info = onnxInfo(node.as<OnnxModelParams>().path, error);
+        if (!info) {
+            continue;  // the plan reports it
+        }
+        std::vector<std::string> inputs, outputs;
+        for (const auto& input : info->inputs) {
+            inputs.push_back(input.name);
+        }
+        for (const auto& output : info->outputs) {
+            outputs.push_back(output.name);
+        }
+        if (const int removed = graph_.setOnnxPins(node.id, std::move(inputs), std::move(outputs)); removed > 0) {
+            setStatus(std::format("{}: the model's pins changed; {} link(s) removed", node.title, removed), true);
+        }
+    }
+}
+
 void StudioApp::updatePlan() {
     if (graph_.revision() != plannedRevision_) {
+        // An ONNX Model node's pins follow its model file.
+        syncOnnxPins();
         plan_ = planGraph(
             graph_, [this](const std::string& path, std::string& error) { return onnxInfo(path, error); },
             [this](const std::string& path) { return resolveInputPath(path).has_value(); });
@@ -1502,6 +1533,19 @@ void StudioApp::drawAuthoringEditor() {
         case NodeKind::OnnxModel:
             ImGui::TextUnformatted(fileName(node.as<OnnxModelParams>().path).c_str());
             break;
+        case NodeKind::Add:
+        case NodeKind::Subtract:
+        case NodeKind::Multiply:
+        case NodeKind::Divide:
+            if (!graph_.inputLink(node.id, 1)) {
+                ImGui::Text("b = %g", node.as<BinaryLayerParams>().b);
+            }
+            break;
+        case NodeKind::Relu:
+        case NodeKind::Sigmoid:
+        case NodeKind::Sqrt:
+        case NodeKind::Softmax:
+            break;
         case NodeKind::Prompt: {
             const auto& prompt = node.as<PromptParams>().prompt;
             ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + kNodeWidth);
@@ -1555,23 +1599,31 @@ void StudioApp::drawAuthoringEditor() {
             break;
         }
         }
-        // Tensor outputs show their shape.
+        // Tensor outputs show their shape and, unless float32, element type.
+        const auto inputs = graph_.inputPins(node);
+        const auto outputs = graph_.outputPins(node);
         if (plan_.run) {
-            if (auto it = plan_.run->shapes.find(node.id); it != plan_.run->shapes.end()) {
-                ImGui::Text("-> %s", shapeToString(it->second).c_str());
+            for (int slot = 0; slot < static_cast<int>(outputs.size()); ++slot) {
+                if (auto it = plan_.run->types.find({node.id, slot}); it != plan_.run->types.end()) {
+                    const std::string type = tensorTypeToString(it->second);
+                    if (outputs.size() > 1) {
+                        ImGui::Text("%s -> %s", outputs[slot].name.c_str(), type.c_str());
+                    } else {
+                        ImGui::Text("-> %s", type.c_str());
+                    }
+                }
             }
         }
         ImGui::PopStyleColor();
 
         // Pin rows: inputs on the left, outputs right-aligned.
-        const auto& info = kindInfo(node.kind);
-        const size_t rows = std::max(info.inputs.size(), info.outputs.size());
+        const size_t rows = std::max(inputs.size(), outputs.size());
         const float iconSize = ImGui::GetTextLineHeight();
         for (size_t row = 0; row < rows; ++row) {
             const int slot = static_cast<int>(row);
             bool sameLine = false;
-            if (row < info.inputs.size()) {
-                const auto& pin = info.inputs[row];
+            if (row < inputs.size()) {
+                const auto& pin = inputs[row];
                 const PinRef ref{node.id, PinDirection::Input, slot};
                 ed::BeginPin(authoringPinId(ref), ed::PinKind::Input);
                 ed::PinPivotAlignment(ImVec2(0.0f, 0.5f));
@@ -1582,8 +1634,8 @@ void StudioApp::drawAuthoringEditor() {
                 ed::EndPin();
                 sameLine = true;
             }
-            if (row < info.outputs.size()) {
-                const auto& pin = info.outputs[row];
+            if (row < outputs.size()) {
+                const auto& pin = outputs[row];
                 const PinRef ref{node.id, PinDirection::Output, slot};
                 const float width = ImGui::CalcTextSize(pin.name.data(), pin.name.data() + pin.name.size()).x +
                                     ImGui::GetStyle().ItemSpacing.x + iconSize;
@@ -1618,8 +1670,7 @@ void StudioApp::drawAuthoringEditor() {
     }
 
     for (const auto& link : graph_.links()) {
-        const Node* from = graph_.findNode(link.fromNode);
-        const PinType type = kindInfo(from->kind).outputs[link.fromSlot].type;
+        const PinType type = graph_.inputType(link.toNode, link.toSlot).value_or(PinType::Tensor);
         ed::Link(authoringLinkId(link.id), authoringPinId({link.fromNode, PinDirection::Output, link.fromSlot}),
                  authoringPinId({link.toNode, PinDirection::Input, link.toSlot}),
                  ImGui::ColorConvertU32ToFloat4(pinColor(type)), 2.5f);
@@ -2401,6 +2452,23 @@ void StudioApp::drawNodeInspector(Node& node) {
     case NodeKind::OnnxModel:
         changed |= modelFile(node.as<OnnxModelParams>().path, {kSampleEncoder, kSampleDecoder});
         break;
+    case NodeKind::Add:
+    case NodeKind::Subtract:
+    case NodeKind::Multiply:
+    case NodeKind::Divide:
+        ImGui::SeparatorText("Operand");
+        if (graph_.inputLink(node.id, 1)) {
+            ImGui::TextDisabled("B is connected; b is not used.");
+        } else {
+            changed |= ImGui::DragFloat("b", &node.as<BinaryLayerParams>().b, 0.01f, 0.0f, 0.0f, "%.6g");
+            ImGui::TextDisabled("B is not connected: the node uses b as a one-element tensor.");
+        }
+        break;
+    case NodeKind::Relu:
+    case NodeKind::Sigmoid:
+    case NodeKind::Sqrt:
+    case NodeKind::Softmax:
+        break;
     case NodeKind::Prompt: {
         auto& p = node.as<PromptParams>();
         ImGui::SeparatorText("Prompt");
@@ -2487,13 +2555,13 @@ void StudioApp::drawNodeInspector(Node& node) {
     }
 
     ImGui::SeparatorText("Pins");
-    for (int slot = 0; slot < static_cast<int>(info.inputs.size()); ++slot) {
+    const auto inputs = graph_.inputPins(node);
+    for (int slot = 0; slot < static_cast<int>(inputs.size()); ++slot) {
         const Node* src = graph_.inputNode(node.id, slot);
-        ImGui::BulletText("in  %s <- %s", std::string(info.inputs[slot].name).c_str(),
-                          src ? src->title.c_str() : "(not connected)");
+        ImGui::BulletText("in  %s <- %s", inputs[slot].name.c_str(), src ? src->title.c_str() : "(not connected)");
     }
-    for (const auto& pin : info.outputs) {
-        ImGui::BulletText("out %s (%s)", std::string(pin.name).c_str(), std::string(pinTypeName(pin.type)).c_str());
+    for (const auto& pin : graph_.outputPins(node)) {
+        ImGui::BulletText("out %s (%s)", pin.name.c_str(), std::string(pinTypeName(pin.type)).c_str());
     }
 
     drawDiagnostics(node.id);

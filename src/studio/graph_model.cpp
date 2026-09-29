@@ -41,8 +41,9 @@ constexpr PinDesc kImageInputs[] = {{"Image", PinType::Image}};
 constexpr PinDesc kTensorInputs[] = {{"Tensor", PinType::Tensor}};
 constexpr PinDesc kTensorOutputs[] = {{"Tensor", PinType::Tensor}};
 constexpr PinDesc kSinkInputs[] = {{"Tensor", PinType::Tensor, PinType::Image}};
-constexpr PinDesc kTokensOutputs[] = {{"Tokens", PinType::Tokens}};
-constexpr PinDesc kTextEncoderInputs[] = {{"Tokens", PinType::Tokens}};
+constexpr PinDesc kBinaryLayerInputs[] = {{"A", PinType::Tensor}, {"B", PinType::Tensor, std::nullopt, true}};
+constexpr PinDesc kTokensOutputs[] = {{"Ids", PinType::Tensor}, {"Mask", PinType::Tensor}};
+constexpr PinDesc kTextEncoderInputs[] = {{"Ids", PinType::Tensor}, {"Mask", PinType::Tensor}};
 constexpr PinDesc kEmbeddingsOutputs[] = {{"Embeddings", PinType::Tensor}};
 constexpr PinDesc kLatentsInputs[] = {{"Latents", PinType::Tensor}};
 constexpr PinDesc kLatentsOutputs[] = {{"Latents", PinType::Tensor}};
@@ -113,11 +114,31 @@ const NodeKindInfo kKinds[] = {
      ComputeGraph, "klartraum::GeneralComputation (tensor_to_image.comp)", kEveryExecution},
     {NodeKind::Resample, "resample", "Resample", "Compute", "Resamples an image to a fixed size.", kImageInputs,
      kImageOutputs, Gpu, ComputeGraph, "klartraum::ImageResample", kEveryExecution},
-    {NodeKind::OnnxModel, "onnx_model", "ONNX Model", "Compute", "Runs an ONNX network on a tensor.", kTensorInputs,
-     kTensorOutputs, Gpu, ComputeGraph, "klartraum::OnnxNetwork", kEveryExecution},
+    {NodeKind::OnnxModel, "onnx_model", "ONNX Model", "Compute",
+     "Runs an ONNX network; it has one tensor pin per model input and output.", kTensorInputs, kTensorOutputs, Gpu,
+     ComputeGraph, "klartraum::OnnxNetwork", kEveryExecution},
+    {NodeKind::Add, "add", "Add", "Layers", "A + B, elementwise; the shapes broadcast. Without B, adds the node's b.",
+     kBinaryLayerInputs, kTensorOutputs, Gpu, ComputeGraph, "klartraum::layers::binary (Add)", kEveryExecution},
+    {NodeKind::Subtract, "subtract", "Subtract", "Layers",
+     "A - B, elementwise; the shapes broadcast. Without B, subtracts the node's b.", kBinaryLayerInputs,
+     kTensorOutputs, Gpu, ComputeGraph, "klartraum::layers::binary (Sub)", kEveryExecution},
+    {NodeKind::Multiply, "multiply", "Multiply", "Layers",
+     "A * B, elementwise; the shapes broadcast. Without B, multiplies by the node's b.", kBinaryLayerInputs,
+     kTensorOutputs, Gpu, ComputeGraph, "klartraum::layers::binary (Mul)", kEveryExecution},
+    {NodeKind::Divide, "divide", "Divide", "Layers",
+     "A / B, elementwise; the shapes broadcast. Without B, divides by the node's b.", kBinaryLayerInputs,
+     kTensorOutputs, Gpu, ComputeGraph, "klartraum::layers::binary (Div)", kEveryExecution},
+    {NodeKind::Relu, "relu", "ReLU", "Layers", "max(x, 0), elementwise.", kTensorInputs, kTensorOutputs, Gpu,
+     ComputeGraph, "klartraum::layers::relu", kEveryExecution},
+    {NodeKind::Sigmoid, "sigmoid", "Sigmoid", "Layers", "1 / (1 + exp(-x)), elementwise.", kTensorInputs,
+     kTensorOutputs, Gpu, ComputeGraph, "klartraum::layers::unary (Sigmoid)", kEveryExecution},
+    {NodeKind::Sqrt, "sqrt", "Sqrt", "Layers", "The square root, elementwise.", kTensorInputs, kTensorOutputs, Gpu,
+     ComputeGraph, "klartraum::layers::unary (Sqrt)", kEveryExecution},
+    {NodeKind::Softmax, "softmax", "Softmax", "Layers", "Softmax over the last axis.", kTensorInputs, kTensorOutputs,
+     Gpu, ComputeGraph, "klartraum::layers::softmax", kEveryExecution},
     {NodeKind::Prompt, "sd_prompt", "Prompt", "Stable Diffusion",
-     "A prompt and a negative prompt, tokenized with CLIP's byte-pair encoding into 2x77 token ids (negative "
-     "first) and their attention mask.",
+     "A prompt and a negative prompt, tokenized with CLIP's byte-pair encoding into 2x77 int64 tensors: token "
+     "ids (negative prompt first) and their attention mask.",
      {}, kTokensOutputs, Upload, ComputeGraph,
      "klartraum::ClipTokenizer on the CPU, uploaded into two klartraum::TensorElement<int64_t>", kOnBuild},
     {NodeKind::TextEncoder, "sd_text_encoder", "Text Encoder", "Stable Diffusion",
@@ -184,7 +205,6 @@ std::string_view pinTypeName(PinType type) {
     case PinType::Camera: return "Camera";
     case PinType::Image: return "Image";
     case PinType::Tensor: return "Tensor";
-    case PinType::Tokens: return "Tokens";
     }
     return "?";
 }
@@ -220,6 +240,14 @@ NodeParams defaultParams(NodeKind kind) {
     case NodeKind::TensorToImage: return TensorToImageParams{};
     case NodeKind::Resample: return ResampleParams{};
     case NodeKind::OnnxModel: return OnnxModelParams{};
+    case NodeKind::Add:
+    case NodeKind::Subtract:
+    case NodeKind::Multiply:
+    case NodeKind::Divide: return BinaryLayerParams{};
+    case NodeKind::Relu:
+    case NodeKind::Sigmoid:
+    case NodeKind::Sqrt:
+    case NodeKind::Softmax: return UnaryLayerParams{};
     case NodeKind::Prompt: return PromptParams{};
     case NodeKind::TextEncoder: return TextEncoderParams{};
     case NodeKind::LatentNoise: return LatentNoiseParams{};
@@ -233,6 +261,15 @@ NodeParams defaultParams(NodeKind kind) {
 
 bool isSink(NodeKind kind) {
     return kind == NodeKind::Preview || kind == NodeKind::ImageFileWriter;
+}
+
+bool isBinaryLayer(NodeKind kind) {
+    return kind == NodeKind::Add || kind == NodeKind::Subtract || kind == NodeKind::Multiply ||
+           kind == NodeKind::Divide;
+}
+
+bool isUnaryLayer(NodeKind kind) {
+    return kind == NodeKind::Relu || kind == NodeKind::Sigmoid || kind == NodeKind::Sqrt || kind == NodeKind::Softmax;
 }
 
 bool isStaged(NodeKind kind) {
@@ -336,8 +373,8 @@ std::optional<std::string> Graph::checkConnection(PinRef from, PinRef to) const 
     if (!src || !dst) {
         return "Unknown node.";
     }
-    const auto& outputs = kindInfo(src->kind).outputs;
-    const auto& inputs = kindInfo(dst->kind).inputs;
+    const auto outputs = outputPins(*src);
+    const auto inputs = inputPins(*dst);
     if (from.slot < 0 || from.slot >= static_cast<int>(outputs.size()) || to.slot < 0 ||
         to.slot >= static_cast<int>(inputs.size())) {
         return "Unknown pin.";
@@ -397,7 +434,55 @@ std::optional<PinType> Graph::inputType(int node, int slot) const {
     if (!source) {
         return std::nullopt;
     }
-    return kindInfo(source->kind).outputs[link->fromSlot].type;
+    const auto outputs = outputPins(*source);
+    return link->fromSlot < static_cast<int>(outputs.size()) ? std::optional(outputs[link->fromSlot].type)
+                                                             : std::nullopt;
+}
+
+std::vector<Pin> Graph::inputPins(const Node& node) const {
+    if (node.kind == NodeKind::OnnxModel) {
+        std::vector<Pin> pins;
+        for (const auto& name : node.as<OnnxModelParams>().inputs) {
+            pins.emplace_back(name, PinType::Tensor);
+        }
+        return pins;
+    }
+    const auto& desc = kindInfo(node.kind).inputs;
+    return {desc.begin(), desc.end()};
+}
+
+std::vector<Pin> Graph::outputPins(const Node& node) const {
+    if (node.kind == NodeKind::OnnxModel) {
+        std::vector<Pin> pins;
+        for (const auto& name : node.as<OnnxModelParams>().outputs) {
+            pins.emplace_back(name, PinType::Tensor);
+        }
+        return pins;
+    }
+    const auto& desc = kindInfo(node.kind).outputs;
+    return {desc.begin(), desc.end()};
+}
+
+int Graph::setOnnxPins(int nodeId, std::vector<std::string> inputs, std::vector<std::string> outputs) {
+    Node* node = findNode(nodeId);
+    if (!node || node->kind != NodeKind::OnnxModel) {
+        throw std::logic_error("setOnnxPins: not an ONNX Model node");
+    }
+    inputs.resize(std::min<size_t>(inputs.size(), kMaxPinsPerDirection));
+    outputs.resize(std::min<size_t>(outputs.size(), kMaxPinsPerDirection));
+    auto& p = node->as<OnnxModelParams>();
+    if (p.inputs == inputs && p.outputs == outputs) {
+        return 0;
+    }
+    p.inputs = std::move(inputs);
+    p.outputs = std::move(outputs);
+    const int in = static_cast<int>(p.inputs.size());
+    const int out = static_cast<int>(p.outputs.size());
+    const auto removed = std::erase_if(links_, [&](const Link& l) {
+        return (l.toNode == nodeId && l.toSlot >= in) || (l.fromNode == nodeId && l.fromSlot >= out);
+    });
+    touch();
+    return static_cast<int>(removed);
 }
 
 bool Graph::reaches(int fromNode, int toNode) const {
@@ -501,7 +586,7 @@ std::vector<Diagnostic> Graph::validate() const {
     };
 
     for (const auto& node : nodes_) {
-        const auto& inputs = kindInfo(node.kind).inputs;
+        const auto inputs = inputPins(node);
         for (int slot = 0; slot < static_cast<int>(inputs.size()); ++slot) {
             if (!inputs[slot].optional && !inputLink(node.id, slot)) {
                 report(Severity::Error, node.id, std::format("Input '{}' is not connected.", inputs[slot].name));
@@ -853,7 +938,8 @@ Graph makeStableDiffusionGraph(const std::string& modelDirectory, uint32_t size,
     graph.findNode(decoder)->as<VaeDecoderParams>().path = file("sd15_vae_decoder.onnx");
     graph.findNode(writer)->as<ImageFileWriterParams>().path = outputPath;
 
-    graph.connect(out(promptNode), in(encoder));
+    graph.connect(out(promptNode, 0), in(encoder, 0));  // token ids
+    graph.connect(out(promptNode, 1), in(encoder, 1));  // attention mask
     graph.connect(out(noise), in(sampler, 0));
     graph.connect(out(encoder), in(sampler, 1));
     graph.connect(out(sampler), in(decoder));

@@ -97,6 +97,8 @@ private:
     std::shared_ptr<const OnnxModelInfo> onnxInfo(const std::string& path, std::string& error);
 
     // Compilation
+    // Sets every ONNX Model node's pins to its model's inputs and outputs.
+    void syncOnnxPins();
     void updatePlan();
     bool apply(const LivePlan& plan, const Graph& graph);
     void installBuilder(const std::optional<LivePlan>& plan, const Graph& graph);
