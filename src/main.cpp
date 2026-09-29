@@ -22,8 +22,8 @@ constexpr int kWindowHeight = 960;
 void printUsage(const char* program) {
     std::cout << "Usage: " << program << " [options] [graph.ktgraph.json]\n"
               << "  --example NAME             start with an example: gaussian-splatting (default),\n"
-              << "                             autoencoder, splat-autoencoder, combined-scenes or\n"
-              << "                             animated-scenes\n"
+              << "                             autoencoder, splat-autoencoder, combined-scenes,\n"
+              << "                             animated-scenes or stable-diffusion\n"
               << "  --spz PATH                 scene for the Gaussian-splatting examples\n"
               << "  --backend compute|raster   backend of the default graph (default: raster)\n"
               << "  --profile                  start with per-element GPU timings enabled\n"

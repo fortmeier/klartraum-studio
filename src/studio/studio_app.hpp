@@ -29,7 +29,7 @@ class GaussianDataStandard;
 namespace kstudio {
 
 // The example graphs offered in File > Examples.
-enum class Example { GaussianSplatting, Autoencoder, SplatAutoencoder, CombinedScenes, AnimatedScenes };
+enum class Example { GaussianSplatting, Autoencoder, SplatAutoencoder, CombinedScenes, AnimatedScenes, StableDiffusion };
 std::optional<Example> exampleFromName(std::string_view name);
 
 struct StudioOptions {

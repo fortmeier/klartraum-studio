@@ -23,6 +23,10 @@ CompilePlan planGraph(const Graph& graph, const OnnxInfoProvider& onnxInfo, cons
                 path = &node.as<SceneParams>().path;
             } else if (node.kind == NodeKind::ImageFile) {
                 path = &node.as<ImageFileParams>().path;
+            } else if (node.kind == NodeKind::Prompt) {
+                path = &node.as<PromptParams>().vocabulary;
+            } else if (node.kind == NodeKind::LatentNoise) {
+                path = &node.as<LatentNoiseParams>().path;  // optional
             }
             if (path && !path->empty() && !inputExists(*path)) {
                 plan.diagnostics.push_back(Diagnostic{Severity::Error, node.id, "File not found: " + *path});

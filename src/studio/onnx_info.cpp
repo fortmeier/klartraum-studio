@@ -33,7 +33,12 @@ std::string shapeToString(const TensorShape& shape) {
 }
 
 bool isSupportedOnnxOp(const std::string& opType) {
-    static const std::set<std::string> supported{"Conv", "ConvTranspose", "Relu", "Reshape", "Transpose", "Constant"};
+    // See createTensorOperation in klartraum's onnx_operations.hpp.
+    static const std::set<std::string> supported{
+        "Add",     "Cast",     "Concat",  "Constant", "Conv",  "ConvTranspose", "Cos",       "Div",
+        "Erf",     "Expand",   "Gather",  "Gemm",     "InstanceNormalization",   "LayerNormalization",
+        "MatMul",  "Mul",      "Relu",    "Reshape",  "Resize", "Sigmoid",       "Sin",       "Slice",
+        "Softmax", "Split",    "Sqrt",    "Sub",      "Transpose", "Unsqueeze"};
     return supported.contains(opType);
 }
 

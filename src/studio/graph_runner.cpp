@@ -1,5 +1,6 @@
 #include "studio/graph_runner.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <format>
 #include <set>
@@ -22,8 +23,10 @@
 #include "klartraum/klartraum_core.hpp"
 #include "klartraum/offscreen_target.hpp"
 #include "klartraum/onnx/onnx_network.hpp"
+#include "klartraum/sd15/clip_tokenizer.hpp"
 
 #include "studio/cpu_numbers.hpp"
+#include "studio/stable_diffusion.hpp"
 
 namespace kstudio {
 
@@ -31,6 +34,19 @@ namespace {
 
 using klartraum::ComputeGraphElementPtr;
 using FloatTensor = klartraum::TensorElement<float>;
+using Int64Tensor = klartraum::TensorElement<int64_t>;
+
+// Tensors the studio fills from the CPU; readable back as well, e.g. by ONNX
+// operations that copy them.
+constexpr VkBufferUsageFlags kUploadUsage =
+    VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+
+// A prompt's token ids and attention mask, both 2x77.
+struct TokensRef {
+    std::shared_ptr<Int64Tensor> ids;
+    std::shared_ptr<Int64Tensor> mask;
+};
+
 
 // Matches shaders/onnx/image_to_tensor.comp and tensor_to_image.comp.
 struct ImageSizePushConstants {
@@ -82,16 +98,60 @@ public:
         }
     }
 
-    // One root depending on every sink's tensor.
-    ComputeGraphElementPtr runRoot(const RunPlan& plan) {
+    // One root depending on every sink's tensor and on the tensors of
+    // `exported` nodes, which later stages read; nullptr if there are none.
+    ComputeGraphElementPtr runRoot(const std::vector<int>& sinks, const std::vector<int>& exported) {
         auto root = std::make_shared<klartraum::NoOp>(vc_);
         root->setName("Run");
         inserted_.insert(root.get());
-        for (size_t i = 0; i < plan.sinks.size(); ++i) {
-            const TensorRef& ref = sinkTensor(*graph_.findNode(plan.sinks[i]));
-            root->setInput(ref.producer, static_cast<int>(i), ref.slot);
+        int slot = 0;
+        for (int sink : sinks) {
+            const TensorRef& ref = sinkTensor(*graph_.findNode(sink));
+            root->setInput(ref.producer, slot++, ref.slot);
         }
-        return root;
+        for (int id : exported) {
+            if (hostTensors_.contains(id)) {
+                continue;  // computed on the CPU already
+            }
+            auto it = tensors_.find(id);
+            if (it == tensors_.end()) {
+                throw std::runtime_error(graph_.findNode(id)->title + ": only tensors can be handed to a later stage");
+            }
+            root->setInput(it->second.producer, slot++, it->second.slot);
+        }
+        return slot == 0 ? nullptr : root;
+    }
+
+    // After a stage ran: reads the tensors of `exported` nodes back for the
+    // nodes after it, and releases the stage's elements.
+    void finishStage(const std::vector<int>& exported) {
+        for (int id : exported) {
+            if (hostTensors_.contains(id)) {
+                continue;
+            }
+            const TensorRef& ref = tensors_.at(id);
+            const auto& dims = ref.tensor->getDimensions();
+            HostTensor host{TensorShape(dims.begin(), dims.end()), std::vector<float>(ref.tensor->getDataElementCount())};
+            ref.tensor->getDataBuffer(0).memcopyTo(host.values);
+            hostTensors_[id] = std::move(host);
+        }
+        tensors_.clear();
+        images_.clear();
+        tokens_.clear();
+        owners_.clear();
+        inserted_.clear();
+    }
+
+    // Runs a staged node on the tensors earlier stages computed; its result
+    // stays on the CPU until a later node uploads it.
+    StagedResult runStaged(const Node& node) {
+        try {
+            StagedResult result = runStagedNode(node);
+            hostTensors_[node.id] = result.output;
+            return result;
+        } catch (const std::exception& e) {
+            throw std::runtime_error(node.title + ": " + e.what());
+        }
     }
 
     // Brings the Present node's image into the swapchain.
@@ -111,6 +171,13 @@ public:
                 tensor->getDataBuffer(path).memcopyFrom(data);
             }
         }
+        for (const auto& [tensor, data] : tokenUploads_) {
+            for (uint32_t path = 0; path < numPaths_; ++path) {
+                tensor->getDataBuffer(path).memcopyFrom(data);
+            }
+        }
+        uploads_.clear();
+        tokenUploads_.clear();
         for (const auto& update : cameraUpdates_) {
             klartraum::InterfaceCameraOrbit orbit(update.params.up == UpAxis::Y
                                                       ? klartraum::InterfaceCameraOrbit::UpDirection::Y
@@ -124,11 +191,11 @@ public:
             orbit.update(update.ubo->ubo);
             update.ubo->update(0);
         }
+        cameraUpdates_.clear();
     }
 
-    RunResult readSinks(const RunPlan& plan) {
-        RunResult result;
-        for (int sink : plan.sinks) {
+    void readSinks(const std::vector<int>& sinks, RunResult& result) {
+        for (int sink : sinks) {
             const Node& node = *graph_.findNode(sink);
             try {
                 const TensorRef& ref = sinkTensor(node);
@@ -149,7 +216,6 @@ public:
                 throw std::runtime_error(node.title + ": " + e.what());
             }
         }
-        return result;
     }
 
     std::shared_ptr<klartraum::CameraUboType> cameraUbo(int cameraNode) const {
@@ -162,13 +228,65 @@ public:
     const std::vector<HostBinding>& bindings() const { return bindings_; }
 
 private:
-    const TensorRef& inputTensor(const Node& node) {
-        const Link* link = graph_.inputLink(node.id, 0);
-        auto it = link ? tensors_.find(link->fromNode) : tensors_.end();
-        if (it == tensors_.end()) {
+    // The tensor feeding input `slot`. A tensor an earlier stage or the CPU
+    // computed is uploaded, once per stage.
+    const TensorRef& inputTensor(const Node& node, int slot = 0) {
+        const Link* link = graph_.inputLink(node.id, slot);
+        if (!link) {
             throw std::runtime_error("its input tensor was not built");
         }
+        if (auto it = tensors_.find(link->fromNode); it != tensors_.end()) {
+            return it->second;
+        }
+        auto host = hostTensors_.find(link->fromNode);
+        if (host == hostTensors_.end()) {
+            throw std::runtime_error("its input tensor was not built");
+        }
+        const Node& source = *graph_.findNode(link->fromNode);
+        auto tensor = vc_.create<FloatTensor>(host->second.shape, kUploadUsage);
+        tensor->setName(source.title + " upload");
+        uploads_.emplace_back(tensor, host->second.values);
+        owners_[tensor.get()] = source.id;
+        inserted_.insert(tensor.get());
+        return tensors_[source.id] = TensorRef{tensor, -1, tensor};
+    }
+
+    // The CPU values of the tensor feeding input `slot`, as the stage before
+    // a staged node computed them.
+    const HostTensor& hostInput(const Node& node, int slot) {
+        const Link* link = graph_.inputLink(node.id, slot);
+        auto it = link ? hostTensors_.find(link->fromNode) : hostTensors_.end();
+        if (it == hostTensors_.end()) {
+            throw std::runtime_error("an input was not computed");
+        }
         return it->second;
+    }
+
+    // The ONNX model a node names, checked like the plan checks it.
+    std::shared_ptr<const OnnxModelInfo> modelInfo(const std::string& path) {
+        std::string error;
+        auto info = context_.onnxInfo(path, error);
+        if (!info) {
+            throw std::runtime_error(error);
+        }
+        return info;
+    }
+
+    StagedResult runStagedNode(const Node& node) {
+        switch (node.kind) {
+        case NodeKind::DdimSampler: {
+            const auto& p = node.as<DdimSamplerParams>();
+            return sampleDdim(vc_, context_.resolveInput(p.path), *modelInfo(p.path), hostInput(node, 0),
+                              hostInput(node, 1), p, node.title, context_.hostStep);
+        }
+        case NodeKind::VaeDecoder: {
+            const auto& p = node.as<VaeDecoderParams>();
+            return decodeLatents(vc_, context_.resolveInput(p.path), *modelInfo(p.path), hostInput(node, 0),
+                                 node.title, context_.hostStep);
+        }
+        default:
+            throw std::logic_error("not a staged node");
+        }
     }
 
     // The node's input image, in GENERAL layout so that compute shaders can
@@ -536,6 +654,72 @@ private:
             tensors_[node.id] = TensorRef{network, 0, output};
             break;
         }
+        case NodeKind::Prompt: {
+            const auto& p = node.as<PromptParams>();
+            const auto start = std::chrono::steady_clock::now();
+            const klartraum::ClipTokenizer tokenizer(context_.resolveInput(p.vocabulary).parent_path());
+            std::vector<int64_t> ids = tokenizer.encodePair(p.negativePrompt, p.prompt);
+            std::vector<int64_t> mask = tokenizer.attentionMask(ids);
+            hostStep(node.title + ": tokenized", start);
+            const std::vector<uint32_t> shape{2, static_cast<uint32_t>(klartraum::ClipTokenizer::SequenceLength)};
+            TokensRef tokens{vc_.create<Int64Tensor>(shape, kUploadUsage), vc_.create<Int64Tensor>(shape, kUploadUsage)};
+            tokens.ids->setName(node.title + " ids");
+            tokens.mask->setName(node.title + " attention mask");
+            owners_[tokens.ids.get()] = node.id;
+            owners_[tokens.mask.get()] = node.id;
+            tokenUploads_.emplace_back(tokens.ids, std::move(ids));
+            tokenUploads_.emplace_back(tokens.mask, std::move(mask));
+            tokens_[node.id] = tokens;
+            break;
+        }
+        case NodeKind::TextEncoder: {
+            const auto& p = node.as<TextEncoderParams>();
+            const auto info = modelInfo(p.path);
+            const TokensRef& tokens = builtValue(tokens_, node, 0);
+            auto network = vc_.create<klartraum::OnnxNetwork>(context_.resolveInput(p.path).string());
+            network->setName(node.title);
+            for (const auto& input : info->inputs) {
+                if (input.name == "input_ids") {
+                    network->setInputTensor(input.name, tokens.ids);
+                } else if (input.name == "attention_mask") {
+                    network->setInputTensor(input.name, tokens.mask);
+                } else {
+                    throw std::runtime_error("unexpected text encoder input '" + input.name +
+                                             "'; expected input_ids and attention_mask");
+                }
+            }
+            // CLIP's per-token embeddings; a pooled output may follow.
+            const auto& outputs = info->outputs;
+            auto embeddings = std::find_if(outputs.begin(), outputs.end(),
+                                           [](const OnnxTensorDesc& o) { return o.name == "last_hidden_state"; });
+            if (embeddings == outputs.end()) {
+                embeddings = outputs.begin();
+            }
+            auto output = std::dynamic_pointer_cast<FloatTensor>(network->getOutputElement(embeddings->name));
+            if (!output) {
+                throw std::runtime_error("the model's output is not a float tensor");
+            }
+            owners_[network.get()] = node.id;
+            // Slot i of an OnnxNetwork is its i-th output tensor.
+            const int slot = static_cast<int>(embeddings - outputs.begin());
+            tensors_[node.id] = TensorRef{network, slot, output};
+            break;
+        }
+        case NodeKind::LatentNoise: {
+            const auto& p = node.as<LatentNoiseParams>();
+            const auto start = std::chrono::steady_clock::now();
+            HostTensor latents{{1, 4, p.height / 8, p.width / 8}, {}};
+            const size_t count = size_t{4} * (p.height / 8) * (p.width / 8);
+            latents.values = p.path.empty() ? latentNoise(p.seed, count) : readFloats(context_.resolveInput(p.path), count);
+            hostStep(std::format("{}: {}", node.title, p.path.empty() ? std::format("seed {}", p.seed) : "read " + p.path),
+                     start);
+            hostTensors_[node.id] = std::move(latents);
+            break;
+        }
+        case NodeKind::DdimSampler:
+        case NodeKind::VaeDecoder:
+            // Run by runStaged(), between the stages of a run.
+            throw std::runtime_error("only runs with Run");
         case NodeKind::Preview:
         case NodeKind::ImageFileWriter:
             if (graph_.inputType(node.id, 0) == PinType::Image) {
@@ -560,7 +744,11 @@ private:
     std::map<int, std::shared_ptr<klartraum::CameraUboType>> cameraUbos_;
     std::map<int, ImageRef> images_;
     std::map<int, TensorRef> tensors_;
+    std::map<int, TokensRef> tokens_;
+    // Tensors computed on the CPU or by an earlier stage of a run.
+    std::map<int, HostTensor> hostTensors_;
     std::vector<std::pair<std::shared_ptr<FloatTensor>, std::vector<float>>> uploads_;
+    std::vector<std::pair<std::shared_ptr<Int64Tensor>, std::vector<int64_t>>> tokenUploads_;
     std::vector<CameraUpdate> cameraUpdates_;
     std::map<int, klartraum::GaussianSoABuffers> gaussians_;
     std::map<int, klartraum::BufferRef> numbers_;
@@ -588,27 +776,85 @@ void applyBindings(const Graph& graph, const std::vector<HostBinding>& bindings,
     }
 }
 
+std::map<int, int> runStages(const Graph& graph, const std::vector<int>& nodes) {
+    std::map<int, int> stages;
+    for (int id : nodes) {  // producers first
+        int stage = 0;
+        for (const auto& link : graph.links()) {
+            if (link.toNode == id && stages.contains(link.fromNode)) {
+                const bool staged = isStaged(graph.findNode(link.fromNode)->kind);
+                stage = std::max(stage, stages.at(link.fromNode) + (staged ? 1 : 0));
+            }
+        }
+        stages[id] = stage;
+    }
+    return stages;
+}
+
 RunResult runGraph(klartraum::VulkanContext& vulkanContext, const Graph& graph, const RunPlan& plan,
                    const RunContext& context) {
     const auto start = std::chrono::steady_clock::now();
+    const std::map<int, int> stages = runStages(graph, plan.nodes);
+    int lastStage = 0;
+    for (const auto& [id, stage] : stages) {
+        lastStage = std::max(lastStage, stage);
+    }
+
     ElementBuilder builder(vulkanContext, graph, context, false);
-    for (int id : plan.nodes) {
-        builder.build(*graph.findNode(id));
-    }
-    const ComputeGraphElementPtr root = builder.runRoot(plan);
+    RunResult result;
+    for (int stage = 0; stage <= lastStage; ++stage) {
+        auto inStage = [&](int id) { return stages.at(id) == stage; };
+        std::vector<int> sinks;
+        std::vector<int> staged;
+        for (int id : plan.nodes) {
+            const Node& node = *graph.findNode(id);
+            if (!inStage(id)) {
+                continue;
+            }
+            if (isStaged(node.kind)) {
+                staged.push_back(id);
+                continue;
+            }
+            builder.build(node);
+            if (isSink(node.kind)) {
+                sinks.push_back(id);
+            }
+        }
+        // Tensors read by this stage's staged nodes or by later stages.
+        std::vector<int> exported;
+        for (const auto& link : graph.links()) {
+            if (!stages.contains(link.fromNode) || !stages.contains(link.toNode) || !inStage(link.fromNode) ||
+                isStaged(graph.findNode(link.fromNode)->kind)) {
+                continue;
+            }
+            const bool readLater = isStaged(graph.findNode(link.toNode)->kind) || stages.at(link.toNode) > stage;
+            if (readLater && std::find(exported.begin(), exported.end(), link.fromNode) == exported.end()) {
+                exported.push_back(link.fromNode);
+            }
+        }
 
-    klartraum::ComputeGraph computeGraph(vulkanContext, 1);
-    computeGraph.enableProfiling();
-    computeGraph.compileFrom(root);
-    builder.upload();
-    applyBindings(graph, builder.bindings(), context.time);
-    computeGraph.submitAndWait(vulkanContext.getGraphicsQueue(), 0);
+        if (const ComputeGraphElementPtr root = builder.runRoot(sinks, exported)) {
+            klartraum::ComputeGraph computeGraph(vulkanContext, 1);
+            computeGraph.enableProfiling();
+            computeGraph.compileFrom(root);
+            builder.upload();
+            applyBindings(graph, builder.bindings(), context.time);
+            computeGraph.submitAndWait(vulkanContext.getGraphicsQueue(), 0);
 
-    RunResult result = builder.readSinks(plan);
-    for (const auto& [label, ms] : computeGraph.getProfilingResults()) {
-        result.timings.emplace(label, ms);
+            builder.readSinks(sinks, result);
+            for (const auto& [label, ms] : computeGraph.getProfilingResults()) {
+                result.timings.emplace(label, ms);
+            }
+            appendGraph(result.compiled, introspect(root, builder.owners(), -1, builder.inserted()));
+        }
+        builder.finishStage(exported);
+
+        for (int id : staged) {
+            const StagedResult ran = builder.runStaged(*graph.findNode(id));
+            result.timings.insert(ran.timings.begin(), ran.timings.end());
+            appendGraph(result.compiled, introspect(ran.root, {}, id));
+        }
     }
-    result.compiled = introspect(root, builder.owners(), -1, builder.inserted());
     result.milliseconds =
         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
     return result;

@@ -20,7 +20,8 @@ namespace kstudio {
 
 // Gaussians and numbers are CPU data until an upload node puts them into GPU
 // buffers; images, tensors, transforms and camera buffers live on the GPU.
-enum class PinType { GaussiansCpu, GaussiansGpu, Camera, Image, Tensor, NumberCpu, NumberGpu, TransformGpu };
+// Tokens are a Stable Diffusion prompt's CLIP token ids and attention mask.
+enum class PinType { GaussiansCpu, GaussiansGpu, Camera, Image, Tensor, NumberCpu, NumberGpu, TransformGpu, Tokens };
 
 // Where a node's work happens: on the GPU, on the CPU, or moving data between
 // them.
@@ -52,6 +53,11 @@ enum class NodeKind {
     TensorToImage,
     Resample,
     OnnxModel,
+    Prompt,
+    TextEncoder,
+    LatentNoise,
+    DdimSampler,
+    VaeDecoder,
     Preview,
     ImageFileWriter,
 };
@@ -204,6 +210,51 @@ struct OnnxModelParams {
     bool operator==(const OnnxModelParams&) const = default;
 };
 
+// Stable Diffusion 1.5, as exported by klartraum's scripts/sd15_onnx.
+
+// A prompt and a negative prompt, tokenized with CLIP's byte-pair encoding
+// (klartraum::ClipTokenizer). `vocabulary` is CLIP's vocab.json; merges.txt
+// must be next to it.
+struct PromptParams {
+    std::string prompt;
+    std::string negativePrompt;
+    std::string vocabulary;
+    bool operator==(const PromptParams&) const = default;
+};
+
+// The CLIP text encoder: 2x77 tokens -> 2x77x768 embeddings.
+struct TextEncoderParams {
+    std::string path;
+    bool operator==(const TextEncoderParams&) const = default;
+};
+
+// The latents a sampler starts from, 1x4x(height/8)x(width/8) for a
+// width x height image: Gaussian noise from `seed`, or, if `path` is set,
+// raw float32 values read from that file (e.g. initial_latents_f32.bin
+// written by export_denoiser.py, to reproduce its reference).
+struct LatentNoiseParams {
+    uint32_t width = 512;
+    uint32_t height = 512;
+    uint32_t seed = 0;
+    std::string path;
+    bool operator==(const LatentNoiseParams&) const = default;
+};
+
+// Denoises latents with the UNet in `path`: DDIM with SD 1.5's scheduler and
+// classifier-free guidance.
+struct DdimSamplerParams {
+    std::string path;
+    uint32_t steps = 20;
+    float guidanceScale = 7.5f;
+    bool operator==(const DdimSamplerParams&) const = default;
+};
+
+// Decodes latents into a 1x3xHxW image tensor with values in [0, 1].
+struct VaeDecoderParams {
+    std::string path;
+    bool operator==(const VaeDecoderParams&) const = default;
+};
+
 struct PreviewParams {
     bool operator==(const PreviewParams&) const = default;
 };
@@ -217,7 +268,8 @@ using NodeParams = std::variant<SceneParams, TransformGaussiansParams, MergeGaus
                                 NumberParams, TimeParams, SineParams, UploadNumberParams, MakeTransformParams,
                                 TransformGaussiansGpuParams, MergeGaussiansGpuParams, CameraParams, SwapchainTargetParams, SplattingParams, PresentParams,
                                 OffscreenTargetParams, ImageFileParams, ImageToTensorParams, TensorToImageParams,
-                                ResampleParams, OnnxModelParams, PreviewParams, ImageFileWriterParams>;
+                                ResampleParams, OnnxModelParams, PromptParams, TextEncoderParams, LatentNoiseParams,
+                                DdimSamplerParams, VaeDecoderParams, PreviewParams, ImageFileWriterParams>;
 
 struct PinDesc {
     std::string_view name;
@@ -257,6 +309,12 @@ std::string_view implementationName(Implementation implementation);
 NodeParams defaultParams(NodeKind kind);
 // Preview and Image File Writer: executed by Run.
 bool isSink(NodeKind kind);
+// DDIM Sampler and VAE Decoder: Run executes them between submissions of its
+// klartraum graph. They read their input tensors back, run klartraum graphs
+// of their own (the sampler one per denoising step, with CPU work in between)
+// and hand their result on as CPU data, which the nodes after them upload
+// again. They cannot run live.
+bool isStaged(NodeKind kind);
 // Nodes whose Image output holds a result (Gaussian Splatting, Tensor to
 // Image, Resample), as opposed to an empty target.
 bool producesImage(NodeKind kind);
@@ -391,5 +449,12 @@ Graph makeAnimatedScenesGraph(const std::string& scenePath, const SceneParams& m
 // encoder and decoder and previewed on Run.
 Graph makeSplatAutoencoderGraph(const std::string& scenePath, const std::string& encoderPath,
                                 const std::string& decoderPath);
+
+// Stable Diffusion 1.5 from the models export_denoiser.py writes into
+// `modelDirectory` for `size` x `size` images: Prompt -> Text Encoder, Latent
+// Noise -> DDIM Sampler -> VAE Decoder, previewed and written to
+// `outputPath` on Run.
+Graph makeStableDiffusionGraph(const std::string& modelDirectory, uint32_t size, const std::string& prompt,
+                               const std::string& negativePrompt, const std::string& outputPath);
 
 } // namespace kstudio

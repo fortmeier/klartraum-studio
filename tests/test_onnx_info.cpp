@@ -1,7 +1,8 @@
 /**
  * TESTS:
  * - shapeToStringFormats: shapes print as NxCxHxW, the empty shape as scalar
- * - supportedOps: the operators klartraum executes are supported, others are not
+ * - supportedOps: the operators klartraum executes, including Stable Diffusion's, are supported,
+ *   others are not
  * - readEncoderInfo: the sample encoder has input 1x3x128x128, output 1x128x16x16, Conv and Relu
  * - readDecoderInfo: the sample decoder maps 1x128x16x16 back to 1x3x128x128
  * - readRejectsBadFiles: missing files and non-ONNX files throw
@@ -29,11 +30,13 @@ TEST(OnnxInfo, shapeToStringFormats) {
 }
 
 TEST(OnnxInfo, supportedOps) {
-    for (const char* op : {"Conv", "ConvTranspose", "Relu", "Reshape", "Transpose"}) {
+    // The autoencoder's operators and those Stable Diffusion 1.5 needs.
+    for (const char* op : {"Conv", "ConvTranspose", "Relu", "Reshape", "Transpose", "MatMul", "Softmax", "Gemm",
+                           "InstanceNormalization", "LayerNormalization", "Gather", "Resize", "Erf"}) {
         EXPECT_TRUE(isSupportedOnnxOp(op)) << op;
     }
-    EXPECT_FALSE(isSupportedOnnxOp("Softmax"));
-    EXPECT_FALSE(isSupportedOnnxOp("MatMul"));
+    EXPECT_FALSE(isSupportedOnnxOp("LSTM"));
+    EXPECT_FALSE(isSupportedOnnxOp("NonMaxSuppression"));
 }
 
 TEST(OnnxInfo, readEncoderInfo) {

@@ -50,8 +50,15 @@ json paramsToJson(const NodeParams& params) {
                 return {{"path", p.path}, {"width", p.width}, {"height", p.height}};
             } else if constexpr (std::is_same_v<T, ResampleParams>) {
                 return {{"width", p.width}, {"height", p.height}, {"filter", filterName(p.filter)}};
-            } else if constexpr (std::is_same_v<T, OnnxModelParams> || std::is_same_v<T, ImageFileWriterParams>) {
+            } else if constexpr (std::is_same_v<T, OnnxModelParams> || std::is_same_v<T, ImageFileWriterParams> ||
+                                 std::is_same_v<T, TextEncoderParams> || std::is_same_v<T, VaeDecoderParams>) {
                 return {{"path", p.path}};
+            } else if constexpr (std::is_same_v<T, PromptParams>) {
+                return {{"prompt", p.prompt}, {"negativePrompt", p.negativePrompt}, {"vocabulary", p.vocabulary}};
+            } else if constexpr (std::is_same_v<T, LatentNoiseParams>) {
+                return {{"width", p.width}, {"height", p.height}, {"seed", p.seed}, {"path", p.path}};
+            } else if constexpr (std::is_same_v<T, DdimSamplerParams>) {
+                return {{"path", p.path}, {"steps", p.steps}, {"guidanceScale", p.guidanceScale}};
             } else {
                 return json::object();
             }
@@ -130,8 +137,22 @@ NodeParams paramsFromJson(NodeKind kind, const json& j) {
                 if (filter == filterName(ResampleFilter::Nearest)) {
                     p.filter = ResampleFilter::Nearest;
                 }
-            } else if constexpr (std::is_same_v<T, OnnxModelParams> || std::is_same_v<T, ImageFileWriterParams>) {
+            } else if constexpr (std::is_same_v<T, OnnxModelParams> || std::is_same_v<T, ImageFileWriterParams> ||
+                                 std::is_same_v<T, TextEncoderParams> || std::is_same_v<T, VaeDecoderParams>) {
                 read(j, "path", p.path);
+            } else if constexpr (std::is_same_v<T, PromptParams>) {
+                read(j, "prompt", p.prompt);
+                read(j, "negativePrompt", p.negativePrompt);
+                read(j, "vocabulary", p.vocabulary);
+            } else if constexpr (std::is_same_v<T, LatentNoiseParams>) {
+                read(j, "width", p.width);
+                read(j, "height", p.height);
+                read(j, "seed", p.seed);
+                read(j, "path", p.path);
+            } else if constexpr (std::is_same_v<T, DdimSamplerParams>) {
+                read(j, "path", p.path);
+                read(j, "steps", p.steps);
+                read(j, "guidanceScale", p.guidanceScale);
             }
         },
         params);

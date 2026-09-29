@@ -26,7 +26,10 @@ struct ShapeInference {
 
 // Propagates tensor shapes through the graph: Image File and Image to Tensor
 // produce 1x3xHxW (unknown for swapchain renderings), ONNX models map their declared input shape to their output
-// shape. Reports mismatched shapes, unreadable or unsupported models, sinks
+// shape. Stable Diffusion nodes check their inputs against the models' declared
+// inputs: the Text Encoder the Prompt's 2x77 tokens, the DDIM Sampler the
+// latents and embeddings, the VAE Decoder the latents. Reports mismatched
+// shapes, unreadable or unsupported models, sinks
 // fed with tensors that are not images, and Tensor to Image nodes fed with
 // tensors that are not 1x3xHxW. Nodes with unconnected inputs
 // are skipped; Graph::validate reports those.
