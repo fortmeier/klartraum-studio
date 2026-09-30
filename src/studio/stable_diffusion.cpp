@@ -208,47 +208,4 @@ StagedResult sampleDdim(klartraum::VulkanContext& vc, const std::filesystem::pat
     return result;
 }
 
-StagedResult decodeLatents(klartraum::VulkanContext& vc, const std::filesystem::path& decoder,
-                           const OnnxModelInfo& info, const HostTensor& latents, const std::string& name,
-                           const HostStepLog& hostStep) {
-    if (info.inputs.size() != 1 || info.outputs.empty()) {
-        throw std::runtime_error("the VAE decoder must have one input and an output");
-    }
-    if (latents.shape != info.inputs[0].shape) {
-        throw std::runtime_error(std::format("the VAE decoder expects {} latents but gets {}",
-                                             shapeToString(info.inputs[0].shape), shapeToString(latents.shape)));
-    }
-
-    const auto start = std::chrono::steady_clock::now();
-    auto network = vc.create<klartraum::OnnxNetwork>(decoder.string());
-    network->setName(name);
-    auto input = vc.create<FloatTensor>(latents.shape);
-    input->setName(name + " latents");
-    network->setInputTensor(info.inputs[0].name, input);
-    auto output = floatOutput(*network, info.outputs[0].name);
-
-    klartraum::ComputeGraph graph(vc, 1);
-    graph.enableProfiling();
-    graph.compileFrom(network);
-    std::vector<float> scaled = latents.values;
-    for (float& value : scaled) {
-        value /= kVaeScalingFactor;
-    }
-    input->getDataBuffer(0).memcopyFrom(scaled);
-    graph.submitAndWait(vc.getGraphicsQueue(), 0);
-
-    StagedResult result;
-    const auto& dims = output->getDimensions();
-    result.output.shape.assign(dims.begin(), dims.end());
-    result.output.values.resize(output->getDataElementCount());
-    output->getDataBuffer(0).memcopyTo(result.output.values);
-    for (float& value : result.output.values) {
-        value = 0.5f * (value + 1.0f);
-    }
-    log(hostStep, name + ": decoded " + shapeToString(result.output.shape), start);
-    result.timings = timings(graph);
-    result.root = network;
-    return result;
-}
-
 } // namespace kstudio

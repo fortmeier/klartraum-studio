@@ -1,6 +1,9 @@
 #include "studio/graph_serialization.hpp"
 
+#include <algorithm>
 #include <fstream>
+#include <optional>
+#include <set>
 #include <sstream>
 #include <stdexcept>
 
@@ -12,7 +15,8 @@ namespace {
 
 using nlohmann::json;
 
-constexpr int kFormatVersion = 1;
+// Version 2 added meta node definitions.
+constexpr int kFormatVersion = 2;
 
 json paramsToJson(const NodeParams& params) {
     return std::visit(
@@ -50,9 +54,18 @@ json paramsToJson(const NodeParams& params) {
                 return {{"path", p.path}, {"width", p.width}, {"height", p.height}};
             } else if constexpr (std::is_same_v<T, ResampleParams>) {
                 return {{"width", p.width}, {"height", p.height}, {"filter", filterName(p.filter)}};
-            } else if constexpr (std::is_same_v<T, OnnxModelParams> || std::is_same_v<T, ImageFileWriterParams> ||
-                                 std::is_same_v<T, TextEncoderParams> || std::is_same_v<T, VaeDecoderParams>) {
+            } else if constexpr (std::is_same_v<T, OnnxModelParams>) {
+                return {{"path", p.path}, {"inputs", p.inputs}, {"outputs", p.outputs}};
+            } else if constexpr (std::is_same_v<T, ImageFileWriterParams>) {
                 return {{"path", p.path}};
+            } else if constexpr (std::is_same_v<T, BinaryLayerParams>) {
+                return {{"b", p.b}};
+            } else if constexpr (std::is_same_v<T, MetaParams>) {
+                json values = json::object();
+                for (const auto& [name, value] : p.values) {
+                    values[name] = json::parse(value);
+                }
+                return {{"definition", p.definition}, {"values", values}};
             } else if constexpr (std::is_same_v<T, PromptParams>) {
                 return {{"prompt", p.prompt}, {"negativePrompt", p.negativePrompt}, {"vocabulary", p.vocabulary}};
             } else if constexpr (std::is_same_v<T, LatentNoiseParams>) {
@@ -137,9 +150,21 @@ NodeParams paramsFromJson(NodeKind kind, const json& j) {
                 if (filter == filterName(ResampleFilter::Nearest)) {
                     p.filter = ResampleFilter::Nearest;
                 }
-            } else if constexpr (std::is_same_v<T, OnnxModelParams> || std::is_same_v<T, ImageFileWriterParams> ||
-                                 std::is_same_v<T, TextEncoderParams> || std::is_same_v<T, VaeDecoderParams>) {
+            } else if constexpr (std::is_same_v<T, OnnxModelParams>) {
                 read(j, "path", p.path);
+                read(j, "inputs", p.inputs);
+                read(j, "outputs", p.outputs);
+            } else if constexpr (std::is_same_v<T, ImageFileWriterParams>) {
+                read(j, "path", p.path);
+            } else if constexpr (std::is_same_v<T, BinaryLayerParams>) {
+                read(j, "b", p.b);
+            } else if constexpr (std::is_same_v<T, MetaParams>) {
+                read(j, "definition", p.definition);
+                if (j.contains("values")) {
+                    for (const auto& [name, value] : j.at("values").items()) {
+                        p.values[name] = value.dump();
+                    }
+                }
             } else if constexpr (std::is_same_v<T, PromptParams>) {
                 read(j, "prompt", p.prompt);
                 read(j, "negativePrompt", p.negativePrompt);
@@ -180,7 +205,37 @@ std::string paramsToString(const NodeParams& params) {
     return paramsToJson(params).dump();
 }
 
-std::string toJson(const Graph& graph) {
+std::vector<std::string> paramKeys(const NodeParams& params) {
+    std::vector<std::string> keys;
+    for (const auto& [key, value] : paramsToJson(params).items()) {
+        keys.push_back(key);
+    }
+    return keys;
+}
+
+std::optional<std::string> paramValue(const NodeParams& params, std::string_view key) {
+    const json j = paramsToJson(params);
+    auto it = j.find(key);
+    return it == j.end() ? std::nullopt : std::optional(it->dump());
+}
+
+void setParamValue(NodeParams& params, NodeKind kind, std::string_view key, const std::string& value) {
+    json j = paramsToJson(params);
+    if (!j.contains(key)) {
+        throw std::runtime_error("'" + std::string(kindInfo(kind).title) + "' has no parameter '" + std::string(key) +
+                                 "'");
+    }
+    try {
+        j[std::string(key)] = json::parse(value);
+        params = paramsFromJson(kind, j);
+    } catch (const json::exception& e) {
+        throw std::runtime_error("invalid value for '" + std::string(key) + "': " + e.what());
+    }
+}
+
+namespace {
+
+json nodesToJson(const Graph& graph) {
     json nodes = json::array();
     for (const auto& node : graph.nodes()) {
         nodes.push_back({{"id", node.id},
@@ -189,12 +244,195 @@ std::string toJson(const Graph& graph) {
                          {"position", {node.position.x, node.position.y}},
                          {"params", paramsToJson(node.params)}});
     }
+    return nodes;
+}
+
+json linksToJson(const Graph& graph) {
     json links = json::array();
     for (const auto& link : graph.links()) {
         links.push_back({{"from", {link.fromNode, link.fromSlot}}, {"to", {link.toNode, link.toSlot}}});
     }
-    const json doc = {{"format", "klartraum-studio-graph"}, {"version", kFormatVersion}, {"nodes", nodes},
-                      {"links", links}};
+    return links;
+}
+
+json pinRefToJson(const PinRef& pin) {
+    return {pin.node, pin.slot};
+}
+
+PinRef pinRefFromJson(const json& j, PinDirection direction) {
+    return {j.at(0).get<int>(), direction, j.at(1).get<int>()};
+}
+
+// Local definitions that `definition` uses, directly or through others.
+void collectDependencies(const Graph& graph, const MetaDefinition& definition, std::vector<std::string>& order,
+                         std::set<std::string>& visiting) {
+    if (std::find(order.begin(), order.end(), definition.name) != order.end() ||
+        !visiting.insert(definition.name).second) {
+        return;  // done, or a cycle (reported when flattening)
+    }
+    for (const auto& node : definition.graph.nodes()) {
+        if (node.kind != NodeKind::Meta) {
+            continue;
+        }
+        auto it = graph.definitions().find(node.as<MetaParams>().definition);
+        if (it != graph.definitions().end()) {
+            collectDependencies(graph, *it->second, order, visiting);
+        }
+    }
+    order.push_back(definition.name);
+}
+
+json definitionsToJson(const Graph& graph) {
+    // Dependencies first, so that loading can resolve nested meta nodes.
+    std::vector<std::string> order;
+    std::set<std::string> visiting;
+    for (const auto& [name, definition] : graph.definitions()) {
+        collectDependencies(graph, *definition, order, visiting);
+    }
+    json definitions = json::array();
+    for (const auto& name : order) {
+        const MetaDefinition& d = *graph.definitions().at(name);
+        auto pinsToJson = [](const std::vector<MetaPin>& pins) {
+            json result = json::array();
+            for (const auto& pin : pins) {
+                json targets = json::array();
+                for (const auto& target : pin.targets) {
+                    targets.push_back(pinRefToJson(target));
+                }
+                result.push_back({{"name", pin.name}, {"targets", targets}});
+            }
+            return result;
+        };
+        json params = json::array();
+        for (const auto& param : d.params) {
+            params.push_back({{"name", param.name}, {"node", param.node}, {"key", param.key}});
+        }
+        definitions.push_back({{"name", d.name},
+                               {"title", d.title},
+                               {"group", d.group},
+                               {"description", d.description},
+                               {"nodes", nodesToJson(d.graph)},
+                               {"links", linksToJson(d.graph)},
+                               {"inputs", pinsToJson(d.inputs)},
+                               {"outputs", pinsToJson(d.outputs)},
+                               {"params", params}});
+    }
+    return definitions;
+}
+
+// Before they were meta nodes, the Stable Diffusion text encoder and VAE
+// decoder were node kinds with a model path.
+std::optional<std::string> formerMetaKind(const std::string& kindName) {
+    if (kindName == "sd_text_encoder") return "sd15_text_encoder";
+    if (kindName == "sd_vae_decoder") return "sd15_vae_decoder";
+    return std::nullopt;
+}
+
+void loadNodes(Graph& graph, const json& nodes) {
+    for (const auto& j : nodes) {
+        const auto kindName = j.at("kind").get<std::string>();
+        const auto former = formerMetaKind(kindName);
+        const auto kind = former ? std::optional(NodeKind::Meta) : kindFromName(kindName);
+        if (!kind) {
+            throw std::runtime_error("unknown node kind '" + kindName + "'");
+        }
+        Node node;
+        node.id = j.at("id").get<int>();
+        node.kind = *kind;
+        node.title = j.value("title", std::string(kindInfo(*kind).title));
+        if (j.contains("position")) {
+            const auto& pos = j.at("position");
+            node.position = {pos.at(0).get<float>(), pos.at(1).get<float>()};
+        }
+        if (former) {
+            MetaParams meta{*former, {}};
+            const json params = j.value("params", json::object());
+            if (params.contains("path")) {
+                meta.values["Model"] = params.at("path").dump();
+            }
+            node.params = meta;
+        } else {
+            node.params = paramsFromJson(*kind, j.value("params", json::object()));
+        }
+        if (!graph.addNodeWithId(std::move(node))) {
+            throw std::runtime_error("duplicate or invalid node id " + std::to_string(j.at("id").get<int>()));
+        }
+    }
+}
+
+void loadLinks(Graph& graph, const json& links) {
+    for (const auto& j : links) {
+        const PinRef from{j.at("from").at(0).get<int>(), PinDirection::Output, j.at("from").at(1).get<int>()};
+        const PinRef to{j.at("to").at(0).get<int>(), PinDirection::Input, j.at("to").at(1).get<int>()};
+        if (auto error = graph.connect(from, to)) {
+            if (!linksCpuToGpuGaussians(graph, from, to)) {
+                throw std::runtime_error("invalid link: " + *error);
+            }
+            // Before Upload Gaussians existed, scenes fed Gaussian
+            // Splatting directly: put the upload in between.
+            const Node& source = *graph.findNode(from.node);
+            const Node& target = *graph.findNode(to.node);
+            const int upload = graph.addNode(
+                NodeKind::UploadGaussians,
+                {(source.position.x + target.position.x) * 0.5f, (source.position.y + target.position.y) * 0.5f});
+            graph.connect(from, {upload, PinDirection::Input, 0});
+            graph.connect({upload, PinDirection::Output, 0}, to);
+        }
+    }
+}
+
+void loadDefinitions(Graph& graph, const json& definitions) {
+    for (const auto& j : definitions) {
+        auto definition = std::make_shared<MetaDefinition>();
+        definition->name = j.at("name").get<std::string>();
+        definition->title = j.value("title", definition->name);
+        definition->group = j.value("group", std::string());
+        definition->description = j.value("description", std::string());
+        try {
+            // The definitions loaded so far resolve nested meta nodes while
+            // the links are checked; the inner graph does not keep them.
+            Graph inner;
+            for (const auto& [name, loaded] : graph.definitions()) {
+                inner.setDefinition(loaded);
+            }
+            loadNodes(inner, j.at("nodes"));
+            loadLinks(inner, j.at("links"));
+            for (const auto& [name, loaded] : graph.definitions()) {
+                inner.removeDefinition(name);
+            }
+            definition->graph = std::move(inner);
+        } catch (const std::runtime_error& e) {
+            throw std::runtime_error("definition '" + definition->name + "': " + e.what());
+        }
+        auto pinsFromJson = [](const json& pins, PinDirection direction) {
+            std::vector<MetaPin> result;
+            for (const auto& pin : pins) {
+                MetaPin meta{pin.at("name").get<std::string>(), {}};
+                for (const auto& target : pin.at("targets")) {
+                    meta.targets.push_back(pinRefFromJson(target, direction));
+                }
+                result.push_back(std::move(meta));
+            }
+            return result;
+        };
+        definition->inputs = pinsFromJson(j.value("inputs", json::array()), PinDirection::Input);
+        definition->outputs = pinsFromJson(j.value("outputs", json::array()), PinDirection::Output);
+        for (const auto& param : j.value("params", json::array())) {
+            definition->params.push_back(
+                {param.at("name").get<std::string>(), param.at("node").get<int>(), param.at("key").get<std::string>()});
+        }
+        graph.setDefinition(std::move(definition));
+    }
+}
+
+} // namespace
+
+std::string toJson(const Graph& graph) {
+    json doc = {{"format", "klartraum-studio-graph"}, {"version", kFormatVersion}, {"nodes", nodesToJson(graph)},
+                {"links", linksToJson(graph)}};
+    if (!graph.definitions().empty()) {
+        doc["definitions"] = definitionsToJson(graph);
+    }
     return doc.dump(2);
 }
 
@@ -208,43 +446,11 @@ Graph fromJson(const std::string& text) {
         if (doc.value("version", 0) > kFormatVersion) {
             throw std::runtime_error("graph was saved by a newer version of klartraum-studio");
         }
-        for (const auto& j : doc.at("nodes")) {
-            const auto kindName = j.at("kind").get<std::string>();
-            const auto kind = kindFromName(kindName);
-            if (!kind) {
-                throw std::runtime_error("unknown node kind '" + kindName + "'");
-            }
-            Node node;
-            node.id = j.at("id").get<int>();
-            node.kind = *kind;
-            node.title = j.value("title", std::string(kindInfo(*kind).title));
-            if (j.contains("position")) {
-                const auto& pos = j.at("position");
-                node.position = {pos.at(0).get<float>(), pos.at(1).get<float>()};
-            }
-            node.params = paramsFromJson(*kind, j.value("params", json::object()));
-            if (!graph.addNodeWithId(std::move(node))) {
-                throw std::runtime_error("duplicate or invalid node id " + std::to_string(j.at("id").get<int>()));
-            }
+        if (doc.contains("definitions")) {
+            loadDefinitions(graph, doc.at("definitions"));
         }
-        for (const auto& j : doc.at("links")) {
-            const PinRef from{j.at("from").at(0).get<int>(), PinDirection::Output, j.at("from").at(1).get<int>()};
-            const PinRef to{j.at("to").at(0).get<int>(), PinDirection::Input, j.at("to").at(1).get<int>()};
-            if (auto error = graph.connect(from, to)) {
-                if (!linksCpuToGpuGaussians(graph, from, to)) {
-                    throw std::runtime_error("invalid link: " + *error);
-                }
-                // Before Upload Gaussians existed, scenes fed Gaussian
-                // Splatting directly: put the upload in between.
-                const Node& source = *graph.findNode(from.node);
-                const Node& target = *graph.findNode(to.node);
-                const int upload = graph.addNode(
-                    NodeKind::UploadGaussians,
-                    {(source.position.x + target.position.x) * 0.5f, (source.position.y + target.position.y) * 0.5f});
-                graph.connect(from, {upload, PinDirection::Input, 0});
-                graph.connect({upload, PinDirection::Output, 0}, to);
-            }
-        }
+        loadNodes(graph, doc.at("nodes"));
+        loadLinks(graph, doc.at("links"));
     } catch (const json::exception& e) {
         throw std::runtime_error(std::string("malformed graph file: ") + e.what());
     }

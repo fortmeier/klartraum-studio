@@ -21,6 +21,7 @@
 #include "klartraum/gaussian_splatting_factory.hpp"
 #include "klartraum/interface_camera_orbit.hpp"
 #include "klartraum/klartraum_core.hpp"
+#include "klartraum/layers/layers.hpp"
 #include "klartraum/offscreen_target.hpp"
 #include "klartraum/onnx/onnx_network.hpp"
 #include "klartraum/sd15/clip_tokenizer.hpp"
@@ -41,12 +42,6 @@ using Int64Tensor = klartraum::TensorElement<int64_t>;
 constexpr VkBufferUsageFlags kUploadUsage =
     VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
 
-// A prompt's token ids and attention mask, both 2x77.
-struct TokensRef {
-    std::shared_ptr<Int64Tensor> ids;
-    std::shared_ptr<Int64Tensor> mask;
-};
-
 
 // Matches shaders/onnx/image_to_tensor.comp and tensor_to_image.comp.
 struct ImageSizePushConstants {
@@ -55,12 +50,27 @@ struct ImageSizePushConstants {
 };
 
 // A tensor as a consumer connects to it: `producer` (at `slot`, or itself
-// for -1) provides `tensor`.
+// for -1) provides `tensor`, of any element type.
 struct TensorRef {
     ComputeGraphElementPtr producer;
     int slot = -1;
-    std::shared_ptr<FloatTensor> tensor;
+    std::shared_ptr<klartraum::TensorElementInterface> tensor;
+
+    // The tensor as float32; throws if it has another element type.
+    std::shared_ptr<FloatTensor> floats() const {
+        auto result = std::dynamic_pointer_cast<FloatTensor>(tensor);
+        if (!result) {
+            throw std::runtime_error("expects a float32 tensor");
+        }
+        return result;
+    }
 };
+
+// The dimensions of a tensor as a shape.
+TensorShape shapeOf(const klartraum::TensorElementInterface& tensor) {
+    const auto& dims = tensor.getDimensions();
+    return TensorShape(dims.begin(), dims.end());
+}
 
 // An image as a consumer connects to it: slot `slot` of `producer` is the
 // image, left in `layout`.
@@ -100,7 +110,7 @@ public:
 
     // One root depending on every sink's tensor and on the tensors of
     // `exported` nodes, which later stages read; nullptr if there are none.
-    ComputeGraphElementPtr runRoot(const std::vector<int>& sinks, const std::vector<int>& exported) {
+    ComputeGraphElementPtr runRoot(const std::vector<int>& sinks, const std::vector<OutputPin>& exported) {
         auto root = std::make_shared<klartraum::NoOp>(vc_);
         root->setName("Run");
         inserted_.insert(root.get());
@@ -109,13 +119,14 @@ public:
             const TensorRef& ref = sinkTensor(*graph_.findNode(sink));
             root->setInput(ref.producer, slot++, ref.slot);
         }
-        for (int id : exported) {
-            if (hostTensors_.contains(id)) {
+        for (const OutputPin& pin : exported) {
+            if (hostTensors_.contains(pin)) {
                 continue;  // computed on the CPU already
             }
-            auto it = tensors_.find(id);
+            auto it = tensors_.find(pin);
             if (it == tensors_.end()) {
-                throw std::runtime_error(graph_.findNode(id)->title + ": only tensors can be handed to a later stage");
+                throw std::runtime_error(graph_.findNode(pin.first)->title +
+                                         ": only tensors can be handed to a later stage");
             }
             root->setInput(it->second.producer, slot++, it->second.slot);
         }
@@ -124,20 +135,23 @@ public:
 
     // After a stage ran: reads the tensors of `exported` nodes back for the
     // nodes after it, and releases the stage's elements.
-    void finishStage(const std::vector<int>& exported) {
-        for (int id : exported) {
-            if (hostTensors_.contains(id)) {
+    void finishStage(const std::vector<OutputPin>& exported) {
+        for (const OutputPin& pin : exported) {
+            if (hostTensors_.contains(pin)) {
                 continue;
             }
-            const TensorRef& ref = tensors_.at(id);
-            const auto& dims = ref.tensor->getDimensions();
-            HostTensor host{TensorShape(dims.begin(), dims.end()), std::vector<float>(ref.tensor->getDataElementCount())};
-            ref.tensor->getDataBuffer(0).memcopyTo(host.values);
-            hostTensors_[id] = std::move(host);
+            try {
+                const auto tensor = tensors_.at(pin).floats();
+                HostTensor host{shapeOf(*tensor), std::vector<float>(tensor->getDataElementCount())};
+                tensor->getDataBuffer(0).memcopyTo(host.values);
+                hostTensors_[pin] = std::move(host);
+            } catch (const std::exception& e) {
+                throw std::runtime_error(graph_.findNode(pin.first)->title + ": " + e.what() +
+                                         " to hand it to a later stage");
+            }
         }
         tensors_.clear();
         images_.clear();
-        tokens_.clear();
         owners_.clear();
         inserted_.clear();
     }
@@ -147,7 +161,7 @@ public:
     StagedResult runStaged(const Node& node) {
         try {
             StagedResult result = runStagedNode(node);
-            hostTensors_[node.id] = result.output;
+            hostTensors_[{node.id, 0}] = result.output;
             return result;
         } catch (const std::exception& e) {
             throw std::runtime_error(node.title + ": " + e.what());
@@ -171,13 +185,13 @@ public:
                 tensor->getDataBuffer(path).memcopyFrom(data);
             }
         }
-        for (const auto& [tensor, data] : tokenUploads_) {
+        for (const auto& [tensor, data] : int64Uploads_) {
             for (uint32_t path = 0; path < numPaths_; ++path) {
                 tensor->getDataBuffer(path).memcopyFrom(data);
             }
         }
         uploads_.clear();
-        tokenUploads_.clear();
+        int64Uploads_.clear();
         for (const auto& update : cameraUpdates_) {
             klartraum::InterfaceCameraOrbit orbit(update.params.up == UpAxis::Y
                                                       ? klartraum::InterfaceCameraOrbit::UpDirection::Y
@@ -198,13 +212,13 @@ public:
         for (int sink : sinks) {
             const Node& node = *graph_.findNode(sink);
             try {
-                const TensorRef& ref = sinkTensor(node);
-                const auto& dims = ref.tensor->getDimensions();  // NCHW
+                const auto tensor = sinkTensor(node).floats();
+                const auto& dims = tensor->getDimensions();  // NCHW
                 if (dims.size() != 4 || dims[0] != 1) {
                     throw std::runtime_error("the tensor is not an image");
                 }
-                std::vector<float> data(ref.tensor->getDataElementCount());
-                ref.tensor->getDataBuffer(0).memcopyTo(data);
+                std::vector<float> data(tensor->getDataElementCount());
+                tensor->getDataBuffer(0).memcopyTo(data);
                 ImageRGBA8 image = tensorToImage(data, dims[1], dims[2], dims[3]);
                 if (node.kind == NodeKind::ImageFileWriter) {
                     const auto path = context_.resolveOutput(node.as<ImageFileWriterParams>().path);
@@ -235,10 +249,11 @@ private:
         if (!link) {
             throw std::runtime_error("its input tensor was not built");
         }
-        if (auto it = tensors_.find(link->fromNode); it != tensors_.end()) {
+        const OutputPin pin{link->fromNode, link->fromSlot};
+        if (auto it = tensors_.find(pin); it != tensors_.end()) {
             return it->second;
         }
-        auto host = hostTensors_.find(link->fromNode);
+        auto host = hostTensors_.find(pin);
         if (host == hostTensors_.end()) {
             throw std::runtime_error("its input tensor was not built");
         }
@@ -248,14 +263,14 @@ private:
         uploads_.emplace_back(tensor, host->second.values);
         owners_[tensor.get()] = source.id;
         inserted_.insert(tensor.get());
-        return tensors_[source.id] = TensorRef{tensor, -1, tensor};
+        return tensors_[pin] = TensorRef{tensor, -1, tensor};
     }
 
     // The CPU values of the tensor feeding input `slot`, as the stage before
     // a staged node computed them.
     const HostTensor& hostInput(const Node& node, int slot) {
         const Link* link = graph_.inputLink(node.id, slot);
-        auto it = link ? hostTensors_.find(link->fromNode) : hostTensors_.end();
+        auto it = link ? hostTensors_.find({link->fromNode, link->fromSlot}) : hostTensors_.end();
         if (it == hostTensors_.end()) {
             throw std::runtime_error("an input was not computed");
         }
@@ -278,11 +293,6 @@ private:
             const auto& p = node.as<DdimSamplerParams>();
             return sampleDdim(vc_, context_.resolveInput(p.path), *modelInfo(p.path), hostInput(node, 0),
                               hostInput(node, 1), p, node.title, context_.hostStep);
-        }
-        case NodeKind::VaeDecoder: {
-            const auto& p = node.as<VaeDecoderParams>();
-            return decodeLatents(vc_, context_.resolveInput(p.path), *modelInfo(p.path), hostInput(node, 0),
-                                 node.title, context_.hostStep);
         }
         default:
             throw std::logic_error("not a staged node");
@@ -315,7 +325,7 @@ private:
 
     // A sink fed with an image reads the tensor it was converted to.
     const TensorRef& sinkTensor(const Node& node) {
-        auto it = tensors_.find(node.id);
+        auto it = tensors_.find({node.id, 0});
         return it != tensors_.end() ? it->second : inputTensor(node);
     }
 
@@ -570,11 +580,11 @@ private:
             break;
         }
         case NodeKind::ImageToTensor:
-            tensors_[node.id] = convertImage(readableImage(node), node);
+            tensors_[{node.id, 0}] = convertImage(readableImage(node), node);
             break;
         case NodeKind::TensorToImage: {
             const TensorRef& input = inputTensor(node);
-            const auto& dims = input.tensor->getDimensions();  // NCHW
+            const auto& dims = input.floats()->getDimensions();  // NCHW
             if (dims.size() != 4 || dims[0] != 1 || dims[1] != 3) {
                 throw std::runtime_error("expects a 1x3xHxW tensor");
             }
@@ -621,37 +631,96 @@ private:
             tensor->setName(node.title);
             uploads_.emplace_back(tensor, imageToTensor(image));
             owners_[tensor.get()] = node.id;
-            tensors_[node.id] = TensorRef{tensor, -1, tensor};
+            tensors_[{node.id, 0}] = TensorRef{tensor, -1, tensor};
             break;
         }
         case NodeKind::OnnxModel: {
             const auto& p = node.as<OnnxModelParams>();
-            std::string error;
-            const auto info = context_.onnxInfo(p.path, error);
-            if (!info) {
-                throw std::runtime_error(error);
-            }
-            if (info->inputs.size() != 1 || info->outputs.empty()) {
-                throw std::runtime_error("only models with one input are supported");
-            }
-            const TensorRef& input = inputTensor(node);
-            // Shapes that depend on the window are only known here.
-            const auto& dims = input.tensor->getDimensions();
-            const TensorShape shape(dims.begin(), dims.end());
-            if (shape != info->inputs[0].shape) {
-                throw std::runtime_error(std::format("the model expects a {} tensor but gets {}",
-                                                     shapeToString(info->inputs[0].shape), shapeToString(shape)));
+            const auto info = modelInfo(p.path);
+            if (info->inputs.size() != p.inputs.size() || info->outputs.size() != p.outputs.size()) {
+                throw std::runtime_error("the node's pins do not match the model's inputs and outputs");
             }
             auto network = vc_.create<klartraum::OnnxNetwork>(context_.resolveInput(p.path).string());
             network->setName(node.title);
-            network->setInputTensor(info->inputs[0].name, input.producer, input.slot);
-            auto output = std::dynamic_pointer_cast<FloatTensor>(network->getOutputElement(info->outputs[0].name));
-            if (!output) {
-                throw std::runtime_error("the model's output is not a float tensor");
+            for (size_t i = 0; i < info->inputs.size(); ++i) {
+                const auto& declared = info->inputs[i];
+                const TensorRef& input = inputTensor(node, static_cast<int>(i));
+                // Shapes that depend on the window are only known here.
+                const TensorShape shape = shapeOf(*input.tensor);
+                if (shape != declared.shape) {
+                    throw std::runtime_error(std::format("input '{}' expects a {} tensor but gets {}", declared.name,
+                                                         shapeToString(declared.shape), shapeToString(shape)));
+                }
+                network->setInputTensor(declared.name, input.producer, input.slot);
             }
             owners_[network.get()] = node.id;
             // Slot i of an OnnxNetwork is its i-th output tensor.
-            tensors_[node.id] = TensorRef{network, 0, output};
+            for (size_t i = 0; i < info->outputs.size(); ++i) {
+                auto output = std::dynamic_pointer_cast<klartraum::TensorElementInterface>(
+                    network->getOutputElement(info->outputs[i].name));
+                if (!output) {
+                    throw std::runtime_error("the model's output '" + info->outputs[i].name + "' is not a tensor");
+                }
+                tensors_[{node.id, static_cast<int>(i)}] = TensorRef{network, static_cast<int>(i), output};
+            }
+            break;
+        }
+        case NodeKind::Add:
+        case NodeKind::Subtract:
+        case NodeKind::Multiply:
+        case NodeKind::Divide: {
+            const TensorRef& a = inputTensor(node, 0);
+            const TensorShape aShape = shapeOf(*a.floats());
+            TensorRef b;
+            if (graph_.inputLink(node.id, 1)) {
+                b = inputTensor(node, 1);
+                b.floats();
+            } else {
+                // The node's b as a one-element tensor.
+                auto scalar = vc_.create<FloatTensor>(std::vector<uint32_t>{1}, kUploadUsage);
+                scalar->setName(node.title + " b");
+                uploads_.emplace_back(scalar, std::vector<float>{node.as<BinaryLayerParams>().b});
+                owners_[scalar.get()] = node.id;
+                b = TensorRef{scalar, -1, scalar};
+            }
+            const TensorShape bShape = shapeOf(*b.tensor);
+            const TensorShape shape = klartraum::layers::broadcastShape(aShape, bShape);
+            const auto op = node.kind == NodeKind::Add        ? klartraum::layers::BinaryOp::Add
+                            : node.kind == NodeKind::Subtract ? klartraum::layers::BinaryOp::Sub
+                            : node.kind == NodeKind::Multiply ? klartraum::layers::BinaryOp::Mul
+                                                              : klartraum::layers::BinaryOp::Div;
+            auto layer = klartraum::layers::binary(vc_, op, aShape, bShape, shape);
+            layer->setName(node.title);
+            auto output = vc_.create<FloatTensor>(shape);
+            output->setName(node.title + " output");
+            layer->setInput(a.producer, 0, a.slot);
+            layer->setInput(b.producer, 1, b.slot);
+            layer->setInput(output, 2);
+            owners_[layer.get()] = node.id;
+            owners_[output.get()] = node.id;
+            tensors_[{node.id, 0}] = TensorRef{layer, 2, output};
+            break;
+        }
+        case NodeKind::Relu:
+        case NodeKind::Sigmoid:
+        case NodeKind::Sqrt:
+        case NodeKind::Softmax: {
+            const TensorRef& input = inputTensor(node);
+            const TensorShape shape = shapeOf(*input.floats());
+            auto layer = node.kind == NodeKind::Relu      ? klartraum::layers::relu(vc_, shape)
+                         : node.kind == NodeKind::Softmax ? klartraum::layers::softmax(vc_, shape)
+                         : klartraum::layers::unary(vc_,
+                                                    node.kind == NodeKind::Sigmoid ? klartraum::layers::UnaryOp::Sigmoid
+                                                                                   : klartraum::layers::UnaryOp::Sqrt,
+                                                    shape);
+            layer->setName(node.title);
+            auto output = vc_.create<FloatTensor>(shape);
+            output->setName(node.title + " output");
+            layer->setInput(input.producer, 0, input.slot);
+            layer->setInput(output, 1);
+            owners_[layer.get()] = node.id;
+            owners_[output.get()] = node.id;
+            tensors_[{node.id, 0}] = TensorRef{layer, 1, output};
             break;
         }
         case NodeKind::Prompt: {
@@ -662,47 +731,14 @@ private:
             std::vector<int64_t> mask = tokenizer.attentionMask(ids);
             hostStep(node.title + ": tokenized", start);
             const std::vector<uint32_t> shape{2, static_cast<uint32_t>(klartraum::ClipTokenizer::SequenceLength)};
-            TokensRef tokens{vc_.create<Int64Tensor>(shape, kUploadUsage), vc_.create<Int64Tensor>(shape, kUploadUsage)};
-            tokens.ids->setName(node.title + " ids");
-            tokens.mask->setName(node.title + " attention mask");
-            owners_[tokens.ids.get()] = node.id;
-            owners_[tokens.mask.get()] = node.id;
-            tokenUploads_.emplace_back(tokens.ids, std::move(ids));
-            tokenUploads_.emplace_back(tokens.mask, std::move(mask));
-            tokens_[node.id] = tokens;
-            break;
-        }
-        case NodeKind::TextEncoder: {
-            const auto& p = node.as<TextEncoderParams>();
-            const auto info = modelInfo(p.path);
-            const TokensRef& tokens = builtValue(tokens_, node, 0);
-            auto network = vc_.create<klartraum::OnnxNetwork>(context_.resolveInput(p.path).string());
-            network->setName(node.title);
-            for (const auto& input : info->inputs) {
-                if (input.name == "input_ids") {
-                    network->setInputTensor(input.name, tokens.ids);
-                } else if (input.name == "attention_mask") {
-                    network->setInputTensor(input.name, tokens.mask);
-                } else {
-                    throw std::runtime_error("unexpected text encoder input '" + input.name +
-                                             "'; expected input_ids and attention_mask");
-                }
+            int slot = 0;
+            for (auto* values : {&ids, &mask}) {
+                auto tensor = vc_.create<Int64Tensor>(shape, kUploadUsage);
+                tensor->setName(node.title + (slot == 0 ? " ids" : " attention mask"));
+                owners_[tensor.get()] = node.id;
+                int64Uploads_.emplace_back(tensor, std::move(*values));
+                tensors_[{node.id, slot++}] = TensorRef{tensor, -1, tensor};
             }
-            // CLIP's per-token embeddings; a pooled output may follow.
-            const auto& outputs = info->outputs;
-            auto embeddings = std::find_if(outputs.begin(), outputs.end(),
-                                           [](const OnnxTensorDesc& o) { return o.name == "last_hidden_state"; });
-            if (embeddings == outputs.end()) {
-                embeddings = outputs.begin();
-            }
-            auto output = std::dynamic_pointer_cast<FloatTensor>(network->getOutputElement(embeddings->name));
-            if (!output) {
-                throw std::runtime_error("the model's output is not a float tensor");
-            }
-            owners_[network.get()] = node.id;
-            // Slot i of an OnnxNetwork is its i-th output tensor.
-            const int slot = static_cast<int>(embeddings - outputs.begin());
-            tensors_[node.id] = TensorRef{network, slot, output};
             break;
         }
         case NodeKind::LatentNoise: {
@@ -713,17 +749,18 @@ private:
             latents.values = p.path.empty() ? latentNoise(p.seed, count) : readFloats(context_.resolveInput(p.path), count);
             hostStep(std::format("{}: {}", node.title, p.path.empty() ? std::format("seed {}", p.seed) : "read " + p.path),
                      start);
-            hostTensors_[node.id] = std::move(latents);
+            hostTensors_[{node.id, 0}] = std::move(latents);
             break;
         }
         case NodeKind::DdimSampler:
-        case NodeKind::VaeDecoder:
             // Run by runStaged(), between the stages of a run.
             throw std::runtime_error("only runs with Run");
+        case NodeKind::Meta:
+            throw std::logic_error("meta nodes are flattened before they are built");
         case NodeKind::Preview:
         case NodeKind::ImageFileWriter:
             if (graph_.inputType(node.id, 0) == PinType::Image) {
-                tensors_[node.id] = convertImage(readableImage(node), node);
+                tensors_[{node.id, 0}] = convertImage(readableImage(node), node);
             }
             break;
         case NodeKind::Present:
@@ -743,12 +780,11 @@ private:
     std::shared_ptr<klartraum::ImageViewSrc> swapchain_;
     std::map<int, std::shared_ptr<klartraum::CameraUboType>> cameraUbos_;
     std::map<int, ImageRef> images_;
-    std::map<int, TensorRef> tensors_;
-    std::map<int, TokensRef> tokens_;
+    std::map<OutputPin, TensorRef> tensors_;
     // Tensors computed on the CPU or by an earlier stage of a run.
-    std::map<int, HostTensor> hostTensors_;
+    std::map<OutputPin, HostTensor> hostTensors_;
     std::vector<std::pair<std::shared_ptr<FloatTensor>, std::vector<float>>> uploads_;
-    std::vector<std::pair<std::shared_ptr<Int64Tensor>, std::vector<int64_t>>> tokenUploads_;
+    std::vector<std::pair<std::shared_ptr<Int64Tensor>, std::vector<int64_t>>> int64Uploads_;
     std::vector<CameraUpdate> cameraUpdates_;
     std::map<int, klartraum::GaussianSoABuffers> gaussians_;
     std::map<int, klartraum::BufferRef> numbers_;
@@ -821,15 +857,16 @@ RunResult runGraph(klartraum::VulkanContext& vulkanContext, const Graph& graph, 
             }
         }
         // Tensors read by this stage's staged nodes or by later stages.
-        std::vector<int> exported;
+        std::vector<OutputPin> exported;
         for (const auto& link : graph.links()) {
             if (!stages.contains(link.fromNode) || !stages.contains(link.toNode) || !inStage(link.fromNode) ||
                 isStaged(graph.findNode(link.fromNode)->kind)) {
                 continue;
             }
             const bool readLater = isStaged(graph.findNode(link.toNode)->kind) || stages.at(link.toNode) > stage;
-            if (readLater && std::find(exported.begin(), exported.end(), link.fromNode) == exported.end()) {
-                exported.push_back(link.fromNode);
+            const OutputPin pin{link.fromNode, link.fromSlot};
+            if (readLater && std::find(exported.begin(), exported.end(), pin) == exported.end()) {
+                exported.push_back(pin);
             }
         }
 

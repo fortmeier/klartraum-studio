@@ -79,11 +79,4 @@ StagedResult sampleDdim(klartraum::VulkanContext& vulkanContext, const std::file
                         const OnnxModelInfo& info, const HostTensor& latents, const HostTensor& embeddings,
                         const DdimSamplerParams& params, const std::string& name, const HostStepLog& hostStep);
 
-// Decodes `latents` with the VAE decoder at `decoder` into a 1x3xHxW image
-// tensor with values in [0, 1]: the latents are divided by
-// kVaeScalingFactor, and the decoder's [-1, 1] output is mapped to [0, 1].
-StagedResult decodeLatents(klartraum::VulkanContext& vulkanContext, const std::filesystem::path& decoder,
-                           const OnnxModelInfo& info, const HostTensor& latents, const std::string& name,
-                           const HostStepLog& hostStep);
-
 } // namespace kstudio

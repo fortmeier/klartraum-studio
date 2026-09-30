@@ -10,13 +10,14 @@
  * - ddimStepGuidesAndSteps: with the true noise predicted, a step recovers the clean latents and
  *   noises them to the previous alpha; guidance extrapolates from the negative prediction
  * - readFloatsChecksSize: a file of the wrong size is rejected with its size
- * - stagedNodesOnlyRun: DDIM Sampler and VAE Decoder feeding Present are errors on those nodes; the
- *   same nodes feeding a Preview are not
+ * - stagedNodesOnlyRun: a DDIM Sampler feeding Present is an error on it, a Preview is not; the VAE
+ *   Decoder meta node is not staged
  * - validateStableDiffusionParams: missing files, latent sizes that are not multiples of 8 and step
- *   counts outside 1..1000 are errors
- * - tokensOnlyFeedTheTextEncoder: Tokens connect only to a Text Encoder
- * - runStagesSplitAtStagedNodes: nodes before the sampler run in stage 0, the decoder in 1 and the
- *   sinks after it in 2
+ *   counts outside 1..1000 are errors; a built-in Text Encoder without a model reports its inner node
+ * - promptTokensAreInt64Tensors: the Prompt's ids and mask are 2x77 int64 tensor pins; they connect
+ *   like any tensor, and a layer that needs float32 reports them
+ * - runStagesSplitAtStagedNodes: in the flattened example, the nodes up to the sampler run in stage 0,
+ *   the VAE Decoder's inner nodes and the sinks after it in stage 1
  * - roundTripStableDiffusionParams: prompt, noise, sampler and decoder parameters survive
  *   toJson/fromJson
  * - planChecksModelShapes: with the exported models, the example graph plans without errors, shapes
@@ -33,6 +34,7 @@
 #include <filesystem>
 #include <fstream>
 #include <numeric>
+#include <set>
 
 #include "klartraum/headless_frontend.hpp"
 #include "klartraum/klartraum_core.hpp"
@@ -41,7 +43,9 @@
 #include "studio/graph_compiler.hpp"
 #include "studio/graph_runner.hpp"
 #include "studio/graph_serialization.hpp"
+#include "studio/meta_nodes.hpp"
 #include "studio/stable_diffusion.hpp"
+#include "studio/tensor_shapes.hpp"
 
 using namespace kstudio;
 
@@ -72,6 +76,15 @@ template <typename T> std::vector<T> readAll(const std::filesystem::path& path) 
     in.seekg(0);
     in.read(reinterpret_cast<char*>(values.data()), static_cast<std::streamsize>(values.size() * sizeof(T)));
     return values;
+}
+
+int findMeta(const Graph& graph, std::string_view definition) {
+    for (const auto& node : graph.nodes()) {
+        if (node.kind == NodeKind::Meta && node.as<MetaParams>().definition == definition) {
+            return node.id;
+        }
+    }
+    return -1;
 }
 
 int findKind(const Graph& graph, NodeKind kind) {
@@ -211,18 +224,18 @@ TEST(StableDiffusion, readFloatsChecksSize) {
 TEST(StableDiffusion, stagedNodesOnlyRun) {
     Graph graph = makeStableDiffusionGraph("models", 256, "a lantern", "", "out.png");
     const int sampler = findKind(graph, NodeKind::DdimSampler);
-    const int decoder = findKind(graph, NodeKind::VaeDecoder);
-    EXPECT_FALSE(hasError(graph.validate(), sampler));
-    EXPECT_FALSE(hasError(graph.validate(), decoder));
-    EXPECT_FALSE(graph.hasErrors());
+    const int decoder = findMeta(graph, kVaeDecoderDefinition);
+    EXPECT_FALSE(hasError(planGraph(graph).diagnostics, sampler));
+    EXPECT_FALSE(hasError(planGraph(graph).diagnostics, decoder));
 
     const int toImage = graph.addNode(NodeKind::TensorToImage);
     const int present = graph.addNode(NodeKind::Present);
     ASSERT_FALSE(graph.connect(out(decoder), in(toImage)));
     ASSERT_FALSE(graph.connect(out(toImage), in(present)));
-    const auto diagnostics = graph.validate();
+    const auto diagnostics = planGraph(graph).diagnostics;
     EXPECT_TRUE(hasError(diagnostics, sampler));
-    EXPECT_TRUE(hasError(diagnostics, decoder));
+    // The decoder is layers and an ONNX model: it could run live.
+    EXPECT_FALSE(hasError(diagnostics, decoder));
     EXPECT_FALSE(hasError(diagnostics, toImage));
     EXPECT_FALSE(hasError(diagnostics, findKind(graph, NodeKind::Prompt)));
 }
@@ -245,35 +258,58 @@ TEST(StableDiffusion, validateStableDiffusionParams) {
     graph.findNode(sampler)->as<DdimSamplerParams>().steps = 1000;
     graph.findNode(sampler)->as<DdimSamplerParams>().path.clear();
     EXPECT_TRUE(hasError(graph.validate(), sampler));
-    for (NodeKind kind : {NodeKind::TextEncoder, NodeKind::VaeDecoder}) {
-        Graph empty;
-        const int id = empty.addNode(kind);
-        EXPECT_TRUE(hasError(empty.validate(), id)) << kindInfo(kind).title;
-    }
+    // A built-in meta node without its model reports the inner node.
+    Graph bare;
+    const int encoder = bare.addMetaNode(kTextEncoderDefinition);
+    const auto bareDiagnostics = planGraph(bare).diagnostics;
+    EXPECT_TRUE(std::any_of(bareDiagnostics.begin(), bareDiagnostics.end(), [&](const Diagnostic& d) {
+        return d.node == encoder && d.message == "Text Encoder / CLIP: No ONNX model file is set.";
+    }));
 }
 
-TEST(StableDiffusion, tokensOnlyFeedTheTextEncoder) {
+TEST(StableDiffusion, promptTokensAreInt64Tensors) {
     Graph graph;
     const int prompt = graph.addNode(NodeKind::Prompt);
-    const int encoder = graph.addNode(NodeKind::TextEncoder);
-    const int model = graph.addNode(NodeKind::OnnxModel);
-    const int sampler = graph.addNode(NodeKind::DdimSampler);
-    EXPECT_FALSE(graph.connect(out(prompt), in(encoder)));
-    EXPECT_TRUE(graph.connect(out(prompt), in(model)));
-    EXPECT_TRUE(graph.connect(out(prompt), in(sampler, 1)));
-    EXPECT_FALSE(graph.connect(out(encoder), in(sampler, 1)));
+    const int encoder = graph.addMetaNode(kTextEncoderDefinition);
+    const int multiply = graph.addNode(NodeKind::Multiply);
+    const auto outputs = graph.outputPins(*graph.findNode(prompt));
+    ASSERT_EQ(outputs.size(), 2u);
+    EXPECT_EQ(outputs[0].type, PinType::Tensor);
+    EXPECT_EQ(outputs[1].type, PinType::Tensor);
+    EXPECT_FALSE(graph.connect(out(prompt, 0), in(encoder, 0)));
+    EXPECT_FALSE(graph.connect(out(prompt, 1), in(encoder, 1)));
+    EXPECT_FALSE(graph.connect(out(prompt, 1), in(multiply, 0)));
+
+    const ShapeInference types = inferTensorShapes(graph, {});
+    EXPECT_EQ(types.types.at({prompt, 0}), (TensorType{{2, 77}, ElementType::Int64}));
+    EXPECT_EQ(types.types.at({prompt, 1}), (TensorType{{2, 77}, ElementType::Int64}));
+    EXPECT_TRUE(std::any_of(types.diagnostics.begin(), types.diagnostics.end(), [&](const Diagnostic& d) {
+        return d.node == multiply && d.message.find("float32") != std::string::npos;
+    }));
+    EXPECT_FALSE(types.types.contains({multiply, 0}));
 }
 
 TEST(StableDiffusion, runStagesSplitAtStagedNodes) {
     const Graph graph = makeStableDiffusionGraph("models", 256, "a lantern", "", "out.png");
-    const auto stages = runStages(graph, graph.topologicalOrder());
-    EXPECT_EQ(stages.at(findKind(graph, NodeKind::Prompt)), 0);
-    EXPECT_EQ(stages.at(findKind(graph, NodeKind::TextEncoder)), 0);
-    EXPECT_EQ(stages.at(findKind(graph, NodeKind::LatentNoise)), 0);
-    EXPECT_EQ(stages.at(findKind(graph, NodeKind::DdimSampler)), 0);
-    EXPECT_EQ(stages.at(findKind(graph, NodeKind::VaeDecoder)), 1);
-    EXPECT_EQ(stages.at(findKind(graph, NodeKind::Preview)), 2);
-    EXPECT_EQ(stages.at(findKind(graph, NodeKind::ImageFileWriter)), 2);
+    const FlatGraph flat = flatten(graph);
+    const auto stages = runStages(flat.graph, flat.graph.topologicalOrder());
+    // The stage of every flat node standing for top-level node `id`.
+    auto stagesOf = [&](int id) {
+        std::set<int> result;
+        for (const auto& [node, stage] : stages) {
+            if (flat.top(node) == id) {
+                result.insert(stage);
+            }
+        }
+        return result;
+    };
+    EXPECT_EQ(stagesOf(findKind(graph, NodeKind::Prompt)), std::set<int>{0});
+    EXPECT_EQ(stagesOf(findMeta(graph, kTextEncoderDefinition)), std::set<int>{0});
+    EXPECT_EQ(stagesOf(findKind(graph, NodeKind::LatentNoise)), std::set<int>{0});
+    EXPECT_EQ(stagesOf(findKind(graph, NodeKind::DdimSampler)), std::set<int>{0});
+    EXPECT_EQ(stagesOf(findMeta(graph, kVaeDecoderDefinition)), std::set<int>{1});
+    EXPECT_EQ(stagesOf(findKind(graph, NodeKind::Preview)), std::set<int>{1});
+    EXPECT_EQ(stagesOf(findKind(graph, NodeKind::ImageFileWriter)), std::set<int>{1});
 }
 
 TEST(StableDiffusion, roundTripStableDiffusionParams) {
@@ -310,9 +346,10 @@ TEST(StableDiffusion, planChecksModelShapes) {
         EXPECT_NE(d.severity, Severity::Error) << d.message;
     }
     ASSERT_TRUE(plan.run.has_value());
-    EXPECT_EQ(plan.run->shapes.at(findKind(graph, NodeKind::TextEncoder)), (TensorShape{2, 77, 768}));
-    EXPECT_EQ(plan.run->shapes.at(findKind(graph, NodeKind::DdimSampler)), (TensorShape{1, 4, 32, 32}));
-    EXPECT_EQ(plan.run->shapes.at(findKind(graph, NodeKind::VaeDecoder)), (TensorShape{1, 3, 256, 256}));
+    auto typeOf = [&](int node) { return plan.run->types.at(plan.flat.flatOutput({node, 0})).shape; };
+    EXPECT_EQ(typeOf(findMeta(graph, kTextEncoderDefinition)), (TensorShape{2, 77, 768}));
+    EXPECT_EQ(typeOf(findKind(graph, NodeKind::DdimSampler)), (TensorShape{1, 4, 32, 32}));
+    EXPECT_EQ(typeOf(findMeta(graph, kVaeDecoderDefinition)), (TensorShape{1, 3, 256, 256}));
 
     const int noise = findKind(graph, NodeKind::LatentNoise);
     graph.findNode(noise)->as<LatentNoiseParams>().width = 512;
@@ -358,7 +395,7 @@ TEST_F(StableDiffusionRunTest, runReproducesReference) {
     Graph graph = makeStableDiffusionGraph(dir.string(), 128, kPrompt, kNegativePrompt, "sd.png");
     const int noise = findKind(graph, NodeKind::LatentNoise);
     const int sampler = findKind(graph, NodeKind::DdimSampler);
-    const int decoder = findKind(graph, NodeKind::VaeDecoder);
+    const int decoder = findMeta(graph, kVaeDecoderDefinition);
     const int preview = findKind(graph, NodeKind::Preview);
     graph.findNode(noise)->as<LatentNoiseParams>().path = (dir / "initial_latents_f32.bin").string();
     const auto timesteps = readAll<int64_t>(dir / "scheduler_timesteps_i64.bin");
@@ -368,7 +405,8 @@ TEST_F(StableDiffusionRunTest, runReproducesReference) {
     for (const auto& d : plan.diagnostics) {
         ASSERT_NE(d.severity, Severity::Error) << d.message;
     }
-    const RunResult result = runGraph(frontend->getKlartraumEngine().getVulkanContext(), graph, *plan.run, context);
+    const RunResult result =
+        runGraph(frontend->getKlartraumEngine().getVulkanContext(), plan.flat.graph, *plan.run, context);
 
     // The reference is the decoder's [-1, 1] output.
     std::vector<float> reference = readAll<float>(dir / "pipeline_reference_f32.bin");
@@ -393,10 +431,10 @@ TEST_F(StableDiffusionRunTest, runReproducesReference) {
     // Every stage's graph and the staged nodes' networks are in the view.
     auto owned = [&](int node, std::string_view type) {
         return std::any_of(result.compiled.nodes.begin(), result.compiled.nodes.end(), [&](const ElementNode& e) {
-            return e.owner == node && e.type == type;
+            return e.owner >= 0 && plan.flat.top(e.owner) == node && e.type == type;
         });
     };
-    EXPECT_TRUE(owned(findKind(graph, NodeKind::TextEncoder), "OnnxNetwork"));
+    EXPECT_TRUE(owned(findMeta(graph, kTextEncoderDefinition), "OnnxNetwork"));
     EXPECT_TRUE(owned(sampler, "OnnxNetwork"));
     EXPECT_TRUE(owned(decoder, "OnnxNetwork"));
     const auto stepLogs = std::count_if(steps.begin(), steps.end(), [](const std::string& s) {

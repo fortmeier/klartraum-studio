@@ -75,9 +75,9 @@ TEST(TensorShapes, autoencoderShapes) {
     const Graph graph = makeAutoencoderGraph("in.png", "enc", "dec", "out.png");
     const ShapeInference result = inferTensorShapes(graph, sampleModels());
     EXPECT_TRUE(result.diagnostics.empty());
-    EXPECT_EQ(result.shapes.at(findKind(graph, NodeKind::ImageFile)), (TensorShape{1, 3, 128, 128}));
-    EXPECT_EQ(result.shapes.at(findKind(graph, NodeKind::OnnxModel, 0)), (TensorShape{1, 128, 16, 16}));
-    EXPECT_EQ(result.shapes.at(findKind(graph, NodeKind::OnnxModel, 1)), (TensorShape{1, 3, 128, 128}));
+    EXPECT_EQ(result.types.at({findKind(graph, NodeKind::ImageFile), 0}).shape, (TensorShape{1, 3, 128, 128}));
+    EXPECT_EQ(result.types.at({findKind(graph, NodeKind::OnnxModel, 0), 0}).shape, (TensorShape{1, 128, 16, 16}));
+    EXPECT_EQ(result.types.at({findKind(graph, NodeKind::OnnxModel, 1), 0}).shape, (TensorShape{1, 3, 128, 128}));
 }
 
 TEST(TensorShapes, offscreenShapes) {
@@ -86,7 +86,7 @@ TEST(TensorShapes, offscreenShapes) {
     target.width = 64;
     target.height = 32;
     const ShapeInference result = inferTensorShapes(graph, sampleModels());
-    EXPECT_EQ(result.shapes.at(findKind(graph, NodeKind::ImageToTensor)), (TensorShape{1, 3, 32, 64}));
+    EXPECT_EQ(result.types.at({findKind(graph, NodeKind::ImageToTensor), 0}).shape, (TensorShape{1, 3, 32, 64}));
     // 64x32 does not fit the 128x128 encoder.
     EXPECT_TRUE(hasErrorOn(result, findKind(graph, NodeKind::OnnxModel, 0)));
 }
@@ -100,8 +100,8 @@ TEST(TensorShapes, tensorToImageShapes) {
     graph.connect({toTensor, PinDirection::Output, 0}, {findKind(graph, NodeKind::Preview), PinDirection::Input, 0});
     const ShapeInference result = inferTensorShapes(graph, sampleModels());
     EXPECT_TRUE(result.diagnostics.empty());
-    EXPECT_EQ(result.shapes.at(toTensor), (TensorShape{1, 3, 128, 128}));
-    EXPECT_FALSE(result.shapes.contains(toImage));
+    EXPECT_EQ(result.types.at({toTensor, 0}).shape, (TensorShape{1, 3, 128, 128}));
+    EXPECT_FALSE(result.types.contains({toImage, 0}));
 }
 
 TEST(TensorShapes, tensorToImageNeedsRgb) {

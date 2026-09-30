@@ -5,6 +5,7 @@
 #include <map>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace kstudio {
@@ -15,9 +16,28 @@ using TensorShape = std::vector<uint32_t>;
 
 std::string shapeToString(const TensorShape& shape);
 
+// The element types tensors between nodes can have.
+enum class ElementType { Float32, Int64, Other };
+
+std::string_view elementTypeName(ElementType type);
+
+// What flows through a tensor pin.
+struct TensorType {
+    TensorShape shape;
+    ElementType element = ElementType::Float32;
+
+    bool operator==(const TensorType&) const = default;
+};
+
+// "1x3x64x64", with the element type appended unless it is float32.
+std::string tensorTypeToString(const TensorType& type);
+
 struct OnnxTensorDesc {
     std::string name;
     TensorShape shape;
+    ElementType element = ElementType::Float32;
+
+    TensorType type() const { return {shape, element}; }
 };
 
 // What the studio needs to know about an ONNX model without building it.

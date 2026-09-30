@@ -3,7 +3,10 @@
 #include <algorithm>
 #include <format>
 #include <optional>
+#include <stdexcept>
 #include <string_view>
+
+#include "klartraum/layers/layers.hpp"
 
 namespace kstudio {
 
@@ -16,13 +19,27 @@ ShapeInference inferTensorShapes(const Graph& graph, const OnnxInfoProvider& onn
     auto report = [&](int node, std::string message) {
         result.diagnostics.push_back(Diagnostic{Severity::Error, node, std::move(message)});
     };
-    auto inputShape = [&](int node, int slot = 0) -> const TensorShape* {
+    // The type of the tensor feeding input `slot`, if known.
+    auto inputType = [&](int node, int slot = 0) -> const TensorType* {
         const Link* link = graph.inputLink(node, slot);
         if (!link) {
             return nullptr;
         }
-        auto it = result.shapes.find(link->fromNode);
-        return it == result.shapes.end() ? nullptr : &it->second;
+        auto it = result.types.find({link->fromNode, link->fromSlot});
+        return it == result.types.end() ? nullptr : &it->second;
+    };
+    auto inputShape = [&](int node, int slot = 0) -> const TensorShape* {
+        const TensorType* type = inputType(node, slot);
+        return type ? &type->shape : nullptr;
+    };
+    // Reports a float input that is not float; returns whether it is.
+    auto requireFloat = [&](int node, int slot, std::string_view what) {
+        const TensorType* type = inputType(node, slot);
+        if (type && type->element != ElementType::Float32) {
+            report(node, std::format("{} must be a float32 tensor, not {}.", what, elementTypeName(type->element)));
+            return false;
+        }
+        return true;
     };
     // The 1x3xHxW tensor an image converts to, if its size is known: a
     // Gaussian Splatting node renders at its Offscreen Target's size (the
@@ -78,70 +95,90 @@ ShapeInference inferTensorShapes(const Graph& graph, const OnnxInfoProvider& onn
 
     for (int id : graph.topologicalOrder()) {
         const Node& node = *graph.findNode(id);
+        auto output = [&](int slot, TensorType type) { result.types[{id, slot}] = std::move(type); };
+
+        if (isBinaryLayer(node.kind)) {
+            const TensorShape* a = inputShape(id, 0);
+            const bool floats = requireFloat(id, 0, "A") && requireFloat(id, 1, "B");
+            // Without B, the node's b is a one-element tensor.
+            const TensorShape one{1};
+            const TensorShape* b = graph.inputLink(id, 1) ? inputShape(id, 1) : &one;
+            if (a && b && floats) {
+                try {
+                    output(0, {klartraum::layers::broadcastShape(*a, *b), ElementType::Float32});
+                } catch (const std::runtime_error&) {
+                    report(id, std::format("{} and {} cannot be broadcast together.", shapeToString(*a),
+                                           shapeToString(*b)));
+                }
+            }
+            continue;
+        }
+        if (isUnaryLayer(node.kind)) {
+            if (const TensorShape* in = inputShape(id); in && requireFloat(id, 0, "The input")) {
+                output(0, {*in, ElementType::Float32});
+            }
+            continue;
+        }
+
         switch (node.kind) {
         case NodeKind::ImageFile: {
             const auto& p = node.as<ImageFileParams>();
-            result.shapes[id] = {1, 3, p.height, p.width};
+            output(0, {{1, 3, p.height, p.width}});
             break;
         }
         case NodeKind::ImageToTensor:
             if (auto shape = imageShape(graph.inputNode(id, 0))) {
-                result.shapes[id] = *shape;
+                output(0, {*shape});
             }
             break;
         case NodeKind::TensorToImage:
-            // klartraum's tensor_to_image shader reads three planes.
+            // klartraum's tensor_to_image shader reads three float planes.
             if (const TensorShape* in = inputShape(id); in && !(isImageShape(*in) && (*in)[1] == 3)) {
                 report(id, std::format("A {} tensor cannot be converted; expected 1x3xHxW.", shapeToString(*in)));
             }
+            requireFloat(id, 0, "The tensor");
             break;
         case NodeKind::OnnxModel: {
-            const auto info = model(id, node.as<OnnxModelParams>().path);
+            const auto& p = node.as<OnnxModelParams>();
+            const auto info = model(id, p.path);
             if (!info) {
                 break;
             }
-            if (info->inputs.size() != 1 || info->outputs.empty()) {
-                report(id, std::format("Only models with one input are supported (this one has {} inputs, {} outputs).",
-                                       info->inputs.size(), info->outputs.size()));
-                break;
-            }
-            if (const TensorShape* in = inputShape(id); in && *in != info->inputs[0].shape) {
-                report(id, std::format("The model expects a {} tensor but gets {}.",
-                                       shapeToString(info->inputs[0].shape), shapeToString(*in)));
-            }
-            result.shapes[id] = info->outputs[0].shape;
-            break;
-        }
-        case NodeKind::LatentNoise: {
-            const auto& p = node.as<LatentNoiseParams>();
-            result.shapes[id] = {1, 4, p.height / 8, p.width / 8};
-            break;
-        }
-        case NodeKind::TextEncoder: {
-            const auto info = model(id, node.as<TextEncoderParams>().path);
-            if (!info) {
-                break;
-            }
-            // The Prompt node gives 2x77 token ids and an attention mask.
-            const TensorShape tokens{2, 77};
-            const OnnxTensorDesc* ids = modelInput(*info, "input_ids");
-            if (!ids || info->outputs.empty()) {
-                report(id, "Not a CLIP text encoder: it needs an input_ids input and an output.");
-                break;
-            }
+            std::vector<std::string> inputs, outputs;
             for (const auto& input : info->inputs) {
-                if (input.name != "input_ids" && input.name != "attention_mask") {
-                    report(id, "Unexpected text encoder input '" + input.name + "'.");
-                } else if (input.shape != tokens) {
-                    report(id, std::format("The model expects {} {} but the Prompt gives 2x77 (negative and positive "
-                                           "prompt).",
-                                           shapeToString(input.shape), input.name));
+                inputs.push_back(input.name);
+            }
+            for (const auto& out : info->outputs) {
+                outputs.push_back(out.name);
+            }
+            if (inputs.size() > kMaxPinsPerDirection || outputs.size() > kMaxPinsPerDirection) {
+                report(id, std::format("Models with more than {} inputs or outputs are not supported.",
+                                       kMaxPinsPerDirection));
+                break;
+            }
+            if (inputs != p.inputs || outputs != p.outputs) {
+                report(id, "The node's pins do not match the model's inputs and outputs.");
+                break;
+            }
+            for (size_t i = 0; i < info->inputs.size(); ++i) {
+                const TensorType* in = inputType(id, static_cast<int>(i));
+                if (in && *in != info->inputs[i].type()) {
+                    report(id, std::format("Input '{}' expects {} but gets {}.", info->inputs[i].name,
+                                           tensorTypeToString(info->inputs[i].type()), tensorTypeToString(*in)));
                 }
             }
-            const auto& outputs = info->outputs;
-            auto embeddings = std::find_if(outputs.begin(), outputs.end(),
-                                           [](const OnnxTensorDesc& o) { return o.name == "last_hidden_state"; });
-            result.shapes[id] = embeddings != outputs.end() ? embeddings->shape : outputs[0].shape;
+            for (size_t i = 0; i < info->outputs.size(); ++i) {
+                output(static_cast<int>(i), info->outputs[i].type());
+            }
+            break;
+        }
+        case NodeKind::Prompt:
+            output(0, {{2, 77}, ElementType::Int64});
+            output(1, {{2, 77}, ElementType::Int64});
+            break;
+        case NodeKind::LatentNoise: {
+            const auto& p = node.as<LatentNoiseParams>();
+            output(0, {{1, 4, p.height / 8, p.width / 8}});
             break;
         }
         case NodeKind::DdimSampler: {
@@ -170,23 +207,9 @@ ShapeInference inferTensorShapes(const Graph& graph, const OnnxInfoProvider& onn
                 report(id, std::format("The UNet expects {} embeddings but gets {}.", shapeToString(embeddings->shape),
                                        shapeToString(*in)));
             }
-            result.shapes[id] = latents;
-            break;
-        }
-        case NodeKind::VaeDecoder: {
-            const auto info = model(id, node.as<VaeDecoderParams>().path);
-            if (!info) {
-                break;
-            }
-            if (info->inputs.size() != 1 || info->outputs.empty()) {
-                report(id, "A VAE decoder has one input and an output.");
-                break;
-            }
-            if (const TensorShape* in = inputShape(id); in && *in != info->inputs[0].shape) {
-                report(id, std::format("The decoder expects {} latents but gets {}.",
-                                       shapeToString(info->inputs[0].shape), shapeToString(*in)));
-            }
-            result.shapes[id] = info->outputs[0].shape;
+            requireFloat(id, 0, "The latents");
+            requireFloat(id, 1, "The embeddings");
+            output(0, {latents});
             break;
         }
         case NodeKind::Preview:
@@ -194,6 +217,7 @@ ShapeInference inferTensorShapes(const Graph& graph, const OnnxInfoProvider& onn
             if (const TensorShape* in = inputShape(id); in && !isImageShape(*in)) {
                 report(id, std::format("A {} tensor is not an image; expected 1x1xHxW or 1x3xHxW.", shapeToString(*in)));
             }
+            requireFloat(id, 0, "The tensor");
             break;
         default:
             break;

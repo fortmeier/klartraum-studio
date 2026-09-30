@@ -4,12 +4,13 @@
 //   klartraum_studio_snapshot --out shot.bmp [--backend compute|raster]
 //                             [--tab authoring|compiled] [--select KIND]
 //                             [--hide-buffers] [--frames N] [--then-backend B]
-//                             [graph.ktgraph.json]
+//                             [--open-meta] [graph.ktgraph.json]
 //
 // --then-backend switches the Gaussian Splatting node's backend halfway, which
 // exercises recompiling while a graph is running. --example picks the start
 // graph (see klartraum_studio --help); --run presses Run after the first
-// frame and fails if the run fails.
+// frame and fails if the run fails. --open-meta opens the graph's first meta
+// node after the first frame.
 //
 // KIND is a node kind name such as gaussian_splatting or scene. The headless
 // swapchain is 512x512 pixels; the UI is laid out at kLogicalSize and scaled
@@ -120,6 +121,7 @@ int main(int argc, char** argv) {
     int frames = 12;
     std::string thenBackend;
     bool run = false;
+    bool openMeta = false;
 
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
@@ -145,6 +147,8 @@ int main(int argc, char** argv) {
                 return EXIT_FAILURE;
             }
             options.example = *example;
+        } else if (arg == "--open-meta") {
+            openMeta = true;
         } else if (arg == "--run") {
             run = true;
         } else if (arg == "--profile") {
@@ -194,6 +198,14 @@ int main(int argc, char** argv) {
         for (int f = 0; f < total; ++f) {
             if (run && f == 1) {
                 app.requestRun();
+            }
+            if (openMeta && f == 1) {
+                for (const auto& node : app.graph().nodes()) {
+                    if (node.kind == kstudio::NodeKind::Meta) {
+                        app.openMetaNode(node.id);
+                        break;
+                    }
+                }
             }
             if (!thenBackend.empty() && f == frames / 2) {
                 for (auto& node : app.editableGraph().nodes()) {
