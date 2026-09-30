@@ -20,9 +20,6 @@ using OnnxInfoProvider =
 // A tensor that can be shown or saved as an image: 1x1xHxW or 1x3xHxW.
 bool isImageShape(const TensorShape& shape);
 
-// An output pin: (node id, output slot).
-using OutputPin = std::pair<int, int>;
-
 struct ShapeInference {
     std::map<OutputPin, TensorType> types;  // what each tensor output carries, where known
     std::vector<Diagnostic> diagnostics;
@@ -38,7 +35,7 @@ struct ShapeInference {
 //    must be the model's;
 //  - layers broadcast (Add, Subtract, Multiply, Divide) or keep their input's
 //    shape, and take float tensors;
-//  - Stable Diffusion nodes check their inputs against their models;
+//  - the DDIM Sampler checks its latents and embeddings against its UNet;
 //  - sinks need float images (1x1xHxW or 1x3xHxW), Tensor to Image 1x3xHxW;
 //  - unreadable models and operators klartraum cannot execute.
 // Unconnected inputs are skipped; Graph::validate reports those.

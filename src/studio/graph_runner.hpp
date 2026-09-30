@@ -51,11 +51,12 @@ struct RunResult {
 };
 
 // Builds the plan's nodes as a standalone klartraum compute graph (one
-// path), executes it once and reads the sinks back. Staged nodes (see
-// isStaged) split the run into stages: each stage's graph is executed, the
-// tensors later stages need are read back, then the staged nodes run on
-// them. The result's compiled graph holds every stage's graph and the graphs
-// the staged nodes ran. Throws std::runtime_error naming the failing node.
+// path), executes it once and reads the sinks back. `graph` has no meta nodes
+// (see flatten). Staged nodes (see isStaged) split the run into stages: each
+// stage's graph is executed, the tensors later stages need are read back,
+// then the staged nodes run on them. The result's compiled graph holds every
+// stage's graph and the graphs the staged nodes ran. Throws
+// std::runtime_error naming the failing node.
 RunResult runGraph(klartraum::VulkanContext& vulkanContext, const Graph& graph, const RunPlan& plan,
                    const RunContext& context);
 

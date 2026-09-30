@@ -18,7 +18,10 @@
 #include "studio/cpu_numbers.hpp"
 #include "studio/graph_layout.hpp"
 #include "studio/graph_serialization.hpp"
+#include "studio/meta_nodes.hpp"
 #include "studio/stable_diffusion.hpp"
+
+#include <nlohmann/json.hpp>
 
 namespace kstudio {
 
@@ -130,11 +133,10 @@ ImU32 kindColor(NodeKind kind) {
     case NodeKind::Sigmoid:
     case NodeKind::Sqrt:
     case NodeKind::Softmax: return rgb(120, 70, 130);
-    case NodeKind::Prompt:
-    case NodeKind::TextEncoder: return rgb(130, 70, 150);
+    case NodeKind::Prompt: return rgb(130, 70, 150);
     case NodeKind::LatentNoise: return rgb(120, 110, 60);
     case NodeKind::DdimSampler: return rgb(160, 70, 90);
-    case NodeKind::VaeDecoder: return rgb(150, 60, 110);
+    case NodeKind::Meta: return rgb(70, 90, 120);
     case NodeKind::Preview: return rgb(60, 110, 100);
     case NodeKind::ImageFileWriter: return rgb(60, 100, 70);
     }
@@ -451,6 +453,8 @@ void StudioApp::loadExample(Example example) {
 }
 
 void StudioApp::setGraph(Graph graph, std::filesystem::path file) {
+    editPath_.clear();
+    editFrom_.clear();
     graph_ = std::move(graph);
     graph_.touch();
     file_ = std::move(file);
@@ -495,6 +499,7 @@ bool StudioApp::openGraph(const std::filesystem::path& path) {
 }
 
 bool StudioApp::saveGraphTo(const std::filesystem::path& path) {
+    commitDefinition();
     try {
         saveGraph(graph_, path);
         file_ = path;
@@ -607,7 +612,7 @@ void StudioApp::updatePlan() {
         const bool alreadyFailed = failedPlan_ && !pending.needsRebuildFrom(*failedPlan_);
         if (applyRequested_ || (autoApply_ && !alreadyFailed && !userIsEditing)) {
             applyRequested_ = false;
-            apply(pending, graph_);
+            apply(pending, plan_.flat.graph, plan_.flat.topNode);
         }
         return;
     }
@@ -615,7 +620,7 @@ void StudioApp::updatePlan() {
     // Same pipelines; only which authoring nodes they stand for may differ.
     // Equal signatures list corresponding nodes at the same positions.
     if (appliedPlan_->cameraNode != pending.cameraNode) {
-        if (const Node* camera = graph_.findNode(pending.cameraNode)) {
+        if (const Node* camera = plan_.flat.graph.findNode(pending.cameraNode)) {
             pushCameraParams(camera->as<CameraParams>());
         }
     }
@@ -624,9 +629,11 @@ void StudioApp::updatePlan() {
         for (size_t i = 0; i < pending.nodes.size(); ++i) {
             renamed[appliedPlan_->nodes[i]] = pending.nodes[i];
         }
+        // The compiled view names document nodes; top-level nodes keep their
+        // ids when flattened.
         for (auto& element : compiled_.nodes) {
             if (auto it = renamed.find(element.owner); it != renamed.end()) {
-                element.owner = it->second;
+                element.owner = plan_.flat.top(it->second);
             }
         }
         for (auto& binding : liveBindings_) {
@@ -635,7 +642,8 @@ void StudioApp::updatePlan() {
             }
         }
         // The running graph now stands for the current one.
-        appliedGraph_ = graph_;
+        appliedGraph_ = plan_.flat.graph;
+        appliedTopNode_ = plan_.flat.topNode;
     }
     appliedPlan_ = pending;
 }
@@ -728,9 +736,12 @@ void StudioApp::drawExecutionInfo(const Node& node) {
             ImGui::BulletText("In the %s klartraum graph: %d elements.", part, own);
         }
     };
-    const bool live = plan_.live && plan_.live->contains(node.id);
-    const bool run = plan_.run && std::find(plan_.run->nodes.begin(), plan_.run->nodes.end(), node.id) !=
-                                      plan_.run->nodes.end();
+    if (editingDefinition()) {
+        ImGui::TextDisabled("Part of a meta node definition; see its instances for how they run.");
+        return;
+    }
+    const bool live = plan_.live && plan_.flat.covers(plan_.live->nodes, node.id);
+    const bool run = plan_.run && plan_.flat.covers(plan_.run->nodes, node.id);
     describe("live", live, appliedPlan_ && appliedPlan_->contains(node.id) ? &compiled_ : nullptr);
     describe("run", run, lastRun_ ? &lastRun_->compiled : nullptr);
     if (!live && !run) {
@@ -770,7 +781,8 @@ RunContext StudioApp::runContext() {
     return context;
 }
 
-void StudioApp::installBuilder(const std::optional<LivePlan>& plan, const Graph& graph) {
+void StudioApp::installBuilder(const std::optional<LivePlan>& plan, const Graph& graph,
+                               const std::map<int, int>& topNode) {
     if (!plan) {
         compiled_ = {};
         compiledSignature_.clear();
@@ -783,12 +795,17 @@ void StudioApp::installBuilder(const std::optional<LivePlan>& plan, const Graph&
     // The engine runs the builder now and again after every swapchain
     // recreation, so it must not throw: errors are reported via builderError_.
     // It keeps a copy of the graph, which the user goes on editing.
-    engine_.setGraphBuilder([this, plan = *plan, graph](klartraum::KlartraumEngine& e) {
+    engine_.setGraphBuilder([this, plan = *plan, graph, topNode](klartraum::KlartraumEngine& e) {
         liveHostSteps_.clear();
         hostLog_ = &liveHostSteps_;
         try {
             BuiltGraph built = buildLiveGraph(e, graph, plan, runContext());
             compiled_ = introspect(built.root, built.owners, plan.presentNode, built.inserted);
+            for (auto& element : compiled_.nodes) {
+                if (auto it = topNode.find(element.owner); it != topNode.end()) {
+                    element.owner = it->second;
+                }
+            }
             liveBindings_ = std::move(built.bindings);
             applyBindings(graph, liveBindings_, secondsSinceStart());
             builderError_.clear();
@@ -815,7 +832,7 @@ void StudioApp::installBuilder(const std::optional<LivePlan>& plan, const Graph&
     });
 }
 
-bool StudioApp::apply(const LivePlan& plan, const Graph& graph) {
+bool StudioApp::apply(const LivePlan& plan, const Graph& graph, const std::map<int, int>& topNode) {
     // The GUI runs between frames; once the GPU is idle the running graphs
     // can be released.
     vkDeviceWaitIdle(engine_.getVulkanContext().getDevice());
@@ -827,7 +844,7 @@ bool StudioApp::apply(const LivePlan& plan, const Graph& graph) {
     timings_.clear();
 
     const bool newCamera = !appliedPlan_ || appliedPlan_->cameraNode != plan.cameraNode;
-    installBuilder(plan, graph);
+    installBuilder(plan, graph, topNode);
 
     if (!builderError_.empty()) {
         applyError_ = builderError_;
@@ -835,7 +852,7 @@ bool StudioApp::apply(const LivePlan& plan, const Graph& graph) {
         setStatus("Compile failed: " + applyError_, true);
         // Fall back to the last graph that compiled.
         if (appliedPlan_) {
-            installBuilder(appliedPlan_, appliedGraph_);
+            installBuilder(appliedPlan_, appliedGraph_, appliedTopNode_);
         } else {
             installBuilder(std::nullopt, {});
         }
@@ -844,6 +861,7 @@ bool StudioApp::apply(const LivePlan& plan, const Graph& graph) {
 
     appliedPlan_ = plan;
     appliedGraph_ = graph;
+    appliedTopNode_ = topNode;
     failedPlan_.reset();
     applyError_.clear();
     if (newCamera) {
@@ -981,7 +999,11 @@ void StudioApp::run() {
         ~StopLogging() { log = nullptr; }
     } stopLogging{hostLog_};
     try {
-        RunResult result = runGraph(engine_.getVulkanContext(), graph_, *plan_.run, runContext());
+        RunResult result = runGraph(engine_.getVulkanContext(), plan_.flat.graph, *plan_.run, runContext());
+        // The compiled view names document nodes.
+        for (auto& element : result.compiled.nodes) {
+            element.owner = element.owner < 0 ? element.owner : plan_.flat.top(element.owner);
+        }
         previews_.clear();
         for (const auto& [node, image] : result.images) {
             previews_[node] = std::make_unique<PreviewTexture>(engine_.getVulkanContext(), image);
@@ -1010,10 +1032,18 @@ void StudioApp::updateLiveValues() {
     // compiles to the running pipelines, its values apply.
     const bool current = plan_.live && !plan_.live->needsRebuildFrom(*appliedPlan_);
     try {
-        applyBindings(current ? graph_ : appliedGraph_, liveBindings_, secondsSinceStart());
+        applyBindings(current ? liveValuesGraph() : appliedGraph_, liveBindings_, secondsSinceStart());
     } catch (const std::exception&) {
         // An input was disconnected; the plan reports it, and the values stay.
     }
+}
+
+Graph StudioApp::liveValuesGraph() const {
+    // Values edited in the document apply live; inner nodes of meta nodes
+    // take them through their instance's exposed parameters.
+    const bool hasMeta = std::any_of(graph_.nodes().begin(), graph_.nodes().end(),
+                                     [](const Node& n) { return n.kind == NodeKind::Meta; });
+    return hasMeta ? flatten(graph_).graph : graph_;
 }
 
 double StudioApp::secondsSinceStart() const {
@@ -1021,6 +1051,24 @@ double StudioApp::secondsSinceStart() const {
 }
 
 void StudioApp::drawGui() {
+    // Actions requested by the editor or inspector last frame, which change
+    // which nodes exist or which graph is shown.
+    if (pendingOpen_ >= 0) {
+        openMetaNode(std::exchange(pendingOpen_, -1));
+    }
+    if (pendingUngroup_ >= 0) {
+        ungroup(std::exchange(pendingUngroup_, -1));
+    }
+    if (pendingClose_ >= 0) {
+        closeDefinitions(static_cast<size_t>(std::exchange(pendingClose_, -1)));
+    }
+    if (ImGui::Shortcut(ImGuiMod_Ctrl | ImGuiKey_G, ImGuiInputFlags_RouteGlobal)) {
+        pendingGroup_ = true;
+    }
+    if (std::exchange(pendingGroup_, false)) {
+        groupSelection();
+    }
+    commitDefinition();
     syncCamera();
     updateLiveValues();
     if (runRequested_) {
@@ -1111,6 +1159,13 @@ void StudioApp::drawMenuBar() {
         if (ImGui::MenuItem("Apply now", nullptr, false, plan_.ok())) {
             applyRequested_ = true;
             failedPlan_.reset();
+        }
+        ImGui::Separator();
+        if (ImGui::MenuItem("Group selected nodes", "Ctrl+G")) {
+            pendingGroup_ = true;
+        }
+        if (ImGui::MenuItem("Back to the graph", nullptr, false, editingDefinition())) {
+            closeDefinitions(0);
         }
         ImGui::Separator();
         if (ImGui::MenuItem("Arrange authoring graph")) {
@@ -1214,7 +1269,7 @@ void StudioApp::drawOverview() {
         if (appliedPlan_) {
             const LivePlan plan = *appliedPlan_;
             appliedPlan_.reset();
-            apply(plan, appliedGraph_);
+            apply(plan, appliedGraph_, appliedTopNode_);
         }
     }
     if (profiling_) {
@@ -1378,10 +1433,13 @@ void StudioApp::drawEditorToolbar(bool compiled) {
 }
 
 void StudioApp::drawAuthoringEditor() {
+    // Plans, diagnostics and results refer to the document graph; inside a
+    // definition they are not shown.
+    const bool document = !editingDefinition();
     std::set<int> errorNodes;
     std::set<int> unusedNodes;
     for (const auto& d : plan_.diagnostics) {
-        if (d.node < 0) {
+        if (d.node < 0 || !document) {
             continue;
         }
         if (d.severity == Severity::Error) {
@@ -1391,22 +1449,26 @@ void StudioApp::drawAuthoringEditor() {
         }
     }
 
-    // Nodes that become elements of the klartraum compute graphs.
+    // Nodes that become elements of the klartraum compute graphs; a meta
+    // node when any of its inner nodes does.
     std::set<int> liveGraphNodes;
     std::set<int> runGraphNodes;
-    auto inGraph = [&](int id) {
-        const Node* node = graph_.findNode(id);
-        return node && kindInfo(node->kind).implementation == Implementation::ComputeGraph;
+    auto collect = [&](const std::vector<int>& flatNodes, std::set<int>& into) {
+        for (int id : flatNodes) {
+            const Node* node = plan_.flat.graph.findNode(id);
+            if (node && kindInfo(node->kind).implementation == Implementation::ComputeGraph) {
+                into.insert(plan_.flat.top(id));
+            }
+        }
     };
-    if (plan_.live) {
-        std::copy_if(plan_.live->nodes.begin(), plan_.live->nodes.end(),
-                     std::inserter(liveGraphNodes, liveGraphNodes.end()), inGraph);
+    if (plan_.live && document) {
+        collect(plan_.live->nodes, liveGraphNodes);
     }
-    if (plan_.run) {
-        std::copy_if(plan_.run->nodes.begin(), plan_.run->nodes.end(),
-                     std::inserter(runGraphNodes, runGraphNodes.end()), inGraph);
+    if (plan_.run && document) {
+        collect(plan_.run->nodes, runGraphNodes);
     }
 
+    drawBreadcrumbs();
     drawEditorToolbar(false);
     drawLegend();
     ed::SetCurrentEditor(authoringEditor_);
@@ -1419,7 +1481,7 @@ void StudioApp::drawAuthoringEditor() {
 
     auto& vc = engine_.getVulkanContext();
     const ImVec4 bodyText(0.75f, 0.75f, 0.8f, 1.0f);
-    for (auto& node : graph_.nodes()) {
+    for (auto& node : view().nodes()) {
         const ed::NodeId nodeId = authoringNodeId(node.id);
         if (auto it = std::find(nodesToPlace_.begin(), nodesToPlace_.end(), node.id); it != nodesToPlace_.end()) {
             ed::SetNodePosition(nodeId, ImVec2(node.position.x, node.position.y));
@@ -1435,13 +1497,32 @@ void StudioApp::drawAuthoringEditor() {
             ImGui::PushStyleVar(ImGuiStyleVar_Alpha, 0.55f);
         }
 
+        // Wide enough for the longest pair of pin names on one row.
+        const auto inputs = view().inputPins(node);
+        const auto outputs = view().outputPins(node);
+        float nodeWidth = kNodeWidth;
+        {
+            const float iconSize = ImGui::GetTextLineHeight();
+            const float spacing = ImGui::GetStyle().ItemSpacing.x;
+            for (size_t row = 0; row < std::max(inputs.size(), outputs.size()); ++row) {
+                float needed = 0.0f;
+                if (row < inputs.size()) {
+                    needed += iconSize + spacing + ImGui::CalcTextSize(inputs[row].name.c_str()).x;
+                }
+                if (row < outputs.size()) {
+                    needed += 3.0f * spacing + iconSize + spacing + ImGui::CalcTextSize(outputs[row].name.c_str()).x;
+                }
+                nodeWidth = std::max(nodeWidth, needed);
+            }
+        }
+
         ed::BeginNode(nodeId);
         ImGui::PushID(node.id);
         const float left = ImGui::GetCursorScreenPos().x;
 
         ImGui::BeginGroup();
         ImGui::TextUnformatted(node.title.c_str());
-        ImGui::Dummy(ImVec2(kNodeWidth, 0.0f));
+        ImGui::Dummy(ImVec2(nodeWidth, 0.0f));
         ImGui::EndGroup();
         const ImVec2 headerMin = ImGui::GetItemRectMin();
         const ImVec2 headerMax = ImGui::GetItemRectMax();
@@ -1476,10 +1557,10 @@ void StudioApp::drawAuthoringEditor() {
         case NodeKind::UploadNumber:
             try {
                 const int source = node.kind == NodeKind::UploadNumber
-                                       ? (graph_.inputLink(node.id, 0) ? graph_.inputLink(node.id, 0)->fromNode : -1)
+                                       ? (view().inputLink(node.id, 0) ? view().inputLink(node.id, 0)->fromNode : -1)
                                        : node.id;
                 if (source >= 0) {
-                    ImGui::Text("= %.3f", evaluateNumber(graph_, source, secondsSinceStart()));
+                    ImGui::Text("= %.3f", evaluateNumber(view(), source, secondsSinceStart()));
                 }
             } catch (const std::exception&) {
                 ImGui::TextDisabled("(input missing)");
@@ -1493,7 +1574,7 @@ void StudioApp::drawAuthoringEditor() {
             break;
         }
         case NodeKind::UploadGaussians:
-            if (auto model = uploadedGaussians(graph_, node.id)) {
+            if (auto model = uploadedGaussians(view(), node.id)) {
                 ImGui::Text("%u Gaussians, %.0f MB", model->count(), gaussianBytes(model->count()) / 1e6);
             }
             break;
@@ -1537,7 +1618,7 @@ void StudioApp::drawAuthoringEditor() {
         case NodeKind::Subtract:
         case NodeKind::Multiply:
         case NodeKind::Divide:
-            if (!graph_.inputLink(node.id, 1)) {
+            if (!view().inputLink(node.id, 1)) {
                 ImGui::Text("b = %g", node.as<BinaryLayerParams>().b);
             }
             break;
@@ -1554,9 +1635,6 @@ void StudioApp::drawAuthoringEditor() {
             ImGui::PopTextWrapPos();
             break;
         }
-        case NodeKind::TextEncoder:
-            ImGui::TextUnformatted(fileName(node.as<TextEncoderParams>().path).c_str());
-            break;
         case NodeKind::LatentNoise: {
             const auto& p = node.as<LatentNoiseParams>();
             ImGui::Text("for %u x %u", p.width, p.height);
@@ -1573,9 +1651,24 @@ void StudioApp::drawAuthoringEditor() {
             ImGui::Text("%u steps, guidance %.1f", p.steps, p.guidanceScale);
             break;
         }
-        case NodeKind::VaeDecoder:
-            ImGui::TextUnformatted(fileName(node.as<VaeDecoderParams>().path).c_str());
+        case NodeKind::Meta: {
+            const auto& p = node.as<MetaParams>();
+            const MetaDefinition* definition = view().findDefinition(p.definition);
+            if (!definition) {
+                ImGui::TextDisabled("(unknown definition)");
+                break;
+            }
+            if (definition->title != node.title) {
+                ImGui::TextDisabled("%s", definition->title.c_str());
+            }
+            // Exposed values set on this node; files by their name.
+            for (const auto& [name, value] : p.values) {
+                const auto parsed = nlohmann::json::parse(value, nullptr, false);
+                const std::string text = parsed.is_string() ? fileName(parsed.get<std::string>()) : value;
+                ImGui::Text("%s: %s", name.c_str(), text.c_str());
+            }
             break;
+        }
         case NodeKind::ImageToTensor:
         case NodeKind::TensorToImage:
             break;
@@ -1600,11 +1693,10 @@ void StudioApp::drawAuthoringEditor() {
         }
         }
         // Tensor outputs show their shape and, unless float32, element type.
-        const auto inputs = graph_.inputPins(node);
-        const auto outputs = graph_.outputPins(node);
-        if (plan_.run) {
+        if (plan_.run && document) {
             for (int slot = 0; slot < static_cast<int>(outputs.size()); ++slot) {
-                if (auto it = plan_.run->types.find({node.id, slot}); it != plan_.run->types.end()) {
+                const OutputPin pin = plan_.flat.flatOutput({node.id, slot});
+                if (auto it = plan_.run->types.find(pin); it != plan_.run->types.end()) {
                     const std::string type = tensorTypeToString(it->second);
                     if (outputs.size() > 1) {
                         ImGui::Text("%s -> %s", outputs[slot].name.c_str(), type.c_str());
@@ -1628,7 +1720,7 @@ void StudioApp::drawAuthoringEditor() {
                 ed::BeginPin(authoringPinId(ref), ed::PinKind::Input);
                 ed::PinPivotAlignment(ImVec2(0.0f, 0.5f));
                 ed::PinPivotSize(ImVec2(0.0f, 0.0f));
-                pinIcon(pin.type, graph_.inputLink(node.id, slot) != nullptr, iconSize);
+                pinIcon(pin.type, view().inputLink(node.id, slot) != nullptr, iconSize);
                 ImGui::SameLine();
                 ImGui::TextUnformatted(pin.name.data(), pin.name.data() + pin.name.size());
                 ed::EndPin();
@@ -1642,13 +1734,13 @@ void StudioApp::drawAuthoringEditor() {
                 if (sameLine) {
                     ImGui::SameLine();
                 }
-                ImGui::SetCursorScreenPos(ImVec2(left + kNodeWidth - width, ImGui::GetCursorScreenPos().y));
+                ImGui::SetCursorScreenPos(ImVec2(left + nodeWidth - width, ImGui::GetCursorScreenPos().y));
                 ed::BeginPin(authoringPinId(ref), ed::PinKind::Output);
                 ed::PinPivotAlignment(ImVec2(1.0f, 0.5f));
                 ed::PinPivotSize(ImVec2(0.0f, 0.0f));
                 ImGui::TextUnformatted(pin.name.data(), pin.name.data() + pin.name.size());
                 ImGui::SameLine();
-                const bool connected = std::any_of(graph_.links().begin(), graph_.links().end(), [&](const Link& l) {
+                const bool connected = std::any_of(view().links().begin(), view().links().end(), [&](const Link& l) {
                     return l.fromNode == node.id && l.fromSlot == slot;
                 });
                 pinIcon(pin.type, connected, iconSize);
@@ -1669,8 +1761,8 @@ void StudioApp::drawAuthoringEditor() {
         }
     }
 
-    for (const auto& link : graph_.links()) {
-        const PinType type = graph_.inputType(link.toNode, link.toSlot).value_or(PinType::Tensor);
+    for (const auto& link : view().links()) {
+        const PinType type = view().inputType(link.toNode, link.toSlot).value_or(PinType::Tensor);
         ed::Link(authoringLinkId(link.id), authoringPinId({link.fromNode, PinDirection::Output, link.fromSlot}),
                  authoringPinId({link.toNode, PinDirection::Input, link.toSlot}),
                  ImGui::ColorConvertU32ToFloat4(pinColor(type)), 2.5f);
@@ -1682,13 +1774,13 @@ void StudioApp::drawAuthoringEditor() {
         if (ed::QueryNewLink(&start, &end) && start && end) {
             const PinRef a = pinFromEditor(start);
             const PinRef b = pinFromEditor(end);
-            if (auto error = graph_.checkConnection(a, b)) {
+            if (auto error = view().checkConnection(a, b)) {
                 ed::RejectNewItem(ImVec4(1.0f, 0.35f, 0.3f, 1.0f), 2.0f);
                 ed::Suspend();
                 ImGui::SetTooltip("%s", error->c_str());
                 ed::Resume();
             } else if (ed::AcceptNewItem(ImVec4(0.5f, 1.0f, 0.5f, 1.0f), 3.0f)) {
-                graph_.connect(a, b);
+                view().connect(a, b);
                 modified_ = true;
             }
         }
@@ -1699,14 +1791,14 @@ void StudioApp::drawAuthoringEditor() {
         ed::LinkId link;
         while (ed::QueryDeletedLink(&link)) {
             if (ed::AcceptDeletedItem()) {
-                graph_.removeLink(linkFromEditor(link));
+                view().removeLink(linkFromEditor(link));
                 modified_ = true;
             }
         }
         ed::NodeId node;
         while (ed::QueryDeletedNode(&node)) {
             if (ed::AcceptDeletedItem()) {
-                graph_.removeNode(static_cast<int>(node.Get()));
+                view().removeNode(static_cast<int>(node.Get()));
                 if (selectedNode_ == static_cast<int>(node.Get())) {
                     selectedNode_ = -1;
                 }
@@ -1720,6 +1812,9 @@ void StudioApp::drawAuthoringEditor() {
     // active, so the position for a new node is taken before suspending.
     const ImVec2 canvasMouse = ImGui::GetMousePos();
     ed::Suspend();
+    if (const ed::NodeId clicked = ed::GetDoubleClickedNode()) {
+        pendingOpen_ = static_cast<int>(clicked.Get());
+    }
     ed::NodeId contextNode;
     ed::LinkId contextLink;
     if (ed::ShowNodeContextMenu(&contextNode)) {
@@ -1735,52 +1830,112 @@ void StudioApp::drawAuthoringEditor() {
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(8.0f, 8.0f));
     if (ImGui::BeginPopup("add_node")) {
         ImGui::TextDisabled("Add node");
-        std::string_view group;
-        for (const auto& info : allKinds()) {
-            if (info.group != group) {
-                group = info.group;
-                ImGui::SeparatorText(std::string(group).c_str());
-            }
-            if (ImGui::MenuItem(std::string(info.title).c_str(), std::string(siteName(info.site)).c_str())) {
-                const int id = graph_.addNode(info.kind, newNodePosition_);
-                if (info.kind == NodeKind::Scene) {
-                    graph_.findNode(id)->as<SceneParams>().path = defaultScenePath();
-                } else if (info.kind == NodeKind::ImageFile) {
-                    graph_.findNode(id)->as<ImageFileParams>().path = kSampleImage;
-                } else if (info.kind == NodeKind::Prompt) {
-                    auto& p = graph_.findNode(id)->as<PromptParams>();
-                    p.prompt = kSamplePrompt;
-                    p.negativePrompt = kSampleNegativePrompt;
-                    p.vocabulary = sdSample("vocab.json");
-                } else if (info.kind == NodeKind::TextEncoder) {
-                    graph_.findNode(id)->as<TextEncoderParams>().path = sdSample("sd15_text_encoder.onnx");
-                } else if (info.kind == NodeKind::LatentNoise) {
-                    auto& p = graph_.findNode(id)->as<LatentNoiseParams>();
-                    p.width = kSampleSdSize;
-                    p.height = kSampleSdSize;
-                } else if (info.kind == NodeKind::DdimSampler) {
-                    graph_.findNode(id)->as<DdimSamplerParams>().path = sdSample("sd15_unet.onnx");
-                } else if (info.kind == NodeKind::VaeDecoder) {
-                    graph_.findNode(id)->as<VaeDecoderParams>().path = sdSample("sd15_vae_decoder.onnx");
+        // Node kinds, and meta node definitions in their group (the graph's
+        // own ones in "Graph definitions"), in the kinds' group order. Inside
+        // a definition, it and the ones it is opened from are left out.
+        struct Entry {
+            const NodeKindInfo* kind = nullptr;
+            const MetaDefinition* definition = nullptr;
+        };
+        std::vector<std::pair<std::string, std::vector<Entry>>> groups;
+        auto entries = [&](const std::string& name) -> std::vector<Entry>& {
+            for (auto& [group, list] : groups) {
+                if (group == name) {
+                    return list;
                 }
-                nodesToPlace_.push_back(id);
-                pendingSelection_ = id;
-                selectedNode_ = id;
-                modified_ = true;
             }
-            if (ImGui::IsItemHovered()) {
-                ImGui::SetTooltip("%s\n%s, %s: %s", std::string(info.description).c_str(),
-                                  std::string(siteName(info.site)).c_str(),
-                                  std::string(implementationName(info.implementation)).c_str(),
-                                  std::string(info.implementedBy).c_str());
+            return groups.emplace_back(name, std::vector<Entry>{}).second;
+        };
+        for (const auto& info : allKinds()) {
+            if (info.kind != NodeKind::Meta) {
+                entries(std::string(info.group)).push_back({&info, nullptr});
+            }
+        }
+        auto addDefinitions = [&](const MetaDefinitions& definitions, const char* fallbackGroup) {
+            for (const auto& [name, definition] : definitions) {
+                if (std::find(editPath_.begin(), editPath_.end(), name) == editPath_.end()) {
+                    entries(definition->group.empty() ? fallbackGroup : definition->group).push_back({nullptr, definition.get()});
+                }
+            }
+        };
+        addDefinitions(builtinDefinitions(), "Meta nodes");
+        addDefinitions(graph_.definitions(), "Graph definitions");
+
+        for (const auto& [group, list] : groups) {
+            ImGui::SeparatorText(group.c_str());
+            for (const auto& entry : list) {
+                if (entry.definition) {
+                    const MetaDefinition& d = *entry.definition;
+                    if (ImGui::MenuItem(d.title.c_str(), "meta")) {
+                        const int id = view().addMetaNode(d.name, newNodePosition_);
+                        // The built-in Stable Diffusion nodes start with the sample models.
+                        if (d.name == kTextEncoderDefinition) {
+                            view().findNode(id)->as<MetaParams>().values["Model"] =
+                                nlohmann::json(sdSample("sd15_text_encoder.onnx")).dump();
+                        } else if (d.name == kVaeDecoderDefinition) {
+                            view().findNode(id)->as<MetaParams>().values["Model"] =
+                                nlohmann::json(sdSample("sd15_vae_decoder.onnx")).dump();
+                        }
+                        nodesToPlace_.push_back(id);
+                        pendingSelection_ = id;
+                        selectedNode_ = id;
+                        modified_ = true;
+                    }
+                    if (ImGui::IsItemHovered()) {
+                        ImGui::SetTooltip("%s\nMeta node%s: %zu inner nodes", d.description.c_str(),
+                                          d.builtin ? " (built-in)" : "", d.graph.nodes().size());
+                    }
+                    continue;
+                }
+                const NodeKindInfo& info = *entry.kind;
+                if (ImGui::MenuItem(std::string(info.title).c_str(), std::string(siteName(info.site)).c_str())) {
+                    const int id = view().addNode(info.kind, newNodePosition_);
+                    if (info.kind == NodeKind::Scene) {
+                        view().findNode(id)->as<SceneParams>().path = defaultScenePath();
+                    } else if (info.kind == NodeKind::ImageFile) {
+                        view().findNode(id)->as<ImageFileParams>().path = kSampleImage;
+                    } else if (info.kind == NodeKind::Prompt) {
+                        auto& p = view().findNode(id)->as<PromptParams>();
+                        p.prompt = kSamplePrompt;
+                        p.negativePrompt = kSampleNegativePrompt;
+                        p.vocabulary = sdSample("vocab.json");
+                    } else if (info.kind == NodeKind::LatentNoise) {
+                        auto& p = view().findNode(id)->as<LatentNoiseParams>();
+                        p.width = kSampleSdSize;
+                        p.height = kSampleSdSize;
+                    } else if (info.kind == NodeKind::DdimSampler) {
+                        view().findNode(id)->as<DdimSamplerParams>().path = sdSample("sd15_unet.onnx");
+                    }
+                    nodesToPlace_.push_back(id);
+                    pendingSelection_ = id;
+                    selectedNode_ = id;
+                    modified_ = true;
+                }
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip("%s\n%s, %s: %s", std::string(info.description).c_str(),
+                                      std::string(siteName(info.site)).c_str(),
+                                      std::string(implementationName(info.implementation)).c_str(),
+                                      std::string(info.implementedBy).c_str());
+                }
             }
         }
         ImGui::EndPopup();
     }
     if (ImGui::BeginPopup("node_menu")) {
-        if (Node* node = graph_.findNode(contextNode_)) {
+        if (Node* node = view().findNode(contextNode_)) {
             ImGui::TextDisabled("%s", node->title.c_str());
             ImGui::Separator();
+            if (node->kind == NodeKind::Meta) {
+                if (ImGui::MenuItem("Open")) {
+                    pendingOpen_ = node->id;
+                }
+                if (ImGui::MenuItem("Ungroup")) {
+                    pendingUngroup_ = node->id;
+                }
+            }
+            if (ImGui::MenuItem("Group selected nodes", "Ctrl+G")) {
+                pendingGroup_ = true;
+            }
             if (ImGui::MenuItem("Delete")) {
                 ed::Resume();
                 ed::DeleteNode(authoringNodeId(node->id));
@@ -1805,7 +1960,7 @@ void StudioApp::drawAuthoringEditor() {
     if (pendingSelection_ >= 0 && std::find(nodesToPlace_.begin(), nodesToPlace_.end(), pendingSelection_) ==
                                       nodesToPlace_.end()) {
         ed::ClearSelection();
-        if (graph_.findNode(pendingSelection_)) {
+        if (view().findNode(pendingSelection_)) {
             ed::SelectNode(authoringNodeId(pendingSelection_));
         }
         pendingSelection_ = -1;
@@ -1826,7 +1981,7 @@ void StudioApp::drawAuthoringEditor() {
     }
 
     // Remember where the user put things, for saving.
-    for (auto& node : graph_.nodes()) {
+    for (auto& node : view().nodes()) {
         if (std::find(nodesToPlace_.begin(), nodesToPlace_.end(), node.id) != nodesToPlace_.end()) {
             continue;
         }
@@ -1928,18 +2083,18 @@ void StudioApp::deleteSelection() {
 
 void StudioApp::layoutAuthoringGraph() {
     std::map<int, int> index;
-    for (const auto& node : graph_.nodes()) {
+    for (const auto& node : view().nodes()) {
         index.emplace(node.id, static_cast<int>(index.size()));
     }
     std::vector<std::pair<int, int>> edges;
-    for (const auto& link : graph_.links()) {
+    for (const auto& link : view().links()) {
         edges.emplace_back(index.at(link.fromNode), index.at(link.toNode));
     }
     LayoutOptions options;
     options.columnSpacing = kNodeWidth + 140.0f;
     options.rowSpacing = 140.0f;
-    const auto positions = layeredLayout(static_cast<int>(graph_.nodes().size()), edges, options);
-    for (auto& node : graph_.nodes()) {
+    const auto positions = layeredLayout(static_cast<int>(view().nodes().size()), edges, options);
+    for (auto& node : view().nodes()) {
         node.position = positions[index.at(node.id)];
         nodesToPlace_.push_back(node.id);
     }
@@ -1995,7 +2150,9 @@ void StudioApp::drawCompiledEditor() {
         compiledLayoutNeedsMeasure_ = true;
     }
 
-    const int highlightOwner = selectedNode_;
+    // Elements belong to document nodes; inside a definition, the selected
+    // node is an inner one and highlights nothing.
+    const int highlightOwner = editingDefinition() ? -1 : selectedNode_;
     float maxMs = 0.0f;
     for (const auto& [label, ms] : shownTimings()) {
         maxMs = std::max(maxMs, ms);
@@ -2120,12 +2277,12 @@ void StudioApp::drawInspector() {
         }
     }
 
-    if (Node* node = graph_.findNode(selectedNode_)) {
+    if (Node* node = view().findNode(selectedNode_)) {
         drawNodeInspector(*node);
     } else {
         ImGui::TextDisabled("Select a node to edit it.");
         ImGui::SeparatorText("Graph");
-        ImGui::Text("%zu nodes, %zu links", graph_.nodes().size(), graph_.links().size());
+        ImGui::Text("%zu nodes, %zu links", view().nodes().size(), view().links().size());
         ImGui::TextWrapped("File: %s", file_.empty() ? "(unsaved)" : file_.string().c_str());
         drawDiagnostics(-2);
     }
@@ -2267,7 +2424,7 @@ void StudioApp::drawNodeInspector(Node& node) {
         changed |= ImGui::DragFloat("Scale", &p.scale, 0.005f, 0.001f, 1000.0f, "%.3f", ImGuiSliderFlags_Logarithmic);
         std::string connected;
         for (int i = 0; i < 7; ++i) {
-            if (graph_.inputLink(node.id, i)) {
+            if (view().inputLink(node.id, i)) {
                 connected += (connected.empty() ? "" : ", ") + std::string(kindInfo(node.kind).inputs[i].name);
             }
         }
@@ -2457,7 +2614,7 @@ void StudioApp::drawNodeInspector(Node& node) {
     case NodeKind::Multiply:
     case NodeKind::Divide:
         ImGui::SeparatorText("Operand");
-        if (graph_.inputLink(node.id, 1)) {
+        if (view().inputLink(node.id, 1)) {
             ImGui::TextDisabled("B is connected; b is not used.");
         } else {
             changed |= ImGui::DragFloat("b", &node.as<BinaryLayerParams>().b, 0.01f, 0.0f, 0.0f, "%.6g");
@@ -2489,10 +2646,6 @@ void StudioApp::drawNodeInspector(Node& node) {
         ImGui::TextDisabled("CLIP's vocab.json, with merges.txt next to it, as export_denoiser.py writes them.");
         break;
     }
-    case NodeKind::TextEncoder:
-        changed |= modelFile(node.as<TextEncoderParams>().path, {"sd15_text_encoder.onnx"});
-        ImGui::TextDisabled("Output: 2x77x768 embeddings, negative prompt first.");
-        break;
     case NodeKind::LatentNoise: {
         auto& p = node.as<LatentNoiseParams>();
         ImGui::SeparatorText("Image size");
@@ -2520,9 +2673,8 @@ void StudioApp::drawNodeInspector(Node& node) {
                            "steps.");
         break;
     }
-    case NodeKind::VaeDecoder:
-        changed |= modelFile(node.as<VaeDecoderParams>().path, {"sd15_vae_decoder.onnx"});
-        ImGui::TextDisabled("Divides the latents by %.5f and maps the image to [0, 1].", kVaeScalingFactor);
+    case NodeKind::Meta:
+        drawMetaInspector(node, changed);
         break;
     case NodeKind::Preview:
         ImGui::SeparatorText("Result");
@@ -2550,24 +2702,28 @@ void StudioApp::drawNodeInspector(Node& node) {
     }
 
     if (changed) {
-        graph_.touch();
+        view().touch();
         modified_ = true;
     }
 
     ImGui::SeparatorText("Pins");
-    const auto inputs = graph_.inputPins(node);
+    const auto inputs = view().inputPins(node);
     for (int slot = 0; slot < static_cast<int>(inputs.size()); ++slot) {
-        const Node* src = graph_.inputNode(node.id, slot);
+        const Node* src = view().inputNode(node.id, slot);
         ImGui::BulletText("in  %s <- %s", inputs[slot].name.c_str(), src ? src->title.c_str() : "(not connected)");
     }
-    for (const auto& pin : graph_.outputPins(node)) {
+    for (const auto& pin : view().outputPins(node)) {
         ImGui::BulletText("out %s (%s)", pin.name.c_str(), std::string(pinTypeName(pin.type)).c_str());
     }
 
-    drawDiagnostics(node.id);
+    if (editingDefinition()) {
+        drawInterfaceEditor(node);
+    } else {
+        drawDiagnostics(node.id);
+    }
     ImGui::Spacing();
     if (ImGui::Button("Delete node")) {
-        graph_.removeNode(node.id);
+        view().removeNode(node.id);
         selectedNode_ = -1;
         modified_ = true;
     }
@@ -2635,6 +2791,379 @@ void StudioApp::drawDiagnostics(int node) {
         ImGui::PushStyleColor(ImGuiCol_Text, severityColor(Severity::Error));
         ImGui::TextWrapped("[compile] %s", applyError_.c_str());
         ImGui::PopStyleColor();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Meta nodes
+
+const MetaDefinition* StudioApp::editedDefinition() const {
+    return editPath_.empty() ? nullptr : graph_.findDefinition(editPath_.back());
+}
+
+void StudioApp::openMetaNode(int node) {
+    const Node* meta = view().findNode(node);
+    if (!meta || meta->kind != NodeKind::Meta) {
+        return;
+    }
+    openDefinition(meta->as<MetaParams>().definition, node);
+}
+
+void StudioApp::openDefinition(const std::string& name, int from) {
+    if (!graph_.findDefinition(name)) {
+        setStatus("Unknown meta node definition '" + name + "'", true);
+        return;
+    }
+    commitDefinition();
+    editPath_.push_back(name);
+    editFrom_.push_back(from);
+    loadEditGraph();
+}
+
+void StudioApp::closeDefinitions(size_t depth) {
+    if (depth >= editPath_.size()) {
+        return;
+    }
+    commitDefinition();
+    editPath_.resize(depth);
+    editFrom_.resize(depth);
+    if (editingDefinition()) {
+        loadEditGraph();
+        return;
+    }
+    selectedNode_ = -1;
+    nodesToPlace_.clear();
+    for (const auto& node : graph_.nodes()) {
+        nodesToPlace_.push_back(node.id);
+    }
+    ed::SetCurrentEditor(authoringEditor_);
+    ed::ClearSelection();
+    ed::SetCurrentEditor(nullptr);
+    fitRequested_ = true;
+}
+
+void StudioApp::loadEditGraph() {
+    const MetaDefinition* definition = editedDefinition();
+    if (!definition) {
+        editPath_.clear();
+        editFrom_.clear();
+        return;
+    }
+    // The document's definitions resolve nested meta nodes while editing.
+    editGraph_ = definition->graph;
+    for (const auto& [name, local] : graph_.definitions()) {
+        editGraph_.setDefinition(local);
+    }
+    editInputs_ = definition->inputs;
+    editOutputs_ = definition->outputs;
+    editParams_ = definition->params;
+    editInterfaceChanged_ = false;
+    editRevision_ = editGraph_.revision();
+    selectedNode_ = -1;
+    nodesToPlace_.clear();
+    for (const auto& node : editGraph_.nodes()) {
+        nodesToPlace_.push_back(node.id);
+    }
+    ed::SetCurrentEditor(authoringEditor_);
+    ed::ClearSelection();
+    ed::SetCurrentEditor(nullptr);
+    fitRequested_ = true;
+}
+
+void StudioApp::commitDefinition() {
+    const MetaDefinition* definition = editedDefinition();
+    if (!definition || definition->builtin) {
+        return;
+    }
+    const bool structural = editGraph_.revision() != editRevision_ || editInterfaceChanged_;
+    bool moved = false;
+    for (const auto& node : editGraph_.nodes()) {
+        const Node* stored = definition->graph.findNode(node.id);
+        moved = moved || !stored || !(stored->position == node.position) || stored->title != node.title;
+    }
+    if (!structural && !moved) {
+        return;
+    }
+    const MetaDefinition before = *definition;
+    auto updated = std::make_shared<MetaDefinition>(*definition);
+    updated->graph = editGraph_;
+    updated->inputs = editInputs_;
+    updated->outputs = editOutputs_;
+    updated->params = editParams_;
+    // Pins of nested meta nodes resolve while the document's definitions are
+    // still in the inner graph.
+    pruneInterface(*updated);
+    for (const auto& [name, local] : editGraph_.definitions()) {
+        updated->graph.removeDefinition(name);
+    }
+    editInputs_ = updated->inputs;
+    editOutputs_ = updated->outputs;
+    editParams_ = updated->params;
+    graph_.setDefinition(updated, structural);
+    if (const int removed = updateMetaLinks(graph_, updated->name, before); removed > 0) {
+        setStatus(std::format("{} link(s) to removed pins of '{}' were removed", removed, updated->title), true);
+    }
+    editRevision_ = editGraph_.revision();
+    editInterfaceChanged_ = false;
+    modified_ = true;
+}
+
+void StudioApp::duplicateEditedDefinition() {
+    const MetaDefinition* definition = editedDefinition();
+    if (!definition || editPath_.size() != 1) {
+        return;
+    }
+    auto copy = std::make_shared<MetaDefinition>(*definition);
+    copy->name = uniqueDefinitionName(graph_, definition->name + "_copy");
+    copy->title = definition->title + " (copy)";
+    copy->group.clear();
+    copy->builtin = false;
+    graph_.setDefinition(copy);
+    if (Node* node = graph_.findNode(editFrom_[0]); node && node->kind == NodeKind::Meta) {
+        node->as<MetaParams>().definition = copy->name;
+        graph_.touch();
+    }
+    editPath_[0] = copy->name;
+    editGraph_.setDefinition(copy);
+    modified_ = true;
+    setStatus("'" + copy->title + "' is a copy in this graph; the node uses it now");
+}
+
+std::vector<int> StudioApp::selectedNodes() {
+    ed::SetCurrentEditor(authoringEditor_);
+    std::vector<ed::NodeId> selected(static_cast<size_t>(ed::GetSelectedObjectCount()));
+    selected.resize(ed::GetSelectedNodes(selected.data(), static_cast<int>(selected.size())));
+    ed::SetCurrentEditor(nullptr);
+    std::vector<int> nodes;
+    for (const auto& id : selected) {
+        if (view().findNode(static_cast<int>(id.Get()))) {
+            nodes.push_back(static_cast<int>(id.Get()));
+        }
+    }
+    return nodes;
+}
+
+void StudioApp::groupSelection() {
+    const MetaDefinition* edited = editedDefinition();
+    if (edited && edited->builtin) {
+        setStatus("Built-in definitions cannot be changed; duplicate it first", true);
+        return;
+    }
+    const std::vector<int> nodes = selectedNodes();
+    if (nodes.empty()) {
+        setStatus("Select the nodes to group first", true);
+        return;
+    }
+    try {
+        const std::string name = uniqueDefinitionName(graph_, "group");
+        const int meta = groupNodes(view(), nodes, name, "Group");
+        if (editingDefinition()) {
+            // A group inside a definition is a definition of the document.
+            graph_.setDefinition(view().definitions().at(name));
+        }
+        nodesToPlace_.push_back(meta);
+        pendingSelection_ = meta;
+        selectedNode_ = meta;
+        modified_ = true;
+        setStatus(std::format("Grouped {} nodes into a meta node; double-click it to open it", nodes.size()));
+    } catch (const std::exception& e) {
+        setStatus(std::string("Group failed: ") + e.what(), true);
+    }
+}
+
+void StudioApp::ungroup(int node) {
+    const MetaDefinition* edited = editedDefinition();
+    if (edited && edited->builtin) {
+        setStatus("Built-in definitions cannot be changed; duplicate it first", true);
+        return;
+    }
+    try {
+        const std::vector<int> added = ungroupNode(view(), node);
+        nodesToPlace_.insert(nodesToPlace_.end(), added.begin(), added.end());
+        if (selectedNode_ == node) {
+            selectedNode_ = -1;
+        }
+        modified_ = true;
+    } catch (const std::exception& e) {
+        setStatus(std::string("Ungroup failed: ") + e.what(), true);
+    }
+}
+
+void StudioApp::drawBreadcrumbs() {
+    if (!editingDefinition()) {
+        return;
+    }
+    if (ImGui::SmallButton("Graph")) {
+        pendingClose_ = 0;
+    }
+    for (size_t i = 0; i < editPath_.size(); ++i) {
+        ImGui::SameLine();
+        ImGui::TextDisabled(">");
+        ImGui::SameLine();
+        const MetaDefinition* definition = graph_.findDefinition(editPath_[i]);
+        const std::string title = definition ? definition->title : editPath_[i];
+        if (i + 1 < editPath_.size()) {
+            if (ImGui::SmallButton((title + "##crumb" + std::to_string(i)).c_str())) {
+                pendingClose_ = static_cast<int>(i + 1);
+            }
+        } else {
+            ImGui::TextUnformatted(title.c_str());
+        }
+    }
+    const MetaDefinition* definition = editedDefinition();
+    if (definition && definition->builtin) {
+        ImGui::TextColored(severityColor(Severity::Warning), "Built-in definition: shown read-only, changes are not kept.");
+        if (editPath_.size() == 1) {
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Duplicate into this graph")) {
+                duplicateEditedDefinition();
+            }
+        }
+    } else {
+        ImGui::TextDisabled("Changes apply to every node using this definition. Expose pins and parameters in the "
+                           "inspector.");
+    }
+}
+
+void StudioApp::drawInterfaceEditor(const Node& node) {
+    const MetaDefinition* definition = editedDefinition();
+    if (!definition) {
+        return;
+    }
+    ImGui::SeparatorText("Meta node interface");
+    const bool readOnly = definition->builtin;
+    if (readOnly) {
+        ImGui::BeginDisabled();
+    }
+    auto unique = [](const auto& list, const std::string& base) {
+        std::string name = base;
+        for (int i = 2; std::any_of(list.begin(), list.end(), [&](const auto& e) { return e.name == name; }); ++i) {
+            name = base + " " + std::to_string(i);
+        }
+        return name;
+    };
+    auto pinToggles = [&](std::vector<MetaPin>& exposed, const std::vector<Pin>& pins, PinDirection direction,
+                          const char* label) {
+        for (int slot = 0; slot < static_cast<int>(pins.size()); ++slot) {
+            const PinRef ref{node.id, direction, slot};
+            auto owner = std::find_if(exposed.begin(), exposed.end(), [&](const MetaPin& pin) {
+                return std::find(pin.targets.begin(), pin.targets.end(), ref) != pin.targets.end();
+            });
+            bool on = owner != exposed.end();
+            const std::string text = std::format("{} {}{}##{}{}", label, pins[slot].name,
+                                                 on ? " as '" + owner->name + "'" : std::string(), label, slot);
+            if (ImGui::Checkbox(text.c_str(), &on)) {
+                if (on) {
+                    exposed.push_back({unique(exposed, pins[slot].name), {ref}});
+                } else {
+                    std::erase(owner->targets, ref);
+                    if (owner->targets.empty()) {
+                        exposed.erase(owner);
+                    }
+                }
+                editInterfaceChanged_ = true;
+            }
+        }
+    };
+    pinToggles(editInputs_, view().inputPins(node), PinDirection::Input, "Expose input");
+    pinToggles(editOutputs_, view().outputPins(node), PinDirection::Output, "Expose output");
+    for (const auto& key : paramKeys(node.params)) {
+        auto owner = std::find_if(editParams_.begin(), editParams_.end(),
+                                  [&](const MetaParam& p) { return p.node == node.id && p.key == key; });
+        bool on = owner != editParams_.end();
+        const std::string text =
+            std::format("Expose {}{}##param{}", key, on ? " as '" + owner->name + "'" : std::string(), key);
+        if (ImGui::Checkbox(text.c_str(), &on)) {
+            if (on) {
+                std::string name = key;
+                name[0] = static_cast<char>(std::toupper(static_cast<unsigned char>(name[0])));
+                editParams_.push_back({unique(editParams_, name), node.id, key});
+            } else {
+                editParams_.erase(owner);
+            }
+            editInterfaceChanged_ = true;
+        }
+    }
+    if (readOnly) {
+        ImGui::EndDisabled();
+    }
+}
+
+void StudioApp::drawMetaInspector(Node& node, bool& changed) {
+    auto& p = node.as<MetaParams>();
+    const MetaDefinition* definition = view().findDefinition(p.definition);
+    if (!definition) {
+        ImGui::TextColored(severityColor(Severity::Error), "Unknown definition '%s'", p.definition.c_str());
+        return;
+    }
+    ImGui::SeparatorText("Definition");
+    ImGui::TextWrapped("%s%s", definition->title.c_str(), definition->builtin ? " (built-in)" : " (in this graph)");
+    if (!definition->description.empty()) {
+        ImGui::TextWrapped("%s", definition->description.c_str());
+    }
+    ImGui::TextDisabled("%zu inner nodes", definition->graph.nodes().size());
+    if (ImGui::Button("Open")) {
+        pendingOpen_ = node.id;
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Ungroup")) {
+        pendingUngroup_ = node.id;
+    }
+
+    if (definition->params.empty()) {
+        return;
+    }
+    ImGui::SeparatorText("Parameters");
+    for (const auto& param : definition->params) {
+        ImGui::PushID(param.name.c_str());
+        const Node* inner = definition->graph.findNode(param.node);
+        const bool overridden = p.values.contains(param.name);
+        const std::string text = overridden ? p.values.at(param.name)
+                                            : (inner ? paramValue(inner->params, param.key) : std::nullopt).value_or("null");
+        const auto value = nlohmann::json::parse(text, nullptr, false);
+        std::optional<nlohmann::json> edited;
+        if (value.is_string()) {
+            std::string v = value.get<std::string>();
+            if (inputText(param.name.c_str(), v)) {
+                edited = v;
+            }
+            if (param.key == "path" && !v.empty()) {
+                if (auto resolved = resolveInputPath(v)) {
+                    ImGui::TextDisabled("%s", resolved->string().c_str());
+                } else {
+                    ImGui::TextColored(severityColor(Severity::Error), "File not found");
+                }
+            }
+        } else if (value.is_number_integer()) {
+            int v = value.get<int>();
+            if (ImGui::InputInt(param.name.c_str(), &v)) {
+                edited = v;
+            }
+        } else if (value.is_number()) {
+            float v = value.get<float>();
+            if (ImGui::DragFloat(param.name.c_str(), &v, 0.01f, 0.0f, 0.0f, "%.6g")) {
+                edited = v;
+            }
+        } else if (value.is_boolean()) {
+            bool v = value.get<bool>();
+            if (ImGui::Checkbox(param.name.c_str(), &v)) {
+                edited = v;
+            }
+        } else {
+            ImGui::Text("%s: %s", param.name.c_str(), text.c_str());
+        }
+        if (edited) {
+            p.values[param.name] = edited->dump();
+            changed = true;
+        }
+        if (overridden) {
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Reset")) {
+                p.values.erase(param.name);
+                changed = true;
+            }
+        }
+        ImGui::PopID();
     }
 }
 

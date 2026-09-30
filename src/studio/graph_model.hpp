@@ -2,6 +2,8 @@
 
 #include <array>
 #include <cstdint>
+#include <map>
+#include <memory>
 #include <optional>
 #include <span>
 #include <utility>
@@ -64,12 +66,11 @@ enum class NodeKind {
     Sqrt,
     Softmax,
     Prompt,
-    TextEncoder,
     LatentNoise,
     DdimSampler,
-    VaeDecoder,
     Preview,
     ImageFileWriter,
+    Meta,
 };
 
 enum class SplattingBackend { Compute, Raster };
@@ -252,12 +253,6 @@ struct PromptParams {
     bool operator==(const PromptParams&) const = default;
 };
 
-// The CLIP text encoder: 2x77 tokens -> 2x77x768 embeddings.
-struct TextEncoderParams {
-    std::string path;
-    bool operator==(const TextEncoderParams&) const = default;
-};
-
 // The latents a sampler starts from, 1x4x(height/8)x(width/8) for a
 // width x height image: Gaussian noise from `seed`, or, if `path` is set,
 // raw float32 values read from that file (e.g. initial_latents_f32.bin
@@ -279,10 +274,13 @@ struct DdimSamplerParams {
     bool operator==(const DdimSamplerParams&) const = default;
 };
 
-// Decodes latents into a 1x3xHxW image tensor with values in [0, 1].
-struct VaeDecoderParams {
-    std::string path;
-    bool operator==(const VaeDecoderParams&) const = default;
+// A meta node: an instance of a definition (see MetaDefinition), with values
+// for the parameters the definition exposes, as JSON text by parameter
+// name. Exposed parameters without a value keep the definition's.
+struct MetaParams {
+    std::string definition;
+    std::map<std::string, std::string> values;
+    bool operator==(const MetaParams&) const = default;
 };
 
 struct PreviewParams {
@@ -298,8 +296,8 @@ using NodeParams = std::variant<SceneParams, TransformGaussiansParams, MergeGaus
                                 NumberParams, TimeParams, SineParams, UploadNumberParams, MakeTransformParams,
                                 TransformGaussiansGpuParams, MergeGaussiansGpuParams, CameraParams, SwapchainTargetParams, SplattingParams, PresentParams,
                                 OffscreenTargetParams, ImageFileParams, ImageToTensorParams, TensorToImageParams,
-                                ResampleParams, OnnxModelParams, BinaryLayerParams, UnaryLayerParams, PromptParams, TextEncoderParams, LatentNoiseParams,
-                                DdimSamplerParams, VaeDecoderParams, PreviewParams, ImageFileWriterParams>;
+                                ResampleParams, OnnxModelParams, BinaryLayerParams, UnaryLayerParams, PromptParams, LatentNoiseParams,
+                                DdimSamplerParams, PreviewParams, ImageFileWriterParams, MetaParams>;
 
 // A pin of a node kind, as listed in the kinds table.
 struct PinDesc {
@@ -358,11 +356,10 @@ std::string_view implementationName(Implementation implementation);
 NodeParams defaultParams(NodeKind kind);
 // Preview and Image File Writer: executed by Run.
 bool isSink(NodeKind kind);
-// DDIM Sampler and VAE Decoder: Run executes them between submissions of its
-// klartraum graph. They read their input tensors back, run klartraum graphs
-// of their own (the sampler one per denoising step, with CPU work in between)
-// and hand their result on as CPU data, which the nodes after them upload
-// again. They cannot run live.
+// DDIM Sampler: Run executes it between submissions of its klartraum graph.
+// It reads its input tensors back, runs the UNet once per denoising step with
+// CPU work in between, and hands its result on as CPU data, which the nodes
+// after it upload again. It cannot run live.
 bool isStaged(NodeKind kind);
 // Add, Subtract, Multiply, Divide.
 bool isBinaryLayer(NodeKind kind);
@@ -402,6 +399,9 @@ struct PinRef {
 };
 
 constexpr int kMaxPinsPerDirection = 8;
+
+// An output pin: (node id, output slot).
+using OutputPin = std::pair<int, int>;
 int pinId(const PinRef& pin);
 PinRef pinFromId(int id);
 
@@ -420,6 +420,11 @@ struct Diagnostic {
     int node = -1;  // -1: the graph as a whole
     std::string message;
 };
+
+struct MetaDefinition;
+
+// Definitions by name.
+using MetaDefinitions = std::map<std::string, std::shared_ptr<const MetaDefinition>, std::less<>>;
 
 class Graph {
 public:
@@ -451,6 +456,19 @@ public:
     std::vector<Pin> inputPins(const Node& node) const;
     std::vector<Pin> outputPins(const Node& node) const;
 
+    // Meta node definitions stored with this graph (and saved with it).
+    // Meta nodes find their definition here first, then among the built-in
+    // ones (builtinDefinitions()).
+    const MetaDefinitions& definitions() const { return definitions_; }
+    const MetaDefinition* findDefinition(std::string_view name) const;
+    // Adds or replaces a definition; definitions are immutable, so editing
+    // one replaces it for all its instances. Without `changesGraph` (e.g.
+    // when only inner nodes moved) the revision stays.
+    void setDefinition(std::shared_ptr<const MetaDefinition> definition, bool changesGraph = true);
+    bool removeDefinition(std::string_view name);
+    // Adds a meta node for definition `name`, titled like the definition.
+    int addMetaNode(const std::string& name, Vec2 position = {});
+
     // Sets an ONNX Model node's pins to the model's input and output names
     // (at most kMaxPinsPerDirection each). Links to slots that no longer
     // exist are removed; returns how many.
@@ -479,13 +497,49 @@ public:
 
 private:
     bool reaches(int fromNode, int toNode) const;
+    // A node's pins; meta nodes resolve definitions in `resolver`, also for
+    // the meta nodes nested in them.
+    std::vector<Pin> pins(const Node& node, PinDirection direction, const Graph& resolver, int depth) const;
 
+    MetaDefinitions definitions_;
     std::vector<Node> nodes_;
     std::vector<Link> links_;
     int nextNodeId_ = 1;
     int nextLinkId_ = 1;
     uint64_t revision_ = 0;
 };
+
+// A reusable subgraph: its inner nodes appear as one meta node. The pins and
+// parameters it exposes stand for pins and parameters of inner nodes.
+struct MetaPin {
+    std::string name;
+    // An exposed input feeds these inner input pins; an exposed output is
+    // exactly one inner output pin.
+    std::vector<PinRef> targets;
+    bool operator==(const MetaPin&) const = default;
+};
+
+struct MetaParam {
+    std::string name;
+    int node = 0;
+    std::string key;  // the inner node's parameter, as named in graph files
+    bool operator==(const MetaParam&) const = default;
+};
+
+struct MetaDefinition {
+    std::string name;  // identifier, unique among a graph's and the built-in definitions
+    std::string title;
+    std::string group;  // add-node menu group
+    std::string description;
+    Graph graph;
+    std::vector<MetaPin> inputs;
+    std::vector<MetaPin> outputs;
+    std::vector<MetaParam> params;
+    bool builtin = false;
+};
+
+// The definitions that come with the studio (see meta_nodes.hpp).
+const MetaDefinitions& builtinDefinitions();
 
 // The Gaussian-splatting pipeline: Scene, Camera and Swapchain Target feed a
 // Gaussian Splatting node, whose image is presented.
@@ -515,8 +569,8 @@ Graph makeSplatAutoencoderGraph(const std::string& scenePath, const std::string&
 
 // Stable Diffusion 1.5 from the models export_denoiser.py writes into
 // `modelDirectory` for `size` x `size` images: Prompt -> Text Encoder, Latent
-// Noise -> DDIM Sampler -> VAE Decoder, previewed and written to
-// `outputPath` on Run.
+// Noise -> DDIM Sampler -> VAE Decoder (the encoder and decoder are built-in
+// meta nodes), previewed and written to `outputPath` on Run.
 Graph makeStableDiffusionGraph(const std::string& modelDirectory, uint32_t size, const std::string& prompt,
                                const std::string& negativePrompt, const std::string& outputPath);
 

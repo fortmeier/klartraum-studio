@@ -294,11 +294,6 @@ private:
             return sampleDdim(vc_, context_.resolveInput(p.path), *modelInfo(p.path), hostInput(node, 0),
                               hostInput(node, 1), p, node.title, context_.hostStep);
         }
-        case NodeKind::VaeDecoder: {
-            const auto& p = node.as<VaeDecoderParams>();
-            return decodeLatents(vc_, context_.resolveInput(p.path), *modelInfo(p.path), hostInput(node, 0),
-                                 node.title, context_.hostStep);
-        }
         default:
             throw std::logic_error("not a staged node");
         }
@@ -746,37 +741,6 @@ private:
             }
             break;
         }
-        case NodeKind::TextEncoder: {
-            const auto& p = node.as<TextEncoderParams>();
-            const auto info = modelInfo(p.path);
-            auto network = vc_.create<klartraum::OnnxNetwork>(context_.resolveInput(p.path).string());
-            network->setName(node.title);
-            for (const auto& input : info->inputs) {
-                const int slot = input.name == "input_ids" ? 0 : input.name == "attention_mask" ? 1 : -1;
-                if (slot < 0) {
-                    throw std::runtime_error("unexpected text encoder input '" + input.name +
-                                             "'; expected input_ids and attention_mask");
-                }
-                const TensorRef& tokens = inputTensor(node, slot);
-                network->setInputTensor(input.name, tokens.producer, tokens.slot);
-            }
-            // CLIP's per-token embeddings; a pooled output may follow.
-            const auto& outputs = info->outputs;
-            auto embeddings = std::find_if(outputs.begin(), outputs.end(),
-                                           [](const OnnxTensorDesc& o) { return o.name == "last_hidden_state"; });
-            if (embeddings == outputs.end()) {
-                embeddings = outputs.begin();
-            }
-            auto output = std::dynamic_pointer_cast<FloatTensor>(network->getOutputElement(embeddings->name));
-            if (!output) {
-                throw std::runtime_error("the model's output is not a float tensor");
-            }
-            owners_[network.get()] = node.id;
-            // Slot i of an OnnxNetwork is its i-th output tensor.
-            const int slot = static_cast<int>(embeddings - outputs.begin());
-            tensors_[{node.id, 0}] = TensorRef{network, slot, output};
-            break;
-        }
         case NodeKind::LatentNoise: {
             const auto& p = node.as<LatentNoiseParams>();
             const auto start = std::chrono::steady_clock::now();
@@ -789,9 +753,10 @@ private:
             break;
         }
         case NodeKind::DdimSampler:
-        case NodeKind::VaeDecoder:
             // Run by runStaged(), between the stages of a run.
             throw std::runtime_error("only runs with Run");
+        case NodeKind::Meta:
+            throw std::logic_error("meta nodes are flattened before they are built");
         case NodeKind::Preview:
         case NodeKind::ImageFileWriter:
             if (graph_.inputType(node.id, 0) == PinType::Image) {

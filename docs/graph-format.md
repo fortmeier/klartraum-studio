@@ -33,9 +33,10 @@ Graphs are saved as JSON files with the extension `.ktgraph.json`.
 | Key | Meaning |
 |---|---|
 | `format` | Always `"klartraum-studio-graph"`; other files are rejected. |
-| `version` | Format version, currently `1`. Files from a newer version are rejected. |
+| `version` | Format version, currently `2` (meta node definitions). Files from a newer version are rejected; older ones load. |
 | `nodes` | The nodes of the authoring graph. |
 | `links` | The connections between node pins. |
+| `definitions` | The graph's meta node definitions (optional), those used by others first. |
 
 ## Nodes
 
@@ -53,10 +54,29 @@ Node kinds: `scene`, `image_file`, `number`, `time`, `sine`, `upload_number`,
 `swapchain_target`, `offscreen_target`, `gaussian_splatting`,
 `image_to_tensor`, `tensor_to_image`, `resample`, `onnx_model`, `add`,
 `subtract`, `multiply`, `divide`, `relu`, `sigmoid`, `sqrt`, `softmax`,
-`sd_prompt`,
-`sd_text_encoder`, `sd_latent_noise`, `sd_ddim_sampler`, `sd_vae_decoder`,
-`present`, `preview`, `image_file_writer`. See the {doc}`nodes/index` for what
-they do.
+`sd_prompt`, `sd_latent_noise`, `sd_ddim_sampler`, `present`, `preview`,
+`image_file_writer`, `meta`. See the {doc}`nodes/index` for what they do. Files
+with the former kinds `sd_text_encoder` and `sd_vae_decoder` load them as the
+built-in meta nodes.
+
+A `meta` node's parameters name its definition and the values it sets for
+exposed parameters:
+
+```json
+"params": { "definition": "sd15_vae_decoder", "values": { "Model": "data/onnx/sd15_denoiser_256/sd15_vae_decoder.onnx" } }
+```
+
+## Definitions
+
+Each definition has a `name` (unique among the graph's and the built-in
+definitions), a `title`, a `group` and a `description` for the add-node menu,
+the inner graph's `nodes` and `links` (as above), and its interface:
+
+| Key | Meaning |
+|---|---|
+| `inputs` | Exposed inputs: `name` and `targets`, the inner input pins `[node id, pin index]` it feeds. |
+| `outputs` | Exposed outputs: `name` and `targets`, the one inner output pin it is. |
+| `params` | Exposed parameters: `name`, and the inner `node` and parameter `key` it stands for. |
 
 ## Links
 

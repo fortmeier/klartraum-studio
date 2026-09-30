@@ -81,17 +81,45 @@ The *Stable Diffusion 1.5* example expects them in that directory.
 | Node | Description | Implemented by | Runs |
 |---|---|---|---|
 | Prompt | A prompt and a negative prompt, tokenized with CLIP's byte-pair encoding into two 2×77 int64 tensors, *Ids* (negative prompt first) and *Mask* (the attention mask). The *Vocabulary* is the export's `vocab.json`, with `merges.txt` next to it. | {cpp:class}`klartraum::ClipTokenizer`, uploaded into two {cpp:class}`klartraum::TensorElement` | once, when the graph is built |
-| Text Encoder | The CLIP text encoder: turns the Prompt's *Ids* and *Mask* into 2×77×768 embeddings. | {cpp:class}`klartraum::OnnxNetwork` | every run |
+| Text Encoder | Built-in meta node: an ONNX Model (the CLIP text encoder) that turns the Prompt's *Ids* and *Mask* into 2×77×768 embeddings. Exposes *Model*. | {cpp:class}`klartraum::OnnxNetwork` | every run |
 | Latent Noise | Gaussian noise of the latent size for a W×H image (1×4×H/8×W/8), from a seed. Optionally it reads raw float32 latents from a file instead, e.g. the export's `initial_latents_f32.bin` to reproduce its reference image. | studio | every run |
 | DDIM Sampler | Denoises the latents in *Steps* DDIM steps with SD 1.5's scheduler. Each step runs the UNet once on the negative and the positive prompt, blends the two noise estimates with the *Guidance* scale and takes the DDIM step on the CPU. | {cpp:class}`klartraum::OnnxNetwork`, submitted once per step | every run, once per denoising step |
-| VAE Decoder | Decodes the latents into a 1×3×H×W image tensor with values in [0, 1], ready for a Preview or an Image File Writer. | {cpp:class}`klartraum::OnnxNetwork` | every run |
+| VAE Decoder | Built-in meta node: Multiply (undoes the latent scaling) → ONNX Model (the VAE decoder) → Multiply and Add (maps [-1, 1] to [0, 1]). Outputs a 1×3×H×W image tensor for a Preview or an Image File Writer. Exposes *Model* and *Latent scale*. | `klartraum::layers`, {cpp:class}`klartraum::OnnxNetwork` | every run |
 
-The DDIM Sampler and the VAE Decoder are *staged* nodes and only run with
-**Run**. Run executes the Klartraum graph of everything before them, reads the
-tensors they need back and runs them. It then uploads their results for the
-nodes that follow, whose graph it executes next. The compiled graph of a run
-shows every stage's graph together with the UNet and the decoder. Run waits
-for all denoising steps; the overview lists each step with its duration.
+The DDIM Sampler is a *staged* node and only runs with **Run**. Run executes
+the Klartraum graph of everything before it, reads the tensors it needs back
+and runs the UNet once per step. It then uploads the result for the nodes that
+follow, whose graph it executes next. The compiled graph of a run shows every
+stage's graph together with the UNet. Run waits for all denoising steps; the
+overview lists each step with its duration.
+
+## Meta nodes
+
+A meta node stands for a subgraph, its *definition*. It has the pins and
+parameters the definition exposes; each stands for a pin or a parameter of an
+inner node. Definitions can contain meta nodes, to any depth.
+
+- **Built-in definitions** come with the studio (Text Encoder, VAE Decoder)
+  and appear in the add-node menu in their group. They are read-only; *Duplicate
+  into this graph* in the opened definition makes an editable copy that the node
+  then uses.
+- **Group** (Ctrl+G, or the node's context menu) turns the selected nodes into
+  a meta node with a new definition stored in the graph file. Links into the
+  group become exposed inputs, one per outside output feeding every inner pin
+  it fed; links out of it become exposed outputs. *Ungroup* replaces a meta node
+  by its inner nodes.
+- **Open** (double-click, the context menu or the inspector) shows the
+  definition's inner graph; the path back is shown above the editor. Changes
+  apply to every node using the definition. In the inspector of an inner node,
+  *Meta node interface* exposes or hides its pins and parameters; links of
+  instances follow exposed pins by name.
+- A meta node's parameters are edited in its inspector; *Reset* returns one to
+  the definition's value.
+
+Meta nodes are expanded into their inner nodes before the graph is checked and
+compiled, so they run exactly like the nodes they contain. Problems inside
+one are reported on the meta node, prefixed with the inner node's title
+("VAE Decoder / Decoder: ..."), and its compiled elements belong to it.
 
 ## Outputs
 

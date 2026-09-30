@@ -4,6 +4,7 @@
 #include <format>
 #include <functional>
 #include <set>
+#include <tuple>
 
 #include "klartraum/gaussian_splatting_factory.hpp"
 
@@ -11,7 +12,9 @@
 
 namespace kstudio {
 
-CompilePlan planGraph(const Graph& graph, const OnnxInfoProvider& onnxInfo, const InputExists& inputExists) {
+namespace {
+
+CompilePlan planFlatGraph(const Graph& graph, const OnnxInfoProvider& onnxInfo, const InputExists& inputExists) {
     CompilePlan plan;
     plan.diagnostics = graph.validate();
     ShapeInference shapes = inferTensorShapes(graph, onnxInfo);
@@ -115,6 +118,34 @@ CompilePlan planGraph(const Graph& graph, const OnnxInfoProvider& onnxInfo, cons
     };
     visit(present->id);
     plan.live = std::move(live);
+    return plan;
+}
+
+} // namespace
+
+CompilePlan planGraph(const Graph& graph, const OnnxInfoProvider& onnxInfo, const InputExists& inputExists) {
+    FlatGraph flat = flatten(graph);
+    CompilePlan plan = planFlatGraph(flat.graph, onnxInfo, inputExists);
+    // A meta node that could not be expanded is missing from the flat graph,
+    // so the nodes it feeds report unconnected inputs, which keeps the plans
+    // that need it from being made.
+    std::vector<Diagnostic> diagnostics = flat.diagnostics;
+    std::set<std::tuple<int, Severity, std::string>> seen;
+    for (auto& d : plan.diagnostics) {
+        if (d.node >= 0) {
+            const int top = flat.top(d.node);
+            // Inner nodes are titled "<meta node> / <inner node>".
+            if (top != d.node && d.severity != Severity::Info) {
+                d.message = flat.graph.findNode(d.node)->title + ": " + d.message;
+            }
+            d.node = top;
+        }
+        if (seen.insert({d.node, d.severity, d.message}).second) {
+            diagnostics.push_back(std::move(d));
+        }
+    }
+    plan.diagnostics = std::move(diagnostics);
+    plan.flat = std::move(flat);
     return plan;
 }
 

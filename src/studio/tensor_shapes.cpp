@@ -181,31 +181,6 @@ ShapeInference inferTensorShapes(const Graph& graph, const OnnxInfoProvider& onn
             output(0, {{1, 4, p.height / 8, p.width / 8}});
             break;
         }
-        case NodeKind::TextEncoder: {
-            const auto info = model(id, node.as<TextEncoderParams>().path);
-            if (!info) {
-                break;
-            }
-            const OnnxTensorDesc* ids = modelInput(*info, "input_ids");
-            if (!ids || info->outputs.empty()) {
-                report(id, "Not a CLIP text encoder: it needs an input_ids input and an output.");
-                break;
-            }
-            for (const auto& input : info->inputs) {
-                const int slot = input.name == "input_ids" ? 0 : input.name == "attention_mask" ? 1 : -1;
-                if (slot < 0) {
-                    report(id, "Unexpected text encoder input '" + input.name + "'.");
-                } else if (const TensorType* in = inputType(id, slot); in && *in != input.type()) {
-                    report(id, std::format("The model expects {} {} but gets {}.", tensorTypeToString(input.type()),
-                                           input.name, tensorTypeToString(*in)));
-                }
-            }
-            const auto& outputs = info->outputs;
-            auto embeddings = std::find_if(outputs.begin(), outputs.end(),
-                                           [](const OnnxTensorDesc& o) { return o.name == "last_hidden_state"; });
-            output(0, (embeddings != outputs.end() ? *embeddings : outputs[0]).type());
-            break;
-        }
         case NodeKind::DdimSampler: {
             const auto info = model(id, node.as<DdimSamplerParams>().path);
             if (!info) {
@@ -235,23 +210,6 @@ ShapeInference inferTensorShapes(const Graph& graph, const OnnxInfoProvider& onn
             requireFloat(id, 0, "The latents");
             requireFloat(id, 1, "The embeddings");
             output(0, {latents});
-            break;
-        }
-        case NodeKind::VaeDecoder: {
-            const auto info = model(id, node.as<VaeDecoderParams>().path);
-            if (!info) {
-                break;
-            }
-            if (info->inputs.size() != 1 || info->outputs.empty()) {
-                report(id, "A VAE decoder has one input and an output.");
-                break;
-            }
-            if (const TensorShape* in = inputShape(id); in && *in != info->inputs[0].shape) {
-                report(id, std::format("The decoder expects {} latents but gets {}.",
-                                       shapeToString(info->inputs[0].shape), shapeToString(*in)));
-            }
-            requireFloat(id, 0, "The latents");
-            output(0, info->outputs[0].type());
             break;
         }
         case NodeKind::Preview:

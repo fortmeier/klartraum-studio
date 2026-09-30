@@ -74,6 +74,7 @@ add_library(klartraum_studio_core STATIC
   src/studio/cpu_numbers.cpp
   src/studio/gaussian_sources.cpp
   src/studio/stable_diffusion.cpp
+  src/studio/meta_nodes.cpp
   src/studio/graph_runner.cpp
   src/studio/preview_texture.cpp
   src/studio/studio_app.cpp
@@ -123,6 +124,7 @@ if(KLARTRAUM_STUDIO_BUILD_TESTS)
     tests/test_cpu_numbers.cpp
     tests/test_stable_diffusion.cpp
     tests/test_tensor_pins.cpp
+    tests/test_meta_nodes.cpp
   )
   target_link_libraries(klartraum_studio_tests PRIVATE klartraum_studio_core GTest::gtest_main)
   include(GoogleTest)

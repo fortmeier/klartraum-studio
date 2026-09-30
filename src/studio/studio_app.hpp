@@ -68,6 +68,12 @@ public:
     }
     void setHideBuffers(bool hide) { hideBuffers_ = hide; compiledLayoutDirty_ = true; }
     const Graph& graph() const { return graph_; }
+    // Meta node definitions: opens the definition of meta node `node` of the
+    // graph shown in the editor (see view()), or goes back out to `depth`
+    // definitions (0: the document graph).
+    void openMetaNode(int node);
+    void closeDefinitions(size_t depth);
+    bool editingDefinition() const { return !editPath_.empty(); }
     // Edits made through this reference must call Graph::touch().
     Graph& editableGraph() { return graph_; }
     void loadExample(Example example);
@@ -96,12 +102,41 @@ private:
     std::filesystem::path resolveOutputPath(const std::string& path) const;
     std::shared_ptr<const OnnxModelInfo> onnxInfo(const std::string& path, std::string& error);
 
+    // Meta nodes. The editor and inspector show view(): the document graph,
+    // or the inner graph of the definition opened last. Edits of a local
+    // definition are written back into the document's definition by
+    // commitDefinition(); built-in definitions are shown read-only.
+    Graph& view() { return editPath_.empty() ? graph_ : editGraph_; }
+    const MetaDefinition* editedDefinition() const;
+    // Opens definition `name`; `from` is the meta node it was opened from.
+    void openDefinition(const std::string& name, int from);
+    // Shows the innermost opened definition's inner graph in the editor.
+    void loadEditGraph();
+    void commitDefinition();
+    // Makes the built-in definition opened from a document node a local copy
+    // the node then uses.
+    void duplicateEditedDefinition();
+    std::vector<int> selectedNodes();
+    void groupSelection();
+    void ungroup(int node);
+    void drawBreadcrumbs();
+    // Inspector section for a node inside an edited definition: which of its
+    // pins and parameters the definition exposes.
+    void drawInterfaceEditor(const Node& node);
+    void drawMetaInspector(Node& node, bool& changed);
+    // The document graph as the live graph's bindings read it: flattened when
+    // it has meta nodes.
+    Graph liveValuesGraph() const;
+
     // Compilation
     // Sets every ONNX Model node's pins to its model's inputs and outputs.
     void syncOnnxPins();
     void updatePlan();
-    bool apply(const LivePlan& plan, const Graph& graph);
-    void installBuilder(const std::optional<LivePlan>& plan, const Graph& graph);
+    // `graph` is flat (no meta nodes); `topNode` maps its nodes to the
+    // document's, for the compiled graph view.
+    bool apply(const LivePlan& plan, const Graph& graph, const std::map<int, int>& topNode);
+    void installBuilder(const std::optional<LivePlan>& plan, const Graph& graph,
+                        const std::map<int, int>& topNode = {});
     // How the live graph and Run find their inputs.
     RunContext runContext();
     // A scene file's Gaussians, cached per file.
@@ -170,7 +205,8 @@ private:
     uint64_t plannedRevision_ = ~uint64_t{0};
     CompilePlan plan_;
     std::optional<LivePlan> appliedPlan_;
-    Graph appliedGraph_;  // the graph appliedPlan_ was built from
+    Graph appliedGraph_;  // the flat graph appliedPlan_ was built from
+    std::map<int, int> appliedTopNode_;
     std::optional<LivePlan> failedPlan_;
     std::string applyError_;
     std::string builderError_;
@@ -228,6 +264,23 @@ private:
     int selectedNode_ = -1;
     int activeTab_ = 0;              // 0: authoring, 1: compiled
     int requestedTab_ = -1;
+
+    // Meta node definitions opened in the editor, outermost first, with the
+    // node each was opened from (in the graph shown before it).
+    std::vector<std::string> editPath_;
+    std::vector<int> editFrom_;
+    Graph editGraph_;
+    // The edited definition's interface, changed by drawInterfaceEditor.
+    std::vector<MetaPin> editInputs_;
+    std::vector<MetaPin> editOutputs_;
+    std::vector<MetaParam> editParams_;
+    bool editInterfaceChanged_ = false;
+    uint64_t editRevision_ = 0;
+    // Set by the editor and inspector, done at the start of the next frame.
+    int pendingOpen_ = -1;
+    int pendingUngroup_ = -1;
+    int pendingClose_ = -1;  // depth to go back out to
+    bool pendingGroup_ = false;
 
     // Dialogs / status
     enum class FileDialog { None, Open, SaveAs };

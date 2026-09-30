@@ -29,7 +29,8 @@ Nodes stand for klartraum's public building blocks:
 | Rendering | *Orbit Camera*, *Swapchain Target*, *Offscreen Target* (W×H), *Gaussian Splatting* (compute or raster backend, all `GsplatConfig` settings) |
 | Compute | *Image to Tensor* (image → 1×3×H×W tensor), *Tensor to Image* (1×3×H×W tensor → H×W image), *Resample* (image → W×H image, nearest or bilinear; `klartraum::ImageResample`), *ONNX Model* (`klartraum::OnnxNetwork`; one tensor pin per model input and output) |
 | Layers | *Add*, *Subtract*, *Multiply*, *Divide* (broadcasting; without B, a constant *b*), *ReLU*, *Sigmoid*, *Sqrt*, *Softmax* (`klartraum::layers`) |
-| Stable Diffusion | *Prompt* (`klartraum::ClipTokenizer`; token ids and mask as int64 tensors), *Text Encoder* (CLIP), *Latent Noise* (seeded, or from a file), *DDIM Sampler* (UNet once per step, guidance and DDIM update on the CPU), *VAE Decoder* (latents → 1×3×H×W image in [0, 1]); run only, with the models from klartraum's `scripts/sd15_onnx/export_denoiser.py` |
+| Stable Diffusion | *Prompt* (`klartraum::ClipTokenizer`; token ids and mask as int64 tensors), *Text Encoder* (meta node: CLIP), *Latent Noise* (seeded, or from a file), *DDIM Sampler* (UNet once per step, guidance and DDIM update on the CPU; run only), *VAE Decoder* (meta node: layers and the decoder model, latents → 1×3×H×W image in [0, 1]), with the models from klartraum's `scripts/sd15_onnx/export_denoiser.py` |
+| Meta nodes | Subgraphs shown as one node, nestable: built-in (Text Encoder, VAE Decoder) or grouped from selected nodes (Ctrl+G) and stored in the graph file; double-click to open |
 | Outputs | *Present* (live; images other than a swapchain rendering are stretched to the window), *Preview* and *Image File Writer* (run; they take an image tensor or an image) |
 
 Pins are typed (Gaussians on the CPU, Gaussians on the GPU, Camera, Image,

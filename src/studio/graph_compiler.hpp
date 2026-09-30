@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "studio/graph_model.hpp"
+#include "studio/meta_nodes.hpp"
 #include "studio/tensor_shapes.hpp"
 
 namespace klartraum {
@@ -41,8 +42,14 @@ struct RunPlan {
 };
 
 struct CompilePlan {
+    // The graph the plans refer to: the planned graph with its meta nodes
+    // expanded (see meta_nodes.hpp). Plan node ids and tensor types are flat
+    // ids; flat.top() maps them to the planned graph's nodes.
+    FlatGraph flat;
     std::optional<LivePlan> live;  // the live part, if any and valid
     std::optional<RunPlan> run;    // the run part, if any and valid
+    // On the planned graph's nodes; problems inside a meta node are reported
+    // on it, prefixed with the inner node's title.
     std::vector<Diagnostic> diagnostics;
 
     bool ok() const { return live.has_value(); }
@@ -51,7 +58,7 @@ struct CompilePlan {
 // Tells whether an input file (scene, image) stored in the graph exists.
 using InputExists = std::function<bool(const std::string& path)>;
 
-// Validates the graph and extracts the plans. Each plan is only produced when
+// Flattens the graph, validates it and extracts the plans. Each plan is only produced when
 // none of the nodes it depends on has an error, so an error in the run part
 // does not stop live rendering and vice versa. With `onnxInfo`, tensor shapes
 // are checked as well; with `inputExists`, scene and image files.
