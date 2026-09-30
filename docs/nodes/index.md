@@ -51,7 +51,31 @@ work; *Implemented by* names the Klartraum class or function behind it.
 | Image to Tensor | Converts a rendered image into a 1×3×H×W tensor. | {cpp:class}`klartraum::GeneralComputation` | every frame (live) or every run |
 | Tensor to Image | Converts a 1×3×H×W tensor (values in [0, 1]) into an H×W image. | {cpp:class}`klartraum::GeneralComputation` | every frame (live) or every run |
 | Resample | Resamples an image to W×H, nearest or bilinear. | {cpp:class}`klartraum::ImageResample` | every frame (live) or every run |
-| ONNX Model | Runs an ONNX network on a tensor (Conv, ConvTranspose, Relu, Reshape, Transpose). | {cpp:class}`klartraum::OnnxNetwork` | every frame (live) or every run |
+| ONNX Model | Runs an ONNX network with one input on a tensor. The operators Klartraum executes include Conv, ConvTranspose, MatMul, Gemm, Softmax, the normalizations, elementwise arithmetic, Reshape, Transpose, Slice, Concat and Resize. | {cpp:class}`klartraum::OnnxNetwork` | every frame (live) or every run |
+
+## Stable Diffusion
+
+Stable Diffusion 1.5 text-to-image generation, with the models that Klartraum's
+`scripts/sd15_onnx/export_denoiser.py` exports. The models are fixed-size, so
+one export serves one image size. They are not part of the Klartraum
+repository. Export them with `uv run python export_denoiser.py --size 256
+--onnx-dir ../../data/onnx/sd15_denoiser_256` (see the script's README).
+The *Stable Diffusion 1.5* example expects them in that directory.
+
+| Node | Description | Implemented by | Runs |
+|---|---|---|---|
+| Prompt | A prompt and a negative prompt, tokenized with CLIP's byte-pair encoding into 2×77 token ids (negative first) and their attention mask. The *Vocabulary* is the export's `vocab.json`, with `merges.txt` next to it. | {cpp:class}`klartraum::ClipTokenizer`, uploaded into two {cpp:class}`klartraum::TensorElement` | once, when the graph is built |
+| Text Encoder | The CLIP text encoder: turns the tokens into 2×77×768 embeddings. | {cpp:class}`klartraum::OnnxNetwork` | every run |
+| Latent Noise | Gaussian noise of the latent size for a W×H image (1×4×H/8×W/8), from a seed. Optionally it reads raw float32 latents from a file instead, e.g. the export's `initial_latents_f32.bin` to reproduce its reference image. | studio | every run |
+| DDIM Sampler | Denoises the latents in *Steps* DDIM steps with SD 1.5's scheduler. Each step runs the UNet once on the negative and the positive prompt, blends the two noise estimates with the *Guidance* scale and takes the DDIM step on the CPU. | {cpp:class}`klartraum::OnnxNetwork`, submitted once per step | every run, once per denoising step |
+| VAE Decoder | Decodes the latents into a 1×3×H×W image tensor with values in [0, 1], ready for a Preview or an Image File Writer. | {cpp:class}`klartraum::OnnxNetwork` | every run |
+
+The DDIM Sampler and the VAE Decoder are *staged* nodes and only run with
+**Run**. Run executes the Klartraum graph of everything before them, reads the
+tensors they need back and runs them. It then uploads their results for the
+nodes that follow, whose graph it executes next. The compiled graph of a run
+shows every stage's graph together with the UNet and the decoder. Run waits
+for all denoising steps; the overview lists each step with its duration.
 
 ## Outputs
 

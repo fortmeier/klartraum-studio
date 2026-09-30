@@ -51,8 +51,10 @@ Node kinds: `scene`, `image_file`, `number`, `time`, `sine`, `upload_number`,
 `transform_gaussians`, `merge_gaussians`, `upload_gaussians`,
 `make_transform`, `transform_gaussians_gpu`, `merge_gaussians_gpu`, `camera`,
 `swapchain_target`, `offscreen_target`, `gaussian_splatting`,
-`image_to_tensor`, `tensor_to_image`, `resample`, `onnx_model`, `present`,
-`preview`, `image_file_writer`. See the {doc}`nodes/index` for what they do.
+`image_to_tensor`, `tensor_to_image`, `resample`, `onnx_model`, `sd_prompt`,
+`sd_text_encoder`, `sd_latent_noise`, `sd_ddim_sampler`, `sd_vae_decoder`,
+`present`, `preview`, `image_file_writer`. See the {doc}`nodes/index` for what
+they do.
 
 ## Links
 

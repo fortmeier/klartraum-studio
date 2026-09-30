@@ -18,6 +18,7 @@
 #include "studio/cpu_numbers.hpp"
 #include "studio/graph_layout.hpp"
 #include "studio/graph_serialization.hpp"
+#include "studio/stable_diffusion.hpp"
 
 namespace kstudio {
 
@@ -66,6 +67,7 @@ ImU32 pinColor(PinType type) {
     case PinType::Camera: return rgb(110, 196, 140);
     case PinType::Image: return rgb(96, 160, 240);
     case PinType::Tensor: return rgb(206, 120, 226);
+    case PinType::Tokens: return rgb(240, 140, 150);
     }
     return rgb(200, 200, 200);
 }
@@ -121,6 +123,11 @@ ImU32 kindColor(NodeKind kind) {
     case NodeKind::TransformGaussiansGpu:
     case NodeKind::MergeGaussiansGpu: return rgb(150, 100, 40);
     case NodeKind::OnnxModel: return rgb(150, 60, 110);
+    case NodeKind::Prompt:
+    case NodeKind::TextEncoder: return rgb(130, 70, 150);
+    case NodeKind::LatentNoise: return rgb(120, 110, 60);
+    case NodeKind::DdimSampler: return rgb(160, 70, 90);
+    case NodeKind::VaeDecoder: return rgb(150, 60, 110);
     case NodeKind::Preview: return rgb(60, 110, 100);
     case NodeKind::ImageFileWriter: return rgb(60, 100, 70);
     }
@@ -217,8 +224,9 @@ void pinIcon(PinType type, bool connected, float size) {
             drawList->AddRect(ImVec2(c.x - r, c.y - r), ImVec2(c.x + r, c.y + r), color, r * 0.5f, 0, 1.5f);
         }
         break;
-    case PinType::Tensor: {
-        const float d = r * 1.25f;
+    case PinType::Tensor:
+    case PinType::Tokens: {
+        const float d = type == PinType::Tokens ? r * 0.85f : r * 1.25f;
         const ImVec2 top(c.x, c.y - d), right(c.x + d, c.y), bottom(c.x, c.y + d), left(c.x - d, c.y);
         if (connected) {
             drawList->AddQuadFilled(top, right, bottom, left, color);
@@ -248,6 +256,19 @@ bool inputText(const char* label, std::string& value) {
     value.copy(buffer, n);
     buffer[n] = '\0';
     if (ImGui::InputText(label, buffer, sizeof(buffer))) {
+        value = buffer;
+        return true;
+    }
+    return false;
+}
+
+bool inputTextMultiline(const char* label, std::string& value) {
+    char buffer[2048];
+    const size_t n = std::min(value.size(), sizeof(buffer) - 1);
+    value.copy(buffer, n);
+    buffer[n] = '\0';
+    const ImVec2 size(-1.0f, ImGui::GetTextLineHeight() * 4.0f);
+    if (ImGui::InputTextMultiline(label, buffer, sizeof(buffer), size)) {
         value = buffer;
         return true;
     }
@@ -289,6 +310,18 @@ const CameraParams kLanternView{1.57f, -0.35f, 1.9f, {-0.45f, 0.35f, -1.0f}, UpA
 constexpr const char* kSampleImage = "data/lantern.jpg";
 constexpr const char* kSampleEncoder = "data/onnx/simple_encoder.onnx";
 constexpr const char* kSampleDecoder = "data/onnx/simple_decoder.onnx";
+// Stable Diffusion 1.5 exported by klartraum's scripts/sd15_onnx/export_denoiser.py
+// (not part of the klartraum repository; see the node documentation).
+constexpr const char* kSampleSdModels = "data/onnx/sd15_denoiser_256";
+constexpr uint32_t kSampleSdSize = 256;
+constexpr const char* kSamplePrompt =
+    "a realistic photograph of a traditional Japanese stone lantern in a green garden, single gray granite garden "
+    "lantern, centered, moss, natural daylight";
+constexpr const char* kSampleNegativePrompt = "blurry, distorted, oversaturated, text";
+
+std::string sdSample(const char* file) {
+    return (std::filesystem::path(kSampleSdModels) / file).generic_string();
+}
 
 std::string defaultScenePath() {
     return kSampleScene;
@@ -323,6 +356,7 @@ std::optional<Example> exampleFromName(std::string_view name) {
     if (name == "splat-autoencoder") return Example::SplatAutoencoder;
     if (name == "combined-scenes") return Example::CombinedScenes;
     if (name == "animated-scenes") return Example::AnimatedScenes;
+    if (name == "stable-diffusion") return Example::StableDiffusion;
     return std::nullopt;
 }
 
@@ -400,6 +434,11 @@ void StudioApp::loadExample(Example example) {
         setGraph(makeSplatAutoencoderGraph(scene, kSampleEncoder, kSampleDecoder), {});
         break;
     }
+    case Example::StableDiffusion:
+        setGraph(makeStableDiffusionGraph(kSampleSdModels, kSampleSdSize, kSamplePrompt, kSampleNegativePrompt,
+                                          "stable_diffusion.png"),
+                 {});
+        break;
     }
     // The examples come with a layout of their own; start the view on it.
     fitRequested_ = true;
@@ -1003,6 +1042,9 @@ void StudioApp::drawMenuBar() {
             if (ImGui::MenuItem("Raccoons and swinging lantern (live, GPU)")) {
                 loadExample(Example::AnimatedScenes);
             }
+            if (ImGui::MenuItem("Stable Diffusion 1.5 (run)")) {
+                loadExample(Example::StableDiffusion);
+            }
             ImGui::EndMenu();
         }
         if (ImGui::MenuItem("New Empty Graph")) {
@@ -1460,6 +1502,36 @@ void StudioApp::drawAuthoringEditor() {
         case NodeKind::OnnxModel:
             ImGui::TextUnformatted(fileName(node.as<OnnxModelParams>().path).c_str());
             break;
+        case NodeKind::Prompt: {
+            const auto& prompt = node.as<PromptParams>().prompt;
+            ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + kNodeWidth);
+            ImGui::TextUnformatted(prompt.empty() ? "(empty prompt)"
+                                                  : (prompt.size() > 60 ? prompt.substr(0, 57) + "..." : prompt).c_str());
+            ImGui::PopTextWrapPos();
+            break;
+        }
+        case NodeKind::TextEncoder:
+            ImGui::TextUnformatted(fileName(node.as<TextEncoderParams>().path).c_str());
+            break;
+        case NodeKind::LatentNoise: {
+            const auto& p = node.as<LatentNoiseParams>();
+            ImGui::Text("for %u x %u", p.width, p.height);
+            if (p.path.empty()) {
+                ImGui::Text("seed %u", p.seed);
+            } else {
+                ImGui::TextUnformatted(fileName(p.path).c_str());
+            }
+            break;
+        }
+        case NodeKind::DdimSampler: {
+            const auto& p = node.as<DdimSamplerParams>();
+            ImGui::TextUnformatted(fileName(p.path).c_str());
+            ImGui::Text("%u steps, guidance %.1f", p.steps, p.guidanceScale);
+            break;
+        }
+        case NodeKind::VaeDecoder:
+            ImGui::TextUnformatted(fileName(node.as<VaeDecoderParams>().path).c_str());
+            break;
         case NodeKind::ImageToTensor:
         case NodeKind::TensorToImage:
             break;
@@ -1624,6 +1696,21 @@ void StudioApp::drawAuthoringEditor() {
                     graph_.findNode(id)->as<SceneParams>().path = defaultScenePath();
                 } else if (info.kind == NodeKind::ImageFile) {
                     graph_.findNode(id)->as<ImageFileParams>().path = kSampleImage;
+                } else if (info.kind == NodeKind::Prompt) {
+                    auto& p = graph_.findNode(id)->as<PromptParams>();
+                    p.prompt = kSamplePrompt;
+                    p.negativePrompt = kSampleNegativePrompt;
+                    p.vocabulary = sdSample("vocab.json");
+                } else if (info.kind == NodeKind::TextEncoder) {
+                    graph_.findNode(id)->as<TextEncoderParams>().path = sdSample("sd15_text_encoder.onnx");
+                } else if (info.kind == NodeKind::LatentNoise) {
+                    auto& p = graph_.findNode(id)->as<LatentNoiseParams>();
+                    p.width = kSampleSdSize;
+                    p.height = kSampleSdSize;
+                } else if (info.kind == NodeKind::DdimSampler) {
+                    graph_.findNode(id)->as<DdimSamplerParams>().path = sdSample("sd15_unet.onnx");
+                } else if (info.kind == NodeKind::VaeDecoder) {
+                    graph_.findNode(id)->as<VaeDecoderParams>().path = sdSample("sd15_vae_decoder.onnx");
                 }
                 nodesToPlace_.push_back(id);
                 pendingSelection_ = id;
@@ -2011,6 +2098,44 @@ void StudioApp::drawNodeInspector(Node& node) {
     bool changed = false;
     auto& vc = engine_.getVulkanContext();
 
+    // An ONNX model file with its inputs, outputs and operators. Samples
+    // containing a directory are relative to the klartraum sources; the Stable
+    // Diffusion ones are file names in the exported model directory.
+    auto modelFile = [&](std::string& path, std::initializer_list<const char*> samples) {
+        bool edited = false;
+        ImGui::SeparatorText("Model");
+        edited |= inputText("File", path);
+        if (ImGui::BeginCombo("Samples", "choose...")) {
+            for (const char* sample : samples) {
+                const std::string file = std::string_view(sample).find('/') == std::string_view::npos
+                                             ? sdSample(sample)
+                                             : std::string(sample);
+                if (ImGui::Selectable(fileName(file).c_str())) {
+                    path = file;
+                    edited = true;
+                }
+            }
+            ImGui::EndCombo();
+        }
+        std::string error;
+        if (const auto info = path.empty() ? nullptr : onnxInfo(path, error)) {
+            for (const auto& input : info->inputs) {
+                ImGui::BulletText("in  %s: %s", input.name.c_str(), shapeToString(input.shape).c_str());
+            }
+            for (const auto& output : info->outputs) {
+                ImGui::BulletText("out %s: %s", output.name.c_str(), shapeToString(output.shape).c_str());
+            }
+            std::string ops;
+            for (const auto& op : info->opTypes) {
+                ops += (ops.empty() ? "" : ", ") + op;
+            }
+            ImGui::TextWrapped("Operators: %s", ops.c_str());
+        } else if (!path.empty()) {
+            ImGui::TextColored(severityColor(Severity::Error), "%s", error.c_str());
+        }
+        return edited;
+    };
+
     switch (node.kind) {
     case NodeKind::Scene: {
         auto& p = node.as<SceneParams>();
@@ -2273,37 +2398,64 @@ void StudioApp::drawNodeInspector(Node& node) {
         ImGui::TextDisabled("Stretches the image to %u x %u (klartraum::ImageResample).", p.width, p.height);
         break;
     }
-    case NodeKind::OnnxModel: {
-        auto& p = node.as<OnnxModelParams>();
-        ImGui::SeparatorText("Model");
-        changed |= inputText("File", p.path);
-        if (ImGui::BeginCombo("Samples", "choose...")) {
-            for (const char* sample : {kSampleEncoder, kSampleDecoder}) {
-                if (ImGui::Selectable(fileName(sample).c_str())) {
-                    p.path = sample;
-                    changed = true;
-                }
+    case NodeKind::OnnxModel:
+        changed |= modelFile(node.as<OnnxModelParams>().path, {kSampleEncoder, kSampleDecoder});
+        break;
+    case NodeKind::Prompt: {
+        auto& p = node.as<PromptParams>();
+        ImGui::SeparatorText("Prompt");
+        changed |= inputTextMultiline("##prompt", p.prompt);
+        ImGui::SeparatorText("Negative prompt");
+        changed |= inputTextMultiline("##negative", p.negativePrompt);
+        ImGui::TextDisabled("Guidance steers away from the negative prompt. At most 75 tokens each.");
+        ImGui::SeparatorText("Tokenizer");
+        changed |= inputText("Vocabulary", p.vocabulary);
+        if (auto resolved = resolveInputPath(p.vocabulary)) {
+            ImGui::TextDisabled("%s", resolved->string().c_str());
+            if (!std::filesystem::exists(resolved->parent_path() / "merges.txt")) {
+                ImGui::TextColored(severityColor(Severity::Error), "merges.txt is missing next to it");
             }
-            ImGui::EndCombo();
+        } else if (!p.vocabulary.empty()) {
+            ImGui::TextColored(severityColor(Severity::Error), "File not found");
         }
-        std::string error;
-        if (const auto info = p.path.empty() ? nullptr : onnxInfo(p.path, error)) {
-            for (const auto& input : info->inputs) {
-                ImGui::BulletText("in  %s: %s", input.name.c_str(), shapeToString(input.shape).c_str());
-            }
-            for (const auto& output : info->outputs) {
-                ImGui::BulletText("out %s: %s", output.name.c_str(), shapeToString(output.shape).c_str());
-            }
-            std::string ops;
-            for (const auto& op : info->opTypes) {
-                ops += (ops.empty() ? "" : ", ") + op;
-            }
-            ImGui::TextWrapped("Operators: %s", ops.c_str());
-        } else if (!p.path.empty()) {
-            ImGui::TextColored(severityColor(Severity::Error), "%s", error.c_str());
+        ImGui::TextDisabled("CLIP's vocab.json, with merges.txt next to it, as export_denoiser.py writes them.");
+        break;
+    }
+    case NodeKind::TextEncoder:
+        changed |= modelFile(node.as<TextEncoderParams>().path, {"sd15_text_encoder.onnx"});
+        ImGui::TextDisabled("Output: 2x77x768 embeddings, negative prompt first.");
+        break;
+    case NodeKind::LatentNoise: {
+        auto& p = node.as<LatentNoiseParams>();
+        ImGui::SeparatorText("Image size");
+        changed |= inputUint("Width", p.width, 8);
+        changed |= inputUint("Height", p.height, 8);
+        ImGui::TextDisabled("Output: 1x4x%ux%u latents; must match the size the UNet was exported for.", p.height / 8,
+                            p.width / 8);
+        ImGui::SeparatorText("Noise");
+        changed |= inputUint("Seed", p.seed, 0);
+        changed |= inputText("File", p.path);
+        ImGui::TextDisabled("Optional: raw float32 latents replacing the seed's noise, e.g. initial_latents_f32.bin.");
+        if (!p.path.empty() && !resolveInputPath(p.path)) {
+            ImGui::TextColored(severityColor(Severity::Error), "File not found");
         }
         break;
     }
+    case NodeKind::DdimSampler: {
+        auto& p = node.as<DdimSamplerParams>();
+        changed |= modelFile(p.path, {"sd15_unet.onnx"});
+        ImGui::SeparatorText("Sampling");
+        changed |= inputUint("Steps", p.steps);
+        changed |= ImGui::DragFloat("Guidance", &p.guidanceScale, 0.05f, 0.0f, 30.0f, "%.2f");
+        ImGui::TextWrapped("The UNet runs once per step on the negative and the positive prompt; the studio blends "
+                           "their noise estimates (guidance) and takes the DDIM step on the CPU. Run waits for all "
+                           "steps.");
+        break;
+    }
+    case NodeKind::VaeDecoder:
+        changed |= modelFile(node.as<VaeDecoderParams>().path, {"sd15_vae_decoder.onnx"});
+        ImGui::TextDisabled("Divides the latents by %.5f and maps the image to [0, 1].", kVaeScalingFactor);
+        break;
     case NodeKind::Preview:
         ImGui::SeparatorText("Result");
         if (drawPreview(node.id, ImGui::GetContentRegionAvail().x)) {

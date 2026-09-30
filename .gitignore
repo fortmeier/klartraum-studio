@@ -1,4 +1,5 @@
 build/
+build-*/
 build*.log
 *.ktgraph.json
 !examples/*.ktgraph.json

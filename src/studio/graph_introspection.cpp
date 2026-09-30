@@ -131,4 +131,29 @@ ElementGraph introspect(const std::shared_ptr<klartraum::ComputeGraphElement>& r
     return graph;
 }
 
+void appendGraph(ElementGraph& graph, const ElementGraph& part) {
+    if (part.empty()) {
+        return;
+    }
+    const int nodeOffset = static_cast<int>(graph.nodes.size());
+    const int edgeOffset = static_cast<int>(graph.edges.size());
+    for (ElementNode node : part.nodes) {
+        node.id += nodeOffset;
+        for (int& input : node.inputs) {
+            input += nodeOffset;
+        }
+        for (int& output : node.outputs) {
+            output += nodeOffset;
+        }
+        graph.nodes.push_back(std::move(node));
+    }
+    for (ElementEdge edge : part.edges) {
+        edge.id += edgeOffset;
+        edge.from += nodeOffset;
+        edge.to += nodeOffset;
+        graph.edges.push_back(edge);
+    }
+    graph.root = part.root + nodeOffset;
+}
+
 } // namespace kstudio

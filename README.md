@@ -27,11 +27,12 @@ Nodes stand for klartraum's public building blocks:
 | Gaussians (GPU) | *Make Transform* (a transform buffer from x, y, z, pitch, yaw, roll and scale; unconnected inputs take the node's values, which apply without rebuilding; `klartraum::TransformBuffer`), *Transform (GPU)* (`klartraum::GaussianTransform`), *Merge (GPU)* (`klartraum::GaussianMerge`), all running every frame |
 | Numbers (CPU) | *Number*, *Time* (seconds since start), *Sine* (amplitude · sin(frequency · 2π · x + phase) + offset), evaluated by the studio every frame; *Upload Number* (`klartraum::HostFloat`, copied into a GPU buffer before every frame) |
 | Rendering | *Orbit Camera*, *Swapchain Target*, *Offscreen Target* (W×H), *Gaussian Splatting* (compute or raster backend, all `GsplatConfig` settings) |
-| Compute | *Image to Tensor* (image → 1×3×H×W tensor), *Tensor to Image* (1×3×H×W tensor → H×W image), *Resample* (image → W×H image, nearest or bilinear; `klartraum::ImageResample`), *ONNX Model* (`klartraum::OnnxNetwork`; Conv, ConvTranspose, Relu, Reshape, Transpose) |
+| Compute | *Image to Tensor* (image → 1×3×H×W tensor), *Tensor to Image* (1×3×H×W tensor → H×W image), *Resample* (image → W×H image, nearest or bilinear; `klartraum::ImageResample`), *ONNX Model* (`klartraum::OnnxNetwork`, one input) |
+| Stable Diffusion | *Prompt* (`klartraum::ClipTokenizer`), *Text Encoder* (CLIP), *Latent Noise* (seeded, or from a file), *DDIM Sampler* (UNet once per step, guidance and DDIM update on the CPU), *VAE Decoder* (latents → 1×3×H×W image in [0, 1]); run only, with the models from klartraum's `scripts/sd15_onnx/export_denoiser.py` |
 | Outputs | *Present* (live; images other than a swapchain rendering are stretched to the window), *Preview* and *Image File Writer* (run; they take an image tensor or an image) |
 
 Pins are typed (Gaussians on the CPU, Gaussians on the GPU, Camera, Image,
-Tensor), and the graph is validated
+Tensor, Tokens), and the graph is validated
 as you edit it. The checks cover missing inputs and files, Run reading the
 window's swapchain images (render into an *Offscreen Target* for it), tensor
 shapes propagated through ONNX models

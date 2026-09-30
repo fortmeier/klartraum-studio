@@ -64,4 +64,8 @@ ElementGraph introspect(const std::shared_ptr<klartraum::ComputeGraphElement>& r
                         int defaultOwner = -1,
                         const std::set<const klartraum::ComputeGraphElement*>& inserted = {});
 
+// Adds `part` to `graph`, e.g. the graphs of a run's stages, with its ids
+// shifted past `graph`'s; the root becomes `part`'s.
+void appendGraph(ElementGraph& graph, const ElementGraph& part);
+
 } // namespace kstudio

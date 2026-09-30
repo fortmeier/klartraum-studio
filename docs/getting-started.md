@@ -33,6 +33,7 @@ support.
 ./build/klartraum_studio --example splat-autoencoder    # offscreen splatting -> encoder -> decoder -> preview
 ./build/klartraum_studio --example combined-scenes      # raccoon scene + transformed lantern, merged and rendered live
 ./build/klartraum_studio --example animated-scenes      # the same on the GPU, the lantern swinging over time
+./build/klartraum_studio --example stable-diffusion     # prompt -> Stable Diffusion 1.5 -> preview + PNG
 ./build/klartraum_studio my.ktgraph.json                # open a saved graph
 ./build/klartraum_studio --backend compute --spz path/to/scene.spz --profile
 ```
@@ -66,3 +67,12 @@ animated-scenes
 : Places the lantern on the GPU instead. Its yaw comes from
   *Time* → *Sine* → *Upload Number*, and *Transform (GPU)* and *Merge (GPU)*
   update the Gaussians every frame without rebuilding the graph.
+
+stable-diffusion
+: Generates a 256×256 image from a prompt with Stable Diffusion 1.5:
+  *Prompt* → *Text Encoder*, *Latent Noise* → *DDIM Sampler* (20 steps) →
+  *VAE Decoder* → Preview and `stable_diffusion.png`. It needs the models
+  exported into `data/onnx/sd15_denoiser_256` of the Klartraum sources (see
+  the {doc}`nodes/index`) and a Klartraum build with Stable Diffusion support.
+  Press **Run** (F5). The run takes a while; each denoising step appears in the
+  overview.

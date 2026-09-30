@@ -9,7 +9,7 @@ include(FetchContent)
 # klartraum (Vulkan compute-graph framework). Point FETCHCONTENT_SOURCE_DIR_KLARTRAUM
 # at a local checkout to build against it instead of the pinned upstream branch.
 set(KLARTRAUM_GIT_REPOSITORY "https://github.com/fortmeier/klartraum.git" CACHE STRING "klartraum repository")
-set(KLARTRAUM_GIT_TAG "develop" CACHE STRING "klartraum branch, tag or commit")
+set(KLARTRAUM_GIT_TAG "feature/sd15-onnx-inference" CACHE STRING "klartraum branch, tag or commit")
 FetchContent_Declare(
   klartraum
   GIT_REPOSITORY ${KLARTRAUM_GIT_REPOSITORY}
@@ -73,6 +73,7 @@ add_library(klartraum_studio_core STATIC
   src/studio/tensor_shapes.cpp
   src/studio/cpu_numbers.cpp
   src/studio/gaussian_sources.cpp
+  src/studio/stable_diffusion.cpp
   src/studio/graph_runner.cpp
   src/studio/preview_texture.cpp
   src/studio/studio_app.cpp
@@ -120,6 +121,7 @@ if(KLARTRAUM_STUDIO_BUILD_TESTS)
     tests/test_graph_runner.cpp
     tests/test_gaussian_sources.cpp
     tests/test_cpu_numbers.cpp
+    tests/test_stable_diffusion.cpp
   )
   target_link_libraries(klartraum_studio_tests PRIVATE klartraum_studio_core GTest::gtest_main)
   include(GoogleTest)
