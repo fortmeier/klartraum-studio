@@ -2,10 +2,9 @@
 
 ## State
 
-Both parts are committed and wait for review: klartraum in PR #38, the studio on its branch.
+Status: done. klartraum PR #38 is merged into `feature/sd15-onnx-inference`, and the studio branch is merged into `main`.
 
-- **klartraum**, on `feature/render-over-targets` (PR #38). Your local checkout still has the
-  same changes uncommitted on `feature/sd15-onnx-inference`, which the studio builds against:
+- **klartraum**, PR #38 (`feature/render-over-targets`):
   - Swapchain and offscreen targets clear to black by default (can be disabled).
   - `ClearImage`, `ImageViewForward`, `ImageComposite` with `shaders/image/composite.comp`.
   - Splatting renders over its target (raster `setLoadExisting`, compute shader blends
@@ -19,11 +18,8 @@ Both parts are committed and wait for review: klartraum in PR #38, the studio on
     automatic Run per graph revision.
   - Example "Lantern over a Stable Diffusion image (live)", tests and docs.
 
-## To do
+## Outcome
 
-- Review by Dirk:
-  - klartraum PR #38 (`feature/render-over-targets` → `feature/sd15-onnx-inference`).
-  - The studio branch `feature/retained-results` (no PR).
-- After klartraum #38 is merged, point the studio's `KLARTRAUM_GIT_TAG` back at the merged branch
-  (it names `feature/render-over-targets` for now).
-- Merge the studio branch into `main`.
+- klartraum #38 is merged; the local klartraum copy is cleaned up (merged branches and stashes removed).
+- The studio's `KLARTRAUM_GIT_TAG` tracks `feature/sd15-onnx-inference` again.
+- `feature/retained-results` is merged into the studio's `main`.
