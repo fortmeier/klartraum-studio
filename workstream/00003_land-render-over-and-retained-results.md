@@ -2,7 +2,7 @@
 
 ## State
 
-Both parts are committed and wait for review in pull requests.
+Both parts are committed and wait for review: klartraum in PR #38, the studio on its branch.
 
 - **klartraum**, on `feature/render-over-targets` (PR #38). Your local checkout still has the
   same changes uncommitted on `feature/sd15-onnx-inference`, which the studio builds against:
@@ -23,7 +23,7 @@ Both parts are committed and wait for review in pull requests.
 
 - Review by Dirk:
   - klartraum PR #38 (`feature/render-over-targets` → `feature/sd15-onnx-inference`).
-  - The studio PR (`feature/retained-results` → `main`).
+  - The studio branch `feature/retained-results` (no PR).
 - After klartraum #38 is merged, point the studio's `KLARTRAUM_GIT_TAG` back at the merged branch
   (it names `feature/render-over-targets` for now).
-- Merge the studio PR.
+- Merge the studio branch into `main`.
