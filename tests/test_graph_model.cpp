@@ -15,7 +15,11 @@
  * - defaultGraphIsValid: the Gaussian-splatting graph validates without errors
  * - validateMissingPresent: a graph without Present is an error
  * - validateUnconnectedInput: a missing input link is reported on its node
- * - validateTargetMustBeSwapchain: splatting into another node's image is an error
+ * - renderersDrawIntoTargets: a Gaussian Splatting renders into a Swapchain or Offscreen Target,
+ *   possibly after Clear Image or Composite, not into another node's image; a Composite draws a rendered
+ *   image onto such a target; Clear Image only clears Swapchain and Offscreen Targets
+ * - tensorsIntoImageInputsGetConverted: linking a tensor into an input that takes images but not
+ *   tensors puts a Tensor to Image node in between; inputs that take tensors are linked directly
  * - validateReportsUnusedNodes: nodes not feeding Present are reported as info
  * - runOnlyGraphIsValid: a graph with sinks but no Present validates without errors
  * - validateNothingToDo: a graph without Present and sinks is an error
@@ -208,15 +212,63 @@ TEST(GraphModel, validateUnconnectedInput) {
     EXPECT_TRUE(hasDiagnostic(graph.validate(), Severity::Error, findKind(graph, NodeKind::GaussianSplatting)));
 }
 
-TEST(GraphModel, validateTargetMustBeSwapchain) {
+TEST(GraphModel, renderersDrawIntoTargets) {
     Graph graph = makeGaussianSplattingGraph("scene.spz");
     const int first = findKind(graph, NodeKind::GaussianSplatting);
     const int second = graph.addNode(NodeKind::GaussianSplatting);
-    graph.connect(out(findKind(graph, NodeKind::Scene)), in(second, 0));
-    graph.connect(out(findKind(graph, NodeKind::Camera)), in(second, 1));
+    ASSERT_FALSE(graph.connect(out(findKind(graph, NodeKind::UploadGaussians)), in(second, 0)).has_value());
+    ASSERT_FALSE(graph.connect(out(findKind(graph, NodeKind::Camera)), in(second, 1)).has_value());
     ASSERT_FALSE(graph.connect(out(first), in(second, 2)).has_value());
     ASSERT_FALSE(graph.connect(out(second), in(findKind(graph, NodeKind::Present))).has_value());
     EXPECT_TRUE(hasDiagnostic(graph.validate(), Severity::Error, second));
+
+    // Drawn onto a target first, the first rendering is the background.
+    const int target = graph.addNode(NodeKind::OffscreenTarget);
+    const int composite = graph.addNode(NodeKind::Composite);
+    ASSERT_FALSE(graph.connect(out(target), in(composite, 0)).has_value());
+    ASSERT_FALSE(graph.connect(out(first), in(composite, 1)).has_value());
+    ASSERT_FALSE(graph.connect(out(composite), in(second, 2)).has_value());
+    EXPECT_FALSE(graph.hasErrors());
+
+    // A Composite draws onto a target, and draws a rendered image.
+    ASSERT_FALSE(graph.connect(out(first), in(composite, 0)).has_value());
+    EXPECT_TRUE(hasDiagnostic(graph.validate(), Severity::Error, composite));
+    ASSERT_FALSE(graph.connect(out(target), in(composite, 0)).has_value());
+    ASSERT_FALSE(graph.connect(out(target), in(composite, 1)).has_value());
+    EXPECT_TRUE(hasDiagnostic(graph.validate(), Severity::Error, composite));
+
+    // Clear Image clears a target in place, not another node's result.
+    const int clear = graph.addNode(NodeKind::ClearImage);
+    ASSERT_FALSE(graph.connect(out(first), in(clear)).has_value());
+    EXPECT_TRUE(hasDiagnostic(graph.validate(), Severity::Error, clear));
+    ASSERT_FALSE(graph.connect(out(findKind(graph, NodeKind::SwapchainTarget)), in(clear)).has_value());
+    EXPECT_FALSE(hasDiagnostic(graph.validate(), Severity::Error, clear));
+}
+
+TEST(GraphModel, tensorsIntoImageInputsGetConverted) {
+    Graph graph;
+    const int image = graph.addNode(NodeKind::ImageFile, {0.0f, 0.0f});
+    const int present = graph.addNode(NodeKind::Present, {200.0f, 100.0f});
+    const int preview = graph.addNode(NodeKind::Preview);
+    const PinRef tensor = out(image);
+    EXPECT_TRUE(graph.checkConnection(tensor, in(present)).has_value());
+    EXPECT_TRUE(graph.needsTensorToImage(tensor, in(present)));
+    EXPECT_TRUE(graph.needsTensorToImage(in(present), tensor));  // either pin order
+    EXPECT_FALSE(graph.needsTensorToImage(tensor, in(preview)));  // takes tensors itself
+
+    int inserted = -1;
+    ASSERT_FALSE(graph.connectConverting(tensor, in(present), &inserted).has_value());
+    ASSERT_GE(inserted, 0);
+    EXPECT_EQ(graph.findNode(inserted)->kind, NodeKind::TensorToImage);
+    EXPECT_FLOAT_EQ(graph.findNode(inserted)->position.x, 100.0f);
+    EXPECT_EQ(graph.inputLink(inserted, 0)->fromNode, image);
+    EXPECT_EQ(graph.inputLink(present, 0)->fromNode, inserted);
+
+    ASSERT_FALSE(graph.connectConverting(tensor, in(preview), &inserted).has_value());
+    EXPECT_EQ(inserted, -1);
+    EXPECT_EQ(graph.inputLink(preview, 0)->fromNode, image);
+    // Links that fail otherwise still fail.
+    EXPECT_TRUE(graph.connectConverting(out(present), in(image)).has_value());
 }
 
 TEST(GraphModel, runOnlyGraphIsValid) {

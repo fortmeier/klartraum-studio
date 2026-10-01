@@ -49,7 +49,15 @@ json paramsToJson(const NodeParams& params) {
                         {"alphaCullThreshold", p.alphaCullThreshold},
                         {"useMeshShader", p.useMeshShader}};
             } else if constexpr (std::is_same_v<T, OffscreenTargetParams>) {
-                return {{"width", p.width}, {"height", p.height}};
+                return {{"width", p.width}, {"height", p.height}, {"clear", p.clear}};
+            } else if constexpr (std::is_same_v<T, SwapchainTargetParams>) {
+                return {{"clear", p.clear}};
+            } else if constexpr (std::is_same_v<T, ClearImageParams>) {
+                return {{"color", p.color}};
+            } else if constexpr (std::is_same_v<T, CompositeParams>) {
+                return {{"mode", compositeModeName(p.mode)}, {"fit", compositeFitName(p.fit)}};
+            } else if constexpr (std::is_same_v<T, DrawBasicsParams>) {
+                return {{"shape", drawBasicsShapeName(p.shape)}};
             } else if constexpr (std::is_same_v<T, ImageFileParams>) {
                 return {{"path", p.path}, {"width", p.width}, {"height", p.height}};
             } else if constexpr (std::is_same_v<T, ResampleParams>) {
@@ -138,6 +146,32 @@ NodeParams paramsFromJson(NodeKind kind, const json& j) {
             } else if constexpr (std::is_same_v<T, OffscreenTargetParams>) {
                 read(j, "width", p.width);
                 read(j, "height", p.height);
+                read(j, "clear", p.clear);
+            } else if constexpr (std::is_same_v<T, SwapchainTargetParams>) {
+                read(j, "clear", p.clear);
+            } else if constexpr (std::is_same_v<T, ClearImageParams>) {
+                read(j, "color", p.color);
+            } else if constexpr (std::is_same_v<T, CompositeParams>) {
+                std::string mode;
+                read(j, "mode", mode);
+                if (mode == compositeModeName(CompositeMode::Over)) {
+                    p.mode = CompositeMode::Over;
+                }
+                std::string fit;
+                read(j, "fit", fit);
+                for (auto f : {CompositeFit::Stretch, CompositeFit::Fit, CompositeFit::Fill}) {
+                    if (fit == compositeFitName(f)) {
+                        p.fit = f;
+                    }
+                }
+            } else if constexpr (std::is_same_v<T, DrawBasicsParams>) {
+                std::string shape;
+                read(j, "shape", shape);
+                for (auto s : {DrawBasicsShape::Triangle, DrawBasicsShape::Cube, DrawBasicsShape::Axes}) {
+                    if (shape == drawBasicsShapeName(s)) {
+                        p.shape = s;
+                    }
+                }
             } else if constexpr (std::is_same_v<T, ImageFileParams>) {
                 read(j, "path", p.path);
                 read(j, "width", p.width);

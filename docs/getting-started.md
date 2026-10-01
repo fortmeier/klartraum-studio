@@ -34,6 +34,7 @@ support.
 ./build/klartraum_studio --example combined-scenes      # raccoon scene + transformed lantern, merged and rendered live
 ./build/klartraum_studio --example animated-scenes      # the same on the GPU, the lantern swinging over time
 ./build/klartraum_studio --example stable-diffusion     # prompt -> Stable Diffusion 1.5 -> preview + PNG
+./build/klartraum_studio --example stable-diffusion-background  # lantern splatted live over an SD image
 ./build/klartraum_studio my.ktgraph.json                # open a saved graph
 ./build/klartraum_studio --backend compute --spz path/to/scene.spz --profile
 ```
@@ -76,3 +77,10 @@ stable-diffusion
   the {doc}`nodes/index`) and a Klartraum build with Stable Diffusion support.
   Press **Run** (F5). The run takes a while; each denoising step appears in the
   overview.
+
+stable-diffusion-background
+: Renders the lantern live over a Stable Diffusion image: a *Composite* draws
+  the decoded image (a Run result) onto the swapchain, filling the window, and
+  a *Gaussian Splatting* that the orbit camera moves renders over it every
+  frame. The first Run starts on its own; press **Run** (F5) for a
+  new image, e.g. after changing the prompt.

@@ -52,6 +52,9 @@ enum class NodeKind {
     GaussianSplatting,
     Present,
     OffscreenTarget,
+    ClearImage,
+    Composite,
+    DrawBasics,
     ImageFile,
     ImageToTensor,
     TensorToImage,
@@ -157,7 +160,10 @@ struct CameraParams {
     bool operator==(const CameraParams&) const = default;
 };
 
+// Targets clear to opaque black before they are rendered into, unless
+// `clear` is off; renderers draw over what a target holds.
 struct SwapchainTargetParams {
+    bool clear = true;
     bool operator==(const SwapchainTargetParams&) const = default;
 };
 
@@ -188,7 +194,35 @@ struct PresentParams {
 struct OffscreenTargetParams {
     uint32_t width = 128;
     uint32_t height = 128;
+    bool clear = true;
     bool operator==(const OffscreenTargetParams&) const = default;
+};
+
+// Clears a target to a color (RGBA, 0..1) before it is rendered into.
+struct ClearImageParams {
+    std::array<float, 4> color = {0.0f, 0.0f, 0.0f, 1.0f};
+    bool operator==(const ClearImageParams&) const = default;
+};
+
+enum class CompositeMode { Replace, Over };
+enum class CompositeFit { Stretch, Fit, Fill };
+
+// Draws an image onto a target (klartraum::ImageComposite): replacing its
+// pixels or blended over them by the image's alpha; stretched over the
+// target, fitted whole into it (the rest stays) or filling it (cropped).
+struct CompositeParams {
+    CompositeMode mode = CompositeMode::Replace;
+    CompositeFit fit = CompositeFit::Stretch;
+    bool operator==(const CompositeParams&) const = default;
+};
+
+enum class DrawBasicsShape { Triangle, Cube, Axes };
+
+// Draws a basic shape (klartraum::DrawBasics) with the camera over an image,
+// e.g. axes as a reference in the scene.
+struct DrawBasicsParams {
+    DrawBasicsShape shape = DrawBasicsShape::Axes;
+    bool operator==(const DrawBasicsParams&) const = default;
 };
 
 // Loads an image file and resizes it to width x height; outputs a
@@ -295,7 +329,7 @@ struct ImageFileWriterParams {
 using NodeParams = std::variant<SceneParams, TransformGaussiansParams, MergeGaussiansParams, UploadGaussiansParams,
                                 NumberParams, TimeParams, SineParams, UploadNumberParams, MakeTransformParams,
                                 TransformGaussiansGpuParams, MergeGaussiansGpuParams, CameraParams, SwapchainTargetParams, SplattingParams, PresentParams,
-                                OffscreenTargetParams, ImageFileParams, ImageToTensorParams, TensorToImageParams,
+                                OffscreenTargetParams, ClearImageParams, CompositeParams, DrawBasicsParams, ImageFileParams, ImageToTensorParams, TensorToImageParams,
                                 ResampleParams, OnnxModelParams, BinaryLayerParams, UnaryLayerParams, PromptParams, LatentNoiseParams,
                                 DdimSamplerParams, PreviewParams, ImageFileWriterParams, MetaParams>;
 
@@ -351,6 +385,9 @@ std::optional<NodeKind> kindFromName(std::string_view name);
 std::string_view pinTypeName(PinType type);
 std::string_view backendName(SplattingBackend backend);
 std::string_view filterName(ResampleFilter filter);
+std::string_view compositeModeName(CompositeMode mode);
+std::string_view compositeFitName(CompositeFit fit);
+std::string_view drawBasicsShapeName(DrawBasicsShape shape);
 std::string_view siteName(ExecutionSite site);
 std::string_view implementationName(Implementation implementation);
 NodeParams defaultParams(NodeKind kind);
@@ -359,15 +396,20 @@ bool isSink(NodeKind kind);
 // DDIM Sampler: Run executes it between submissions of its klartraum graph.
 // It reads its input tensors back, runs the UNet once per denoising step with
 // CPU work in between, and hands its result on as CPU data, which the nodes
-// after it upload again. It cannot run live.
+// after it upload again. It never runs live: a live graph reads the result
+// of the last Run instead (see graph_compiler.hpp).
 bool isStaged(NodeKind kind);
 // Add, Subtract, Multiply, Divide.
 bool isBinaryLayer(NodeKind kind);
 // ReLU, Sigmoid, Sqrt, Softmax.
 bool isUnaryLayer(NodeKind kind);
 // Nodes whose Image output holds a result (Gaussian Splatting, Tensor to
-// Image, Resample), as opposed to an empty target.
+// Image, Resample, Clear Image, Composite, Draw Basics), as opposed to an
+// empty target.
 bool producesImage(NodeKind kind);
+// Nodes whose Image output is a target renderers draw into: Swapchain and
+// Offscreen Target, and Clear Image and Composite, which work on one.
+bool isTarget(NodeKind kind);
 
 struct Vec2 {
     float x = 0.0f;
@@ -440,6 +482,14 @@ public:
     std::optional<std::string> connect(PinRef from, PinRef to);
     // The error connect() would report, without changing the graph.
     std::optional<std::string> checkConnection(PinRef from, PinRef to) const;
+    // Whether a link from `from` to `to` is a tensor into an input that takes
+    // images but not tensors, which connectConverting() makes through a
+    // Tensor to Image node.
+    bool needsTensorToImage(PinRef from, PinRef to) const;
+    // Like connect(), but a tensor into such an image input goes through a new
+    // Tensor to Image node between the two, whose id is returned in
+    // `inserted` (else -1).
+    std::optional<std::string> connectConverting(PinRef from, PinRef to, int* inserted = nullptr);
     bool removeLink(int id);
 
     Node* findNode(int id);
@@ -573,5 +623,14 @@ Graph makeSplatAutoencoderGraph(const std::string& scenePath, const std::string&
 // meta nodes), previewed and written to `outputPath` on Run.
 Graph makeStableDiffusionGraph(const std::string& modelDirectory, uint32_t size, const std::string& prompt,
                                const std::string& negativePrompt, const std::string& outputPath);
+
+// The Stable Diffusion image as the background of a live Gaussian
+// Splatting: a Composite draws the image of the last Run onto the swapchain
+// (filling it), and `scene`, placed by `placement` and seen through `camera`,
+// is rendered over it every frame and presented; the image itself is
+// previewed.
+Graph makeStableDiffusionBackgroundGraph(const std::string& modelDirectory, uint32_t size, const std::string& prompt,
+                                         const std::string& negativePrompt, const SceneParams& scene,
+                                         const TransformGaussiansParams& placement, const CameraParams& camera);
 
 } // namespace kstudio

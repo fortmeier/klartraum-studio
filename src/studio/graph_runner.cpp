@@ -1,6 +1,7 @@
 #include "studio/graph_runner.hpp"
 
 #include <algorithm>
+#include <iterator>
 #include <chrono>
 #include <format>
 #include <set>
@@ -11,11 +12,16 @@
 #include "klartraum/computegraph/gaussianmerge.hpp"
 #include "klartraum/computegraph/gaussiantransform.hpp"
 #include "klartraum/computegraph/hostvalues.hpp"
+#include "klartraum/computegraph/imagecomposite.hpp"
 #include "klartraum/computegraph/imageresample.hpp"
 #include "klartraum/computegraph/imageviewsrc.hpp"
 #include "klartraum/computegraph/noop.hpp"
+#include "klartraum/computegraph/renderpass.hpp"
 #include "klartraum/computegraph/tensorelement.hpp"
 #include "klartraum/computegraph/transformbuffer.hpp"
+#include "klartraum/draw_basics.hpp"
+#include "klartraum/offscreen_target.hpp"
+#include "studio/swapchain_stand_in.hpp"
 #include "klartraum/draw_component.hpp"
 #include "klartraum/gaussian_data_standard.hpp"
 #include "klartraum/gaussian_splatting_factory.hpp"
@@ -27,6 +33,7 @@
 #include "klartraum/sd15/clip_tokenizer.hpp"
 
 #include "studio/cpu_numbers.hpp"
+#include "studio/retained_results.hpp"
 #include "studio/stable_diffusion.hpp"
 
 namespace kstudio {
@@ -96,9 +103,11 @@ klartraum::ResampleFilter toKlartraum(ResampleFilter filter) {
 // swapchain) or for the window's frame loop (one path per swapchain image).
 class ElementBuilder {
 public:
-    ElementBuilder(klartraum::VulkanContext& vc, const Graph& graph, const RunContext& context, bool live)
+    ElementBuilder(klartraum::VulkanContext& vc, const Graph& graph, const RunContext& context, bool live,
+                   std::vector<OutputPin> retainedPins = {})
         : vc_(vc), graph_(graph), context_(context), live_(live),
-          numPaths_(live ? vc.getNumberOfSwapChainImages() : 1u) {}
+          numPaths_(live ? vc.getNumberOfSwapChainImages() : 1u), retainedPins_(std::move(retainedPins)),
+          standIn_(live && needsSwapchainStandIn(vc)) {}
 
     void build(const Node& node) {
         try {
@@ -110,7 +119,8 @@ public:
 
     // One root depending on every sink's tensor and on the tensors of
     // `exported` nodes, which later stages read; nullptr if there are none.
-    ComputeGraphElementPtr runRoot(const std::vector<int>& sinks, const std::vector<OutputPin>& exported) {
+    ComputeGraphElementPtr runRoot(const std::vector<int>& sinks, const std::vector<OutputPin>& exported,
+                                   const std::vector<OutputPin>& kept) {
         auto root = std::make_shared<klartraum::NoOp>(vc_);
         root->setName("Run");
         inserted_.insert(root.get());
@@ -130,7 +140,43 @@ public:
             }
             root->setInput(it->second.producer, slot++, it->second.slot);
         }
+        for (const OutputPin& pin : kept) {
+            if (auto tensor = tensors_.find(pin); tensor != tensors_.end()) {
+                root->setInput(tensor->second.producer, slot++, tensor->second.slot);
+            } else if (auto image = images_.find(pin.first); image != images_.end()) {
+                root->setInput(image->second.producer, slot++, image->second.slot);
+            }
+        }
         return slot == 0 ? nullptr : root;
+    }
+
+    // After a stage ran, or a staged node: stores the results among `kept`
+    // this builder has for the live graph (see RetainedResults).
+    void keep(const std::vector<OutputPin>& kept) {
+        if (!context_.retained) {
+            return;
+        }
+        for (const OutputPin& pin : kept) {
+            const Node& node = *graph_.findNode(pin.first);
+            const std::string name = node.title + " (kept from the last Run)";
+            try {
+                if (auto host = hostTensors_.find(pin); host != hostTensors_.end()) {
+                    context_.retained->storeHost(pin, host->second, name);
+                } else if (auto tensor = tensors_.find(pin); tensor != tensors_.end()) {
+                    context_.retained->storeTensor(pin, *tensor->second.tensor, name);
+                } else if (auto image = images_.find(pin.first); image != images_.end()) {
+                    const ImageRef& ref = image->second;
+                    auto source = std::dynamic_pointer_cast<klartraum::ImageViewSrc>(
+                        ref.slot < 0 ? ref.producer : ref.producer->getInputElement(ref.slot));
+                    if (!source) {
+                        throw std::runtime_error("its image cannot be kept");
+                    }
+                    context_.retained->storeImage(pin, source->getImage(0), ref.layout, ref.extent, name);
+                }
+            } catch (const std::exception& e) {
+                throw std::runtime_error(node.title + ": " + e.what());
+            }
+        }
     }
 
     // After a stage ran: reads the tensors of `exported` nodes back for the
@@ -253,6 +299,10 @@ private:
         if (auto it = tensors_.find(pin); it != tensors_.end()) {
             return it->second;
         }
+        if (const RetainedValue* value = retained(pin); value && value->tensor) {
+            // A result of the last Run, which every path reads.
+            return tensors_[pin] = TensorRef{value->tensor, -1, value->tensor};
+        }
         auto host = hostTensors_.find(pin);
         if (host == hostTensors_.end()) {
             throw std::runtime_error("its input tensor was not built");
@@ -264,6 +314,31 @@ private:
         owners_[tensor.get()] = source.id;
         inserted_.insert(tensor.get());
         return tensors_[pin] = TensorRef{tensor, -1, tensor};
+    }
+
+    // A retained result the live graph reads (see RetainedResults); throws if
+    // the pin is one but Run has not made it yet.
+    const RetainedValue* retained(OutputPin pin) const {
+        if (!live_ || !context_.retained) {
+            return nullptr;
+        }
+        if (const RetainedValue* value = context_.retained->find(pin)) {
+            return value;
+        }
+        if (std::find(retainedPins_.begin(), retainedPins_.end(), pin) != retainedPins_.end()) {
+            throw std::runtime_error("needs the result of '" + graph_.findNode(pin.first)->title +
+                                     "' from a Run; press Run (F5)");
+        }
+        return nullptr;
+    }
+
+    // Whether `element` is the swapchain, or stands for its images.
+    bool isSwapchain(ComputeGraphElementPtr element) {
+        while (element && element != swapchain_) {
+            auto forward = std::dynamic_pointer_cast<klartraum::ImageViewForward>(element);
+            element = forward ? forward->getInputElement(0) : nullptr;
+        }
+        return element != nullptr;
     }
 
     // The CPU values of the tensor feeding input `slot`, as the stage before
@@ -306,6 +381,14 @@ private:
     const ImageRef& readableImage(const Node& node, int slot = 0) {
         const Link* link = graph_.inputLink(node.id, slot);
         auto it = link ? images_.find(link->fromNode) : images_.end();
+        if (it == images_.end() && link) {
+            // A result of the last Run, which every path reads.
+            if (const RetainedValue* value = retained({link->fromNode, link->fromSlot}); value && value->image) {
+                it = images_.emplace(link->fromNode,
+                                     ImageRef{value->image, -1, value->image->extent(), VK_IMAGE_LAYOUT_GENERAL})
+                         .first;
+            }
+        }
         if (it == images_.end()) {
             throw std::runtime_error("its input image was not built");
         }
@@ -355,7 +438,9 @@ private:
     }
 
     // The window's swapchain images, waiting for their acquisition. Created
-    // once: only one element may wait for an image's acquire semaphore.
+    // once: only one element may wait for an image's acquire semaphore. On
+    // MoltenVK, images standing in for them, which Present copies into them
+    // (see needsSwapchainStandIn).
     std::shared_ptr<klartraum::ImageViewSrc> swapchain(int owner) {
         if (!live_) {
             throw std::runtime_error("swapchain images cannot be used by Run; use an Offscreen Target");
@@ -369,12 +454,19 @@ private:
                 imageViews[i] = vc_.getImageView(i);
                 images[i] = vc_.getSwapChainImage(i);
             }
-            swapchain_ = std::make_shared<klartraum::ImageViewSrc>(imageViews, images, extents);
-            swapchain_->setName("Swapchain");
+            swapchainImages_ = std::make_shared<klartraum::ImageViewSrc>(imageViews, images, extents);
+            swapchainImages_->setName("Swapchain");
             for (uint32_t i = 0; i < numImages; ++i) {
-                swapchain_->setWaitFor(i, vc_.imageAvailableSemaphoresPerImage[i]);
+                swapchainImages_->setWaitFor(i, vc_.imageAvailableSemaphoresPerImage[i]);
             }
-            owners_[swapchain_.get()] = owner;
+            owners_[swapchainImages_.get()] = owner;
+            if (standIn_) {
+                swapchain_ = std::make_shared<klartraum::OffscreenTarget>(vc_, vc_.getSwapChainExtent(), numImages);
+                swapchain_->setName("Swapchain stand-in");
+                owners_[swapchain_.get()] = owner;
+            } else {
+                swapchain_ = swapchainImages_;
+            }
         }
         return swapchain_;
     }
@@ -384,11 +476,26 @@ private:
         return vc_.hasSurface() ? VK_IMAGE_LAYOUT_PRESENT_SRC_KHR : VK_IMAGE_LAYOUT_GENERAL;
     }
 
+    // Copies a rendering into the swapchain stand-in into the swapchain.
+    ComputeGraphElementPtr copyToSwapchain(ComputeGraphElementPtr producer, int slot, VkImageLayout layout,
+                                           int owner) {
+        auto copy = std::make_shared<SwapchainCopy>(layout, presentLayout());
+        copy->setName("Present (copy into the swapchain)");
+        copy->setInput(producer, 0, slot);
+        copy->setInput(swapchainImages_, 1);
+        owners_[copy.get()] = owner;
+        inserted_.insert(copy.get());
+        return copy;
+    }
+
     ComputeGraphElementPtr buildPresent(const Node& present) {
         const Link* link = graph_.inputLink(present.id, 0);
         const ImageRef& image = images_.at(link->fromNode);
         // A rendering into the swapchain is presented as it is.
-        if (swapchain_ && image.producer->getInputElement(image.slot) == swapchain_) {
+        if (swapchain_ && isSwapchain(image.slot < 0 ? image.producer : image.producer->getInputElement(image.slot))) {
+            if (standIn_) {
+                return copyToSwapchain(image.producer, image.slot, image.layout, present.id);
+            }
             if (image.layout == presentLayout()) {
                 return image.producer;
             }
@@ -412,6 +519,9 @@ private:
         resample->setInput(target, 1);
         owners_[resample.get()] = present.id;
         inserted_.insert(resample.get());
+        if (standIn_) {
+            return copyToSwapchain(resample, 1, VK_IMAGE_LAYOUT_GENERAL, present.id);
+        }
         if (presentLayout() == VK_IMAGE_LAYOUT_GENERAL) {
             return resample;
         }
@@ -542,6 +652,7 @@ private:
             const auto& p = node.as<OffscreenTargetParams>();
             auto target = std::make_shared<klartraum::OffscreenTarget>(vc_, VkExtent2D{p.width, p.height}, numPaths_);
             target->setName(node.title);
+            target->setClear(p.clear);
             owners_[target.get()] = node.id;
             targets_[node.id] = target;
             targetSizes_[node.id] = {p.width, p.height};
@@ -549,14 +660,91 @@ private:
         }
         case NodeKind::SwapchainTarget:
             targets_[node.id] = swapchain(node.id);
+            swapchain_->setClear(node.as<SwapchainTargetParams>().clear);
             targetSizes_[node.id] = vc_.getSwapChainExtent();
             break;
+        case NodeKind::ClearImage: {
+            const auto& c = node.as<ClearImageParams>().color;
+            auto clear = std::make_shared<klartraum::ClearImage>(VkClearColorValue{{c[0], c[1], c[2], c[3]}});
+            clear->setName(node.title);
+            clear->setInput(built(targets_, node, 0), 0);
+            owners_[clear.get()] = node.id;
+            const VkExtent2D size = targetSizes_.at(graph_.inputLink(node.id, 0)->fromNode);
+            targets_[node.id] = clear;
+            targetSizes_[node.id] = size;
+            // As an image, it holds the color.
+            images_[node.id] = ImageRef{clear, -1, size, VK_IMAGE_LAYOUT_GENERAL};
+            break;
+        }
+        case NodeKind::Composite: {
+            const auto& p = node.as<CompositeParams>();
+            auto target = built(targets_, node, 0);
+            const VkExtent2D size = targetSizes_.at(graph_.inputLink(node.id, 0)->fromNode);
+            // The image may be one every path reads, e.g. a Run result; it is
+            // only read, and drawn onto each path's target.
+            const ImageRef& image = readableImage(node, 1);
+            auto composite = std::make_shared<klartraum::ImageComposite>(
+                vc_, image.extent, size,
+                p.mode == CompositeMode::Over ? klartraum::CompositeMode::Over : klartraum::CompositeMode::Replace,
+                p.fit == CompositeFit::Fit    ? klartraum::CompositeFit::Fit
+                : p.fit == CompositeFit::Fill ? klartraum::CompositeFit::Fill
+                                              : klartraum::CompositeFit::Stretch);
+            composite->setName(node.title);
+            composite->draw()->setName(node.title + " draw");
+            composite->setSource(image.producer, image.slot);
+            composite->setTarget(target);
+            owners_[composite.get()] = node.id;
+            owners_[composite->draw().get()] = node.id;
+            targets_[node.id] = composite;
+            targetSizes_[node.id] = size;
+            images_[node.id] = ImageRef{composite, -1, size, VK_IMAGE_LAYOUT_GENERAL};
+            break;
+        }
+        case NodeKind::DrawBasics: {
+            const auto& p = node.as<DrawBasicsParams>();
+            // The render pass draws over the image's contents, which it reads
+            // in GENERAL layout.
+            const ImageRef image = readableImage(node, 0);
+            const VkExtent2D window = vc_.getSwapChainExtent();
+            if (image.extent.width != window.width || image.extent.height != window.height) {
+                // klartraum::DrawBasics sets its viewport to the swapchain's.
+                throw std::runtime_error("draws only on images of the window's size");
+            }
+            const Node* cameraNode = graph_.inputNode(node.id, 1);
+            std::shared_ptr<klartraum::CameraUboType> ubo;
+            if (live_) {
+                ubo = built(cameraUbos_, node, 1);
+            } else {
+                ubo = std::make_shared<klartraum::CameraUboType>();
+                ubo->setName("CameraUBO");
+                owners_[ubo.get()] = cameraNode->id;
+                cameraUpdates_.push_back(CameraUpdate{ubo, cameraNode->as<CameraParams>(),
+                                                      static_cast<float>(image.extent.width) /
+                                                          static_cast<float>(image.extent.height)});
+            }
+            auto pass = std::make_shared<klartraum::RenderPass>(vc_.getSwapChainImageFormat(), image.extent);
+            pass->setName(node.title);
+            pass->setLoadExisting(true);
+            pass->setInput(image.producer, 0, image.slot);
+            pass->setInput(ubo, 1);
+            pass->addDrawComponent(std::make_shared<klartraum::DrawBasics>(
+                p.shape == DrawBasicsShape::Triangle ? klartraum::DrawBasicsType::Triangle
+                : p.shape == DrawBasicsShape::Cube   ? klartraum::DrawBasicsType::Cube
+                                                     : klartraum::DrawBasicsType::Axes));
+            owners_[pass.get()] = node.id;
+            // The pass leaves the image like a renderer: ready for a transfer
+            // (offscreen) or for presenting (swapchain).
+            auto drawn = std::dynamic_pointer_cast<klartraum::ImageViewSrcInterface>(pass->getInputElement(0));
+            const VkImageLayout layout =
+                drawn ? drawn->getFinalLayoutOverride().value_or(presentLayout()) : presentLayout();
+            images_[node.id] = ImageRef{pass, 0, image.extent, layout};
+            break;
+        }
         case NodeKind::GaussianSplatting: {
             const auto& p = node.as<SplattingParams>();
             const Node* cameraNode = graph_.inputNode(node.id, 1);
-            const Link* targetLink = graph_.inputLink(node.id, 2);
             auto target = built(targets_, node, 2);
-            const VkExtent2D size = targetSizes_.at(targetLink->fromNode);
+            const VkExtent2D size = targetSizes_.at(graph_.inputLink(node.id, 2)->fromNode);
 
             std::shared_ptr<klartraum::CameraUboType> ubo;
             if (live_) {
@@ -777,10 +965,18 @@ private:
 
     std::map<int, std::shared_ptr<klartraum::ImageViewSrc>> targets_;
     std::map<int, VkExtent2D> targetSizes_;
+    // What the Swapchain Target renders into: the swapchain images, or on
+    // MoltenVK their stand-in.
     std::shared_ptr<klartraum::ImageViewSrc> swapchain_;
+    std::shared_ptr<klartraum::ImageViewSrc> swapchainImages_;
     std::map<int, std::shared_ptr<klartraum::CameraUboType>> cameraUbos_;
     std::map<int, ImageRef> images_;
     std::map<OutputPin, TensorRef> tensors_;
+    // Outputs the live graph reads from the last Run.
+    std::vector<OutputPin> retainedPins_;
+    // Whether the Swapchain Target renders into a stand-in (see
+    // needsSwapchainStandIn).
+    bool standIn_;
     // Tensors computed on the CPU or by an earlier stage of a run.
     std::map<OutputPin, HostTensor> hostTensors_;
     std::vector<std::pair<std::shared_ptr<FloatTensor>, std::vector<float>>> uploads_;
@@ -870,7 +1066,15 @@ RunResult runGraph(klartraum::VulkanContext& vulkanContext, const Graph& graph, 
             }
         }
 
-        if (const ComputeGraphElementPtr root = builder.runRoot(sinks, exported)) {
+        // Results the live graph reads, made by this stage's nodes.
+        std::vector<OutputPin> kept;
+        for (const OutputPin& pin : plan.retained) {
+            if (stages.contains(pin.first) && inStage(pin.first) && !isStaged(graph.findNode(pin.first)->kind)) {
+                kept.push_back(pin);
+            }
+        }
+
+        if (const ComputeGraphElementPtr root = builder.runRoot(sinks, exported, kept)) {
             klartraum::ComputeGraph computeGraph(vulkanContext, 1);
             computeGraph.enableProfiling();
             computeGraph.compileFrom(root);
@@ -884,12 +1088,17 @@ RunResult runGraph(klartraum::VulkanContext& vulkanContext, const Graph& graph, 
             }
             appendGraph(result.compiled, introspect(root, builder.owners(), -1, builder.inserted()));
         }
+        builder.keep(kept);
         builder.finishStage(exported);
 
         for (int id : staged) {
             const StagedResult ran = builder.runStaged(*graph.findNode(id));
             result.timings.insert(ran.timings.begin(), ran.timings.end());
             appendGraph(result.compiled, introspect(ran.root, {}, id));
+            std::vector<OutputPin> keptHere;
+            std::copy_if(plan.retained.begin(), plan.retained.end(), std::back_inserter(keptHere),
+                         [&](const OutputPin& pin) { return pin.first == id; });
+            builder.keep(keptHere);
         }
     }
     result.milliseconds =
@@ -899,7 +1108,7 @@ RunResult runGraph(klartraum::VulkanContext& vulkanContext, const Graph& graph, 
 
 BuiltGraph buildLiveGraph(klartraum::KlartraumEngine& engine, const Graph& graph, const LivePlan& plan,
                           const RunContext& context) {
-    ElementBuilder builder(engine.getVulkanContext(), graph, context, true);
+    ElementBuilder builder(engine.getVulkanContext(), graph, context, true, plan.retained);
     for (int id : graph.topologicalOrder()) {
         if (plan.contains(id) && id != plan.presentNode) {
             builder.build(*graph.findNode(id));

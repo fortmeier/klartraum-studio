@@ -19,6 +19,7 @@
 #include "studio/graph_layout.hpp"
 #include "studio/graph_serialization.hpp"
 #include "studio/meta_nodes.hpp"
+#include "studio/retained_results.hpp"
 #include "studio/stable_diffusion.hpp"
 
 #include <nlohmann/json.hpp>
@@ -112,6 +113,9 @@ ImU32 kindColor(NodeKind kind) {
     case NodeKind::GaussianSplatting: return rgb(122, 60, 150);
     case NodeKind::Present: return rgb(70, 70, 82);
     case NodeKind::OffscreenTarget: return rgb(44, 110, 140);
+    case NodeKind::ClearImage: return rgb(60, 90, 120);
+    case NodeKind::Composite: return rgb(60, 105, 130);
+    case NodeKind::DrawBasics: return rgb(70, 120, 110);
     case NodeKind::ImageFile: return rgb(150, 84, 50);
     case NodeKind::ImageToTensor: return rgb(110, 70, 140);
     case NodeKind::TensorToImage: return rgb(70, 90, 150);
@@ -326,6 +330,8 @@ constexpr const char* kSamplePrompt =
     "a realistic photograph of a traditional Japanese stone lantern in a green garden, single gray granite garden "
     "lantern, centered, moss, natural daylight";
 constexpr const char* kSampleNegativePrompt = "blurry, distorted, oversaturated, text";
+constexpr const char* kSampleSdBackgroundPrompt =
+    "a realistic photograph of a quiet japanese garden with moss and stones, soft daylight";
 
 std::string sdSample(const char* file) {
     return (std::filesystem::path(kSampleSdModels) / file).generic_string();
@@ -365,11 +371,13 @@ std::optional<Example> exampleFromName(std::string_view name) {
     if (name == "combined-scenes") return Example::CombinedScenes;
     if (name == "animated-scenes") return Example::AnimatedScenes;
     if (name == "stable-diffusion") return Example::StableDiffusion;
+    if (name == "stable-diffusion-background") return Example::StableDiffusionBackground;
     return std::nullopt;
 }
 
 StudioApp::StudioApp(klartraum::KlartraumEngine& engine, StudioOptions options, GLFWwindow* window)
-    : engine_(engine), window_(window), options_(std::move(options)) {
+    : engine_(engine), window_(window), options_(std::move(options)),
+      retained_(std::make_unique<RetainedResults>(engine.getVulkanContext())) {
     profiling_ = options_.profiling;
 
     // Editor layouts are stored in the graph files, not in NodeEditor.json.
@@ -447,12 +455,25 @@ void StudioApp::loadExample(Example example) {
                                           "stable_diffusion.png"),
                  {});
         break;
+    case Example::StableDiffusionBackground:
+        setGraph(makeStableDiffusionBackgroundGraph(kSampleSdModels, kSampleSdSize, kSampleSdBackgroundPrompt,
+                                                    kSampleNegativePrompt, SceneParams{kSampleLantern, true},
+                                                    kLanternPlacement, kLanternView),
+                 {});
+        break;
     }
     // The examples come with a layout of their own; start the view on it.
     fitRequested_ = true;
 }
 
 void StudioApp::setGraph(Graph graph, std::filesystem::path file) {
+    // Results kept for the previous graph's live graph do not belong to this one.
+    if (appliedPlan_ && !appliedPlan_->retained.empty()) {
+        vkDeviceWaitIdle(engine_.getVulkanContext().getDevice());
+        appliedPlan_.reset();
+        installBuilder(std::nullopt, {});
+    }
+    retained_->clear();
     editPath_.clear();
     editFrom_.clear();
     graph_ = std::move(graph);
@@ -607,7 +628,19 @@ void StudioApp::updatePlan() {
     }
     const LivePlan& pending = *plan_.live;
 
-    const bool rebuild = !appliedPlan_ || pending.needsRebuildFrom(*appliedPlan_);
+    // The live graph reads results of the last Run. Without them yet, Run
+    // once on its own; after that only on request.
+    if (!retained_->has(pending.retained)) {
+        if (plan_.run && autoRunRevision_ != graph_.revision()) {
+            autoRunRevision_ = graph_.revision();
+            runRequested_ = true;
+        }
+        return;
+    }
+
+    // New storage for retained results needs a live graph built with it.
+    const bool rebuild = !appliedPlan_ || pending.needsRebuildFrom(*appliedPlan_) ||
+                         (!pending.retained.empty() && appliedGeneration_ != retained_->generation());
     if (rebuild) {
         const bool alreadyFailed = failedPlan_ && !pending.needsRebuildFrom(*failedPlan_);
         if (applyRequested_ || (autoApply_ && !alreadyFailed && !userIsEditing)) {
@@ -778,6 +811,7 @@ RunContext StudioApp::runContext() {
     context.hostStep = [this](const std::string& step, double milliseconds) { logHostStep(step, milliseconds); };
     context.time = secondsSinceStart();
     context.onnxInfo = [this](const std::string& path, std::string& error) { return onnxInfo(path, error); };
+    context.retained = retained_.get();
     return context;
 }
 
@@ -862,6 +896,7 @@ bool StudioApp::apply(const LivePlan& plan, const Graph& graph, const std::map<i
     appliedPlan_ = plan;
     appliedGraph_ = graph;
     appliedTopNode_ = topNode;
+    appliedGeneration_ = retained_->generation();
     failedPlan_.reset();
     applyError_.clear();
     if (newCamera) {
@@ -985,6 +1020,9 @@ void StudioApp::updateWindowTitle() {
 
 void StudioApp::run() {
     runRequested_ = false;
+    // Run writes the results the live graph reads; frames still in flight
+    // must be done with them first.
+    vkDeviceWaitIdle(engine_.getVulkanContext().getDevice());
     lastRunRevision_ = graph_.revision();
     if (!plan_.run) {
         runError_ = "Nothing to run: add a Preview or Image File Writer, and fix the errors of the nodes feeding it.";
@@ -1014,6 +1052,9 @@ void StudioApp::run() {
         }
         lastRun_ = std::move(result);
         runError_.clear();
+        // With new results, a live graph that failed for want of them is
+        // tried again.
+        failedPlan_.reset();
         setStatus(message);
         if (compiledSource_ == 1) {
             compiledLayoutDirty_ = true;
@@ -1123,6 +1164,9 @@ void StudioApp::drawMenuBar() {
             }
             if (ImGui::MenuItem("Stable Diffusion 1.5 (run)")) {
                 loadExample(Example::StableDiffusion);
+            }
+            if (ImGui::MenuItem("Lantern over a Stable Diffusion image (live)")) {
+                loadExample(Example::StableDiffusionBackground);
             }
             ImGui::EndMenu();
         }
@@ -1587,6 +1631,25 @@ void StudioApp::drawAuthoringEditor() {
         case NodeKind::SwapchainTarget: {
             const VkExtent2D extent = vc.getSwapChainExtent();
             ImGui::Text("%u x %u, %u images", extent.width, extent.height, vc.getNumberOfSwapChainImages());
+            if (!node.as<SwapchainTargetParams>().clear) {
+                ImGui::TextDisabled("not cleared");
+            }
+            break;
+        }
+        case NodeKind::Composite: {
+            const auto& p = node.as<CompositeParams>();
+            ImGui::Text("%s, %s", std::string(compositeModeName(p.mode)).c_str(),
+                        std::string(compositeFitName(p.fit)).c_str());
+            break;
+        }
+        case NodeKind::DrawBasics:
+            ImGui::TextUnformatted(std::string(drawBasicsShapeName(node.as<DrawBasicsParams>().shape)).c_str());
+            break;
+        case NodeKind::ClearImage: {
+            const auto& c = node.as<ClearImageParams>().color;
+            ImGui::ColorButton("##color", ImVec4(c[0], c[1], c[2], c[3]), ImGuiColorEditFlags_NoTooltip);
+            ImGui::SameLine();
+            ImGui::Text("%.2f %.2f %.2f %.2f", c[0], c[1], c[2], c[3]);
             break;
         }
         case NodeKind::GaussianSplatting: {
@@ -1602,7 +1665,7 @@ void StudioApp::drawAuthoringEditor() {
             break;
         case NodeKind::OffscreenTarget: {
             const auto& p = node.as<OffscreenTargetParams>();
-            ImGui::Text("%u x %u", p.width, p.height);
+            ImGui::Text("%u x %u%s", p.width, p.height, p.clear ? "" : ", not cleared");
             break;
         }
         case NodeKind::ImageFile: {
@@ -1774,14 +1837,28 @@ void StudioApp::drawAuthoringEditor() {
         if (ed::QueryNewLink(&start, &end) && start && end) {
             const PinRef a = pinFromEditor(start);
             const PinRef b = pinFromEditor(end);
-            if (auto error = view().checkConnection(a, b)) {
+            // A tensor into an image input goes through a Tensor to Image node.
+            const bool convert = view().needsTensorToImage(a, b);
+            if (auto error = convert ? std::optional<std::string>() : view().checkConnection(a, b)) {
                 ed::RejectNewItem(ImVec4(1.0f, 0.35f, 0.3f, 1.0f), 2.0f);
                 ed::Suspend();
                 ImGui::SetTooltip("%s", error->c_str());
                 ed::Resume();
-            } else if (ed::AcceptNewItem(ImVec4(0.5f, 1.0f, 0.5f, 1.0f), 3.0f)) {
-                view().connect(a, b);
-                modified_ = true;
+            } else {
+                if (convert) {
+                    ed::Suspend();
+                    ImGui::SetTooltip("Inserts a Tensor to Image node");
+                    ed::Resume();
+                }
+                if (ed::AcceptNewItem(ImVec4(0.5f, 1.0f, 0.5f, 1.0f), 3.0f)) {
+                    int inserted = -1;
+                    if (auto problem = view().connectConverting(a, b, &inserted)) {
+                        setStatus(*problem, true);
+                    } else if (inserted >= 0) {
+                        nodesToPlace_.push_back(inserted);
+                    }
+                    modified_ = true;
+                }
             }
         }
     }
@@ -2488,6 +2565,45 @@ void StudioApp::drawNodeInspector(Node& node) {
         ImGui::Text("Extent: %u x %u", extent.width, extent.height);
         ImGui::Text("Images: %u", vc.getNumberOfSwapChainImages());
         ImGui::TextDisabled("Follows the window size.");
+        changed |= ImGui::Checkbox("Clear to black", &node.as<SwapchainTargetParams>().clear);
+        ImGui::TextDisabled("Renderers draw over what the target holds. Without clearing, each frame draws over "
+                            "an earlier one.");
+        break;
+    }
+    case NodeKind::Composite: {
+        auto& p = node.as<CompositeParams>();
+        ImGui::SeparatorText("Drawing");
+        int mode = p.mode == CompositeMode::Over ? 1 : 0;
+        if (ImGui::Combo("Mode", &mode, "replace\0over (by the image's alpha)\0")) {
+            p.mode = mode == 1 ? CompositeMode::Over : CompositeMode::Replace;
+            changed = true;
+        }
+        int fit = static_cast<int>(p.fit);
+        if (ImGui::Combo("Fit", &fit, "stretch\0fit (whole image, aspect kept)\0fill (covers the target, cropped)\0")) {
+            p.fit = static_cast<CompositeFit>(fit);
+            changed = true;
+        }
+        ImGui::TextWrapped("Draws the image onto the target, per frame, and passes the target on: renderers after "
+                           "it draw over the image. The image is only read, so it may be a Run result.");
+        break;
+    }
+    case NodeKind::DrawBasics: {
+        auto& p = node.as<DrawBasicsParams>();
+        ImGui::SeparatorText("Drawing");
+        int shape = static_cast<int>(p.shape);
+        if (ImGui::Combo("Shape", &shape, "triangle\0cube\0axes\0")) {
+            p.shape = static_cast<DrawBasicsShape>(shape);
+            changed = true;
+        }
+        ImGui::TextWrapped("Draws the shape with the camera over the image, per frame, in a render pass that keeps "
+                           "the image's contents. Only on images of the window's size.");
+        break;
+    }
+    case NodeKind::ClearImage: {
+        auto& c = node.as<ClearImageParams>().color;
+        ImGui::SeparatorText("Color");
+        changed |= ImGui::ColorEdit4("Color", c.data(), ImGuiColorEditFlags_Float);
+        ImGui::TextDisabled("Clears the target in place before it is rendered into (klartraum::ClearImage).");
         break;
     }
     case NodeKind::GaussianSplatting: {
@@ -2557,6 +2673,8 @@ void StudioApp::drawNodeInspector(Node& node) {
         ImGui::SeparatorText("Image size");
         changed |= inputUint("Width", p.width);
         changed |= inputUint("Height", p.height);
+        changed |= ImGui::Checkbox("Clear to black", &p.clear);
+        ImGui::TextDisabled("Renderers draw over what the target holds.");
         break;
     }
     case NodeKind::ImageFile: {

@@ -25,6 +25,8 @@ class VulkanContext;
 
 namespace kstudio {
 
+class RetainedResults;
+
 // How a run or the live graph finds its inputs and places its outputs; paths
 // are the ones stored in the graph.
 struct RunContext {
@@ -40,6 +42,9 @@ struct RunContext {
     // Seconds since the studio started, for Time nodes when running once.
     double time = 0.0;
     OnnxInfoProvider onnxInfo;
+    // Where Run keeps the results the live graph reads (RunPlan::retained)
+    // and the live graph finds them (LivePlan::retained); optional for Run.
+    RetainedResults* retained = nullptr;
 };
 
 struct RunResult {
