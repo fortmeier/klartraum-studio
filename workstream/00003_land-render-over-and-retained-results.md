@@ -2,10 +2,10 @@
 
 ## State
 
-All of this is uncommitted and waiting for review.
+Both parts are committed and wait for review in pull requests.
 
-- **klartraum**, uncommitted on `feature/sd15-onnx-inference` (originally meant for
-  `feature/render-over-targets`):
+- **klartraum**, on `feature/render-over-targets` (PR #38). Your local checkout still has the
+  same changes uncommitted on `feature/sd15-onnx-inference`, which the studio builds against:
   - Swapchain and offscreen targets clear to black by default (can be disabled).
   - `ClearImage`, `ImageViewForward`, `ImageComposite` with `shaders/image/composite.comp`.
   - Splatting renders over its target (raster `setLoadExisting`, compute shader blends
