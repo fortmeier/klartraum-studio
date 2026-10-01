@@ -21,7 +21,9 @@ All of this is uncommitted and waiting for review.
 
 ## To do
 
-- Review by Dirk.
-- Decide the klartraum branch for these changes, then commit and open the klartraum PR.
-- Point the studio's `KLARTRAUM_GIT_TAG` (CMakeLists.txt) at the merged klartraum branch.
-- Commit the studio branch. No PR unless asked.
+- Review by Dirk:
+  - klartraum PR #38 (`feature/render-over-targets` → `feature/sd15-onnx-inference`).
+  - The studio PR (`feature/retained-results` → `main`).
+- After klartraum #38 is merged, point the studio's `KLARTRAUM_GIT_TAG` back at the merged branch
+  (it names `feature/render-over-targets` for now).
+- Merge the studio PR.
