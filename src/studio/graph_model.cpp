@@ -42,6 +42,8 @@ constexpr PinDesc kSplattingInputs[] = {
     {"Target", PinType::Image},
 };
 constexpr PinDesc kImageInputs[] = {{"Image", PinType::Image}};
+constexpr PinDesc kCompositeInputs[] = {{"Target", PinType::Image}, {"Image", PinType::Image}};
+constexpr PinDesc kDrawBasicsInputs[] = {{"Image", PinType::Image}, {"Camera", PinType::Camera}};
 constexpr PinDesc kTensorInputs[] = {{"Tensor", PinType::Tensor}};
 constexpr PinDesc kTensorOutputs[] = {{"Tensor", PinType::Tensor}};
 constexpr PinDesc kSinkInputs[] = {{"Tensor", PinType::Tensor, PinType::Image}};
@@ -98,13 +100,28 @@ const NodeKindInfo kKinds[] = {
      kCameraOutputs, Upload, ComputeGraph, "klartraum::InterfaceCameraOrbit writing a klartraum::CameraUboType",
      "every frame (live), once per run", true},
     {NodeKind::SwapchainTarget, "swapchain_target", "Swapchain Target", "Rendering",
-     "The window's swapchain images, rendered into directly.", {}, kImageOutputs, Gpu, ComputeGraph,
+     "The window's swapchain images, rendered into directly; cleared to black first unless turned off.", {},
+     kImageOutputs, Gpu, ComputeGraph,
      "klartraum::ImageViewSrc over the swapchain", "every frame (live only)"},
     {NodeKind::OffscreenTarget, "offscreen_target", "Offscreen Target", "Rendering",
-     "An image of fixed size to render into for further processing.", {}, kImageOutputs, Gpu, ComputeGraph,
-     "klartraum::OffscreenTarget", kEveryExecution},
+     "An image of fixed size to render into for further processing; cleared to black first unless turned off.",
+     {}, kImageOutputs, Gpu, ComputeGraph, "klartraum::OffscreenTarget", kEveryExecution},
+    {NodeKind::ClearImage, "clear_image", "Clear Image", "Rendering",
+     "Clears a target to a color before it is rendered into.", kImageInputs, kImageOutputs, Gpu, ComputeGraph,
+     "klartraum::ClearImage", kEveryExecution},
+    {NodeKind::Composite, "composite", "Composite", "Rendering",
+     "Draws an image onto a target, e.g. as the background renderers draw over. The target keeps what it holds "
+     "where the image is not drawn.",
+     kCompositeInputs, kImageOutputs, Gpu, ComputeGraph, "klartraum::ImageComposite", kEveryExecution},
+    {NodeKind::DrawBasics, "draw_basics", "Draw Basics", "Rendering",
+     "Draws a triangle, a cube or axes with the camera over a rendered image at the window's size, e.g. after "
+     "a Gaussian Splatting.",
+     kDrawBasicsInputs, kImageOutputs, Gpu, ComputeGraph, "klartraum::RenderPass with a klartraum::DrawBasics",
+     kEveryExecution},
     {NodeKind::GaussianSplatting, "gaussian_splatting", "Gaussian Splatting", "Rendering",
-     "Renders the Gaussians into the target image.", kSplattingInputs, kImageOutputs, Gpu, ComputeGraph,
+     "Renders the Gaussians over its target: a Swapchain or Offscreen Target, possibly after Clear Image or "
+     "Composite.",
+     kSplattingInputs, kImageOutputs, Gpu, ComputeGraph,
      "klartraum::createGaussianSplatting", kEveryExecution},
     {NodeKind::ImageToTensor, "image_to_tensor", "Image to Tensor", "Compute",
      "Converts a rendered image into a 1x3xHxW tensor.", kImageInputs, kTensorOutputs, Gpu, ComputeGraph,
@@ -228,6 +245,9 @@ NodeParams defaultParams(NodeKind kind) {
     case NodeKind::GaussianSplatting: return SplattingParams{};
     case NodeKind::Present: return PresentParams{};
     case NodeKind::OffscreenTarget: return OffscreenTargetParams{};
+    case NodeKind::ClearImage: return ClearImageParams{};
+    case NodeKind::Composite: return CompositeParams{};
+    case NodeKind::DrawBasics: return DrawBasicsParams{};
     case NodeKind::ImageFile: return ImageFileParams{};
     case NodeKind::ImageToTensor: return ImageToTensorParams{};
     case NodeKind::TensorToImage: return TensorToImageParams{};
@@ -288,7 +308,25 @@ std::string_view implementationName(Implementation implementation) {
 }
 
 bool producesImage(NodeKind kind) {
-    return kind == NodeKind::GaussianSplatting || kind == NodeKind::TensorToImage || kind == NodeKind::Resample;
+    return kind == NodeKind::GaussianSplatting || kind == NodeKind::TensorToImage || kind == NodeKind::Resample ||
+           kind == NodeKind::ClearImage || kind == NodeKind::Composite || kind == NodeKind::DrawBasics;
+}
+
+bool isTarget(NodeKind kind) {
+    return kind == NodeKind::SwapchainTarget || kind == NodeKind::OffscreenTarget || kind == NodeKind::ClearImage ||
+           kind == NodeKind::Composite;
+}
+
+std::string_view compositeModeName(CompositeMode mode) {
+    return mode == CompositeMode::Replace ? "replace" : "over";
+}
+
+std::string_view compositeFitName(CompositeFit fit) {
+    return fit == CompositeFit::Stretch ? "stretch" : fit == CompositeFit::Fit ? "fit" : "fill";
+}
+
+std::string_view drawBasicsShapeName(DrawBasicsShape shape) {
+    return shape == DrawBasicsShape::Triangle ? "triangle" : shape == DrawBasicsShape::Cube ? "cube" : "axes";
 }
 
 int pinId(const PinRef& pin) {
@@ -383,6 +421,50 @@ std::optional<std::string> Graph::checkConnection(PinRef from, PinRef to) const 
     }
     if (from.node == to.node || reaches(to.node, from.node)) {
         return "This link would create a cycle.";
+    }
+    return std::nullopt;
+}
+
+bool Graph::needsTensorToImage(PinRef from, PinRef to) const {
+    if (from.direction == PinDirection::Input) {
+        std::swap(from, to);
+    }
+    const Node* src = findNode(from.node);
+    const Node* dst = findNode(to.node);
+    if (!src || !dst || from.direction != PinDirection::Output || to.direction != PinDirection::Input) {
+        return false;
+    }
+    const auto outputs = outputPins(*src);
+    const auto inputs = inputPins(*dst);
+    if (from.slot < 0 || from.slot >= static_cast<int>(outputs.size()) || to.slot < 0 ||
+        to.slot >= static_cast<int>(inputs.size())) {
+        return false;
+    }
+    return outputs[from.slot].type == PinType::Tensor && inputs[to.slot].accepts(PinType::Image) &&
+           !inputs[to.slot].accepts(PinType::Tensor);
+}
+
+std::optional<std::string> Graph::connectConverting(PinRef from, PinRef to, int* inserted) {
+    if (inserted) {
+        *inserted = -1;
+    }
+    if (!needsTensorToImage(from, to)) {
+        return connect(from, to);
+    }
+    if (from.direction == PinDirection::Input) {
+        std::swap(from, to);
+    }
+    if (from.node == to.node || reaches(to.node, from.node)) {
+        return "This link would create a cycle.";
+    }
+    const Node& source = *findNode(from.node);
+    const Node& target = *findNode(to.node);
+    const Vec2 position{(source.position.x + target.position.x) * 0.5f, (source.position.y + target.position.y) * 0.5f};
+    const int convert = addNode(NodeKind::TensorToImage, position);
+    connect(from, {convert, PinDirection::Input, 0});
+    connect({convert, PinDirection::Output, 0}, to);
+    if (inserted) {
+        *inserted = convert;
     }
     return std::nullopt;
 }
@@ -637,9 +719,9 @@ std::vector<Diagnostic> Graph::validate() const {
     }
 
     // Targets are empty images; what reads an image needs one with a result.
-    auto checkRenderedImage = [&](const Node& node) {
-        const Node* source = inputNode(node.id, 0);
-        if (inputType(node.id, 0) == PinType::Image && !producesImage(source->kind)) {
+    auto checkRenderedImage = [&](const Node& node, int slot = 0) {
+        const Node* source = inputNode(node.id, slot);
+        if (inputType(node.id, slot) == PinType::Image && !producesImage(source->kind)) {
             report(Severity::Error, node.id,
                    "Needs a rendered image, e.g. from Gaussian Splatting, Tensor to Image or Resample.");
         }
@@ -670,11 +752,12 @@ std::vector<Diagnostic> Graph::validate() const {
             }
             break;
         case NodeKind::GaussianSplatting: {
-            const Node* target = inputNode(node.id, 2);
-            if (target && target->kind != NodeKind::SwapchainTarget && target->kind != NodeKind::OffscreenTarget) {
+            // Renderers write their target on every path; another node's
+            // result is drawn onto a target first.
+            if (const Node* target = inputNode(node.id, 2); target && !isTarget(target->kind)) {
                 report(Severity::Error, node.id,
-                       "The target must be a Swapchain Target or an Offscreen Target: klartraum's splatting "
-                       "backends render into an image and do not composite onto another node's output.");
+                       "The target must be a Swapchain Target or an Offscreen Target, possibly after Clear Image or "
+                       "Composite. To render over another image, draw it onto a target with a Composite node.");
             }
             const auto& params = node.as<SplattingParams>();
             if (params.backend == SplattingBackend::Compute && (params.splatTileX == 0 || params.splatTileY == 0)) {
@@ -694,6 +777,7 @@ std::vector<Diagnostic> Graph::validate() const {
             }
             break;
         case NodeKind::Preview:
+        case NodeKind::DrawBasics:
             checkRenderedImage(node);
             break;
         case NodeKind::OffscreenTarget: {
@@ -703,6 +787,22 @@ std::vector<Diagnostic> Graph::validate() const {
             }
             break;
         }
+        case NodeKind::Composite:
+            // It draws onto the target's images in place.
+            if (const Node* target = inputNode(node.id, 0); target && !isTarget(target->kind)) {
+                report(Severity::Error, node.id,
+                       "Draws onto a Swapchain Target or an Offscreen Target, possibly after Clear Image or "
+                       "another Composite.");
+            }
+            checkRenderedImage(node, 1);
+            break;
+        case NodeKind::ClearImage:
+            // It clears the target's images in place.
+            if (const Node* source = inputNode(node.id, 0);
+                source && source->kind != NodeKind::SwapchainTarget && source->kind != NodeKind::OffscreenTarget) {
+                report(Severity::Error, node.id, "Clears a Swapchain Target or an Offscreen Target.");
+            }
+            break;
         case NodeKind::ImageFile: {
             const auto& p = node.as<ImageFileParams>();
             if (p.path.empty()) {
@@ -765,17 +865,6 @@ std::vector<Diagnostic> Graph::validate() const {
                         [&](int id) { return findNode(id)->kind == NodeKind::SwapchainTarget; })) {
             report(Severity::Error, sink->id,
                    "Run cannot use the window's swapchain images; render into an Offscreen Target for it.");
-        }
-    }
-
-    // The live graph is submitted once per frame; staged nodes need several
-    // submissions with CPU work in between.
-    for (const Node* present : presents) {
-        for (int id : upstreamOf(present->id)) {
-            if (isStaged(findNode(id)->kind)) {
-                report(Severity::Error, id,
-                       "Only runs with Run: connect it to a Preview or Image File Writer instead of Present.");
-            }
         }
     }
 
@@ -1002,6 +1091,51 @@ Graph makeStableDiffusionGraph(const std::string& modelDirectory, uint32_t size,
     graph.connect(out(sampler), in(decoder));
     graph.connect(out(decoder), in(preview));
     graph.connect(out(decoder), in(writer));
+    return graph;
+}
+
+Graph makeStableDiffusionBackgroundGraph(const std::string& modelDirectory, uint32_t size, const std::string& prompt,
+                                         const std::string& negativePrompt, const SceneParams& scene,
+                                         const TransformGaussiansParams& placement, const CameraParams& cameraParams) {
+    Graph graph = makeStableDiffusionGraph(modelDirectory, size, prompt, negativePrompt, "");
+    int decoder = -1;
+    for (const auto& node : graph.nodes()) {
+        if (node.kind == NodeKind::Meta && node.as<MetaParams>().definition == kVaeDecoderDefinition) {
+            decoder = node.id;
+        }
+    }
+    for (const auto& node : graph.nodes()) {
+        if (node.kind == NodeKind::ImageFileWriter) {
+            graph.removeNode(node.id);
+            break;
+        }
+    }
+    const int toImage = graph.addNode(NodeKind::TensorToImage, {1240.0f, 260.0f});
+    const int swapchain = graph.addNode(NodeKind::SwapchainTarget, {1240.0f, 580.0f});
+    const int background = graph.addNode(NodeKind::Composite, {1550.0f, 180.0f});
+    graph.findNode(background)->as<CompositeParams>().fit = CompositeFit::Fill;
+    graph.findNode(background)->title = "Background";
+    const int sceneNode = graph.addNode(NodeKind::Scene, {930.0f, 420.0f});
+    const int move = graph.addNode(NodeKind::TransformGaussians, {1240.0f, 420.0f});
+    const int upload = graph.addNode(NodeKind::UploadGaussians, {1550.0f, 420.0f});
+    const int camera = graph.addNode(NodeKind::Camera, {1550.0f, 740.0f});
+    const int splatting = graph.addNode(NodeKind::GaussianSplatting, {1860.0f, 300.0f});
+    const int axes = graph.addNode(NodeKind::DrawBasics, {2170.0f, 340.0f});
+    const int present = graph.addNode(NodeKind::Present, {2480.0f, 340.0f});
+    graph.findNode(sceneNode)->as<SceneParams>() = scene;
+    graph.findNode(move)->as<TransformGaussiansParams>() = placement;
+    graph.findNode(camera)->as<CameraParams>() = cameraParams;
+    graph.connect(out(decoder), in(toImage));
+    graph.connect(out(sceneNode), in(move));
+    graph.connect(out(move), in(upload));
+    graph.connect(out(upload), in(splatting, 0));
+    graph.connect(out(camera), in(splatting, 1));
+    graph.connect(out(swapchain), in(background, 0));
+    graph.connect(out(toImage), in(background, 1));
+    graph.connect(out(background), in(splatting, 2));
+    graph.connect(out(splatting), in(axes, 0));
+    graph.connect(out(camera), in(axes, 1));
+    graph.connect(out(axes), in(present));
     return graph;
 }
 

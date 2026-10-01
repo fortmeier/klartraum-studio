@@ -10,8 +10,10 @@
  * - ddimStepGuidesAndSteps: with the true noise predicted, a step recovers the clean latents and
  *   noises them to the previous alpha; guidance extrapolates from the negative prediction
  * - readFloatsChecksSize: a file of the wrong size is rejected with its size
- * - stagedNodesOnlyRun: a DDIM Sampler feeding Present is an error on it, a Preview is not; the VAE
- *   Decoder meta node is not staged
+ * - liveGraphReadsRunResults: a live Composite drawing the decoded image as a Gaussian Splatting's
+ *   background reads it as a retained result: the live plan stops at the run-only nodes, and the run
+ *   plan makes the result
+ * - samplerCannotDependOnLiveInputs: a DDIM Sampler fed from what the camera renders is an error
  * - validateStableDiffusionParams: missing files, latent sizes that are not multiples of 8 and step
  *   counts outside 1..1000 are errors; a built-in Text Encoder without a model reports its inner node
  * - promptTokensAreInt64Tensors: the Prompt's ids and mask are 2x77 int64 tensor pins; they connect
@@ -221,23 +223,68 @@ TEST(StableDiffusion, readFloatsChecksSize) {
     std::filesystem::remove(path);
 }
 
-TEST(StableDiffusion, stagedNodesOnlyRun) {
+TEST(StableDiffusion, liveGraphReadsRunResults) {
+    // The decoded image as the target a live Gaussian Splatting renders over.
     Graph graph = makeStableDiffusionGraph("models", 256, "a lantern", "", "out.png");
     const int sampler = findKind(graph, NodeKind::DdimSampler);
     const int decoder = findMeta(graph, kVaeDecoderDefinition);
-    EXPECT_FALSE(hasError(planGraph(graph).diagnostics, sampler));
-    EXPECT_FALSE(hasError(planGraph(graph).diagnostics, decoder));
-
     const int toImage = graph.addNode(NodeKind::TensorToImage);
+    const int scene = graph.addNode(NodeKind::Scene);
+    const int upload = graph.addNode(NodeKind::UploadGaussians);
+    const int camera = graph.addNode(NodeKind::Camera);
+    const int swapchain = graph.addNode(NodeKind::SwapchainTarget);
+    const int background = graph.addNode(NodeKind::Composite);
+    const int splatting = graph.addNode(NodeKind::GaussianSplatting);
     const int present = graph.addNode(NodeKind::Present);
+    graph.findNode(scene)->as<SceneParams>().path = "scene.spz";
     ASSERT_FALSE(graph.connect(out(decoder), in(toImage)));
-    ASSERT_FALSE(graph.connect(out(toImage), in(present)));
-    const auto diagnostics = planGraph(graph).diagnostics;
-    EXPECT_TRUE(hasError(diagnostics, sampler));
-    // The decoder is layers and an ONNX model: it could run live.
-    EXPECT_FALSE(hasError(diagnostics, decoder));
-    EXPECT_FALSE(hasError(diagnostics, toImage));
-    EXPECT_FALSE(hasError(diagnostics, findKind(graph, NodeKind::Prompt)));
+    ASSERT_FALSE(graph.connect(out(swapchain), in(background, 0)));
+    ASSERT_FALSE(graph.connect(out(toImage), in(background, 1)));
+    ASSERT_FALSE(graph.connect(out(scene), in(upload)));
+    ASSERT_FALSE(graph.connect(out(upload), in(splatting, 0)));
+    ASSERT_FALSE(graph.connect(out(camera), in(splatting, 1)));
+    ASSERT_FALSE(graph.connect(out(background), in(splatting, 2)));
+    ASSERT_FALSE(graph.connect(out(splatting), in(present)));
+
+    const CompilePlan plan = planGraph(graph);
+    for (const auto& d : plan.diagnostics) {
+        EXPECT_NE(d.severity, Severity::Error) << d.message;
+    }
+    ASSERT_TRUE(plan.live.has_value());
+    ASSERT_TRUE(plan.run.has_value());
+    // The live graph draws the decoded image, renders the splats over it and
+    // reads the image from the last Run.
+    EXPECT_EQ(plan.live->retained, (std::vector<OutputPin>{{toImage, 0}}));
+    EXPECT_TRUE(plan.live->contains(background));
+    EXPECT_TRUE(plan.live->contains(splatting));
+    EXPECT_FALSE(plan.live->contains(toImage));
+    EXPECT_FALSE(plan.flat.covers(plan.live->nodes, sampler));
+    EXPECT_FALSE(plan.flat.covers(plan.live->nodes, decoder));
+    // Run makes it.
+    EXPECT_EQ(plan.run->retained, plan.live->retained);
+    EXPECT_TRUE(plan.flat.covers(plan.run->nodes, sampler));
+    EXPECT_TRUE(plan.flat.covers(plan.run->nodes, toImage));
+    EXPECT_FALSE(plan.flat.covers(plan.run->nodes, splatting));
+}
+
+TEST(StableDiffusion, samplerCannotDependOnLiveInputs) {
+    Graph graph = makeStableDiffusionGraph("models", 256, "a lantern", "", "out.png");
+    const int sampler = findKind(graph, NodeKind::DdimSampler);
+    // Latents from a splatting that the camera moves.
+    const int scene = graph.addNode(NodeKind::Scene);
+    const int upload = graph.addNode(NodeKind::UploadGaussians);
+    const int camera = graph.addNode(NodeKind::Camera);
+    const int target = graph.addNode(NodeKind::OffscreenTarget);
+    const int splatting = graph.addNode(NodeKind::GaussianSplatting);
+    const int toTensor = graph.addNode(NodeKind::ImageToTensor);
+    graph.findNode(scene)->as<SceneParams>().path = "scene.spz";
+    graph.connect(out(scene), in(upload));
+    graph.connect(out(upload), in(splatting, 0));
+    graph.connect(out(camera), in(splatting, 1));
+    graph.connect(out(target), in(splatting, 2));
+    graph.connect(out(splatting), in(toTensor));
+    ASSERT_FALSE(graph.connect(out(toTensor), in(sampler, 0)));
+    EXPECT_TRUE(hasError(planGraph(graph).diagnostics, sampler));
 }
 
 TEST(StableDiffusion, validateStableDiffusionParams) {

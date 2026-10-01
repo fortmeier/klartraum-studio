@@ -29,7 +29,15 @@ class GaussianDataStandard;
 namespace kstudio {
 
 // The example graphs offered in File > Examples.
-enum class Example { GaussianSplatting, Autoencoder, SplatAutoencoder, CombinedScenes, AnimatedScenes, StableDiffusion };
+enum class Example {
+    GaussianSplatting,
+    Autoencoder,
+    SplatAutoencoder,
+    CombinedScenes,
+    AnimatedScenes,
+    StableDiffusion,
+    StableDiffusionBackground,
+};
 std::optional<Example> exampleFromName(std::string_view name);
 
 struct StudioOptions {
@@ -231,6 +239,10 @@ private:
     bool runRequested_ = false;
     bool autoRun_ = false;
     std::optional<RunResult> lastRun_;
+    // Results of run-only nodes the live graph reads, kept from the last Run.
+    std::unique_ptr<RetainedResults> retained_;
+    uint64_t appliedGeneration_ = 0;  // retained_->generation() the live graph was built with
+    uint64_t autoRunRevision_ = ~uint64_t{0};  // the graph revision Run ran on its own for
     uint64_t lastRunRevision_ = 0;
     std::string runError_;
     std::map<int, std::unique_ptr<PreviewTexture>> previews_;

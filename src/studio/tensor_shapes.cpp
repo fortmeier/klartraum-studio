@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <format>
+#include <functional>
 #include <optional>
 #include <stdexcept>
 #include <string_view>
@@ -42,25 +43,38 @@ ShapeInference inferTensorShapes(const Graph& graph, const OnnxInfoProvider& onn
         return true;
     };
     // The 1x3xHxW tensor an image converts to, if its size is known: a
-    // Gaussian Splatting node renders at its Offscreen Target's size (the
-    // swapchain's is only known when the graph is built), a Tensor to Image
-    // node at its input tensor's, a Resample node at its own.
-    auto imageShape = [&](const Node* source) -> std::optional<TensorShape> {
-        if (source && source->kind == NodeKind::GaussianSplatting) {
-            const Node* target = graph.inputNode(source->id, 2);
-            if (target && target->kind == NodeKind::OffscreenTarget) {
-                const auto& p = target->as<OffscreenTargetParams>();
-                return TensorShape{1, 3, p.height, p.width};
-            }
-        } else if (source && source->kind == NodeKind::Resample) {
+    // Gaussian Splatting node renders at its target's size (the swapchain's
+    // is only known when the graph is built), a Clear Image, a Composite or a
+    // Draw Basics at its input's,
+    // a Tensor to Image node at its input tensor's, a Resample node at its own.
+    std::function<std::optional<TensorShape>(const Node*)> imageShape =
+        [&](const Node* source) -> std::optional<TensorShape> {
+        if (!source) {
+            return std::nullopt;
+        }
+        switch (source->kind) {
+        case NodeKind::OffscreenTarget: {
+            const auto& p = source->as<OffscreenTargetParams>();
+            return TensorShape{1, 3, p.height, p.width};
+        }
+        case NodeKind::GaussianSplatting:
+            return imageShape(graph.inputNode(source->id, 2));
+        case NodeKind::ClearImage:
+        case NodeKind::Composite:
+        case NodeKind::DrawBasics:
+            return imageShape(graph.inputNode(source->id, 0));
+        case NodeKind::Resample: {
             const auto& p = source->as<ResampleParams>();
             return TensorShape{1, 3, p.height, p.width};
-        } else if (source && source->kind == NodeKind::TensorToImage) {
+        }
+        case NodeKind::TensorToImage:
             if (const TensorShape* in = inputShape(source->id); in && isImageShape(*in) && (*in)[1] == 3) {
                 return *in;
             }
+            return std::nullopt;
+        default:
+            return std::nullopt;
         }
-        return std::nullopt;
     };
 
     // The model a node names; reports it if it cannot be read or uses

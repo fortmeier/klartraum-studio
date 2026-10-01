@@ -18,13 +18,18 @@ enum class GsplatBackend;
 
 namespace kstudio {
 
-// What runs every frame: the Present node and everything feeding it.
+// What runs every frame: the Present node and everything feeding it, except
+// run-only nodes: those that depend on a staged node (see isStaged) and not on
+// the camera, the swapchain or time. The live graph reads their outputs as
+// they were computed by the last Run (see RetainedResults).
 struct LivePlan {
     int presentNode = 0;
     // Depth first from Present, inputs in slot order. Two plans with the same
     // signature list corresponding nodes at the same positions.
     std::vector<int> nodes;
     int cameraNode = 0;  // the camera the window's orbit camera drives; 0: none
+    // Outputs of run-only nodes the live graph reads.
+    std::vector<OutputPin> retained;
     // The nodes' kinds, parameters and links, without node ids and live
     // parameters (NodeKindInfo::liveParams): those apply while it runs.
     std::string signature;
@@ -34,10 +39,13 @@ struct LivePlan {
     bool contains(int node) const { return std::find(nodes.begin(), nodes.end(), node) != nodes.end(); }
 };
 
-// What Run executes: every node that feeds a sink, in dependency order.
+// What Run executes: every node that feeds a sink or a retained result, in
+// dependency order.
 struct RunPlan {
     std::vector<int> nodes;
     std::vector<int> sinks;
+    // Outputs the live graph reads; Run keeps them (see RetainedResults).
+    std::vector<OutputPin> retained;
     std::map<OutputPin, TensorType> types;  // tensor types, where known (see inferTensorShapes)
 };
 

@@ -40,9 +40,26 @@ work; *Implemented by* names the Klartraum class or function behind it.
 | Node | Description | Implemented by | Runs |
 |---|---|---|---|
 | Orbit Camera | Camera uniform buffer driven by an orbit camera. | {cpp:class}`klartraum::InterfaceCameraOrbit` | every frame (live), once per run |
-| Swapchain Target | The window's swapchain images, rendered into directly. | {cpp:class}`klartraum::ImageViewSrc` | every frame (live only) |
-| Offscreen Target | An image of fixed size (W×H) to render into for further processing. | `klartraum::OffscreenTarget` | every frame (live) or every run |
-| Gaussian Splatting | Renders the Gaussians into the target image, with the compute or raster backend and all {cpp:struct}`klartraum::GsplatConfig` settings. | `klartraum::createGaussianSplatting` | every frame (live) or every run |
+| Swapchain Target | The window's swapchain images, rendered into directly. Cleared to black before they are rendered into, unless *Clear to black* is off. | {cpp:class}`klartraum::ImageViewSrc` | every frame (live only) |
+| Offscreen Target | An image of fixed size (W×H) to render into for further processing. Cleared to black like the Swapchain Target, unless turned off. | `klartraum::OffscreenTarget` | every frame (live) or every run |
+| Clear Image | Clears a Swapchain or Offscreen Target to a color before it is rendered into. | {cpp:class}`klartraum::ClearImage` | every frame (live) or every run |
+| Composite | Draws an image onto a target: *replace* or *over* (by the image's alpha), *stretch*, *fit* (whole image, aspect kept, the rest of the target stays) or *fill* (covers the target, cropped). It passes the target on, so renderers after it draw over the image. The image is only read; it may be a Run result. | {cpp:class}`klartraum::ImageComposite` | every frame (live) or every run |
+| Gaussian Splatting | Renders the Gaussians over its target, with the compute or raster backend and all {cpp:struct}`klartraum::GsplatConfig` settings. The target is a Swapchain or Offscreen Target, possibly after Clear Image or Composite. | `klartraum::createGaussianSplatting` | every frame (live) or every run |
+| Draw Basics | Draws a triangle, a cube or axes with a camera over a rendered image, e.g. axes as a reference after a Gaussian Splatting. Only on images of the window's size. | {cpp:class}`klartraum::RenderPass` with `klartraum::DrawBasics` | every frame (live) or every run |
+
+Renderers draw over what their target holds: a target starts from black
+because it is cleared, not because the renderer clears it. They render only
+into targets, which have an image per frame in flight; to render over another
+node's result, draw it onto a target with a Composite first.
+
+Linking a tensor into an input that takes images but not tensors (e.g. a
+Composite's *Image* or Present) puts a Tensor to Image node in between.
+
+On MoltenVK, the Swapchain Target is an image per frame in flight standing in
+for the swapchain, which Present copies into the window's image. MoltenVK binds
+swapchain images to compute shaders as they were when the graph was built, so a
+Composite or a resample writing them directly would sometimes draw into an image
+that is not shown. The compiled graph shows the stand-in and the copy.
 
 ## Compute
 
@@ -92,6 +109,27 @@ and runs the UNet once per step. It then uploads the result for the nodes that
 follow, whose graph it executes next. The compiled graph of a run shows every
 stage's graph together with the UNet. Run waits for all denoising steps; the
 overview lists each step with its duration.
+
+## Live graphs that use Run results
+
+A live graph may use what Run computes, e.g. render Gaussians over a Stable
+Diffusion image (*File → New from Example → Lantern over a Stable Diffusion
+image*: a Composite draws the image onto the swapchain, the Gaussian
+Splatting renders over it, and a Draw Basics adds axes):
+
+- Nodes that depend on a staged node, but not on a camera, the swapchain or
+  time, are *run-only*: they are computed by Run, not every frame. They get the
+  green run ring.
+- Where a live node reads a run-only node's output, the live graph reads the
+  result of the last Run: one tensor or image that all frames in flight read
+  (klartraum's `TensorElementSinglePath`, {cpp:class}`klartraum::SinglePathImage`),
+  never write. Tensors of any element type and images can be kept this way.
+- When such results are needed and there are none yet, Run runs once on its
+  own; after that only when you press **Run** (F5). Run waits for the frames in
+  flight before it replaces the results. The live graph keeps running and only
+  needs rebuilding when a result's shape changes.
+- A staged node that depends on a camera, the swapchain or time is an error:
+  it cannot run every frame.
 
 ## Meta nodes
 
